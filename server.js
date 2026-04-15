@@ -19,6 +19,9 @@
  *   - Intraday setups: always based on fresh 5-min data (Tier 2)
  *   - Coverage: ~400 liquid NSE stocks (vs 141 before)
  *   - Staleness: max 5 minutes on intraday, max 55 min on daily swing picture
+ *
+ * FIX v5.1: /prices endpoint now always fetches FRESH data from Yahoo Finance
+ *   instead of serving stale cache. Cache used only as fallback if fetch fails.
  */
 
 const express = require('express');
@@ -41,8 +44,6 @@ let CACHE = {
 };
 
 // ─── FULL NSE LIQUID UNIVERSE (~400 stocks) ──────────────────────────────────
-// Criteria: actively traded, retail accessible, >₹50 price, reasonable liquidity
-// Covers Nifty50, Next50, Midcap150, Smallcap picks, sectoral leaders
 const NSE_ALL = [
   // ── INDICES ──
   '^NSEI','^NSEBANK','NIFTY_FIN_SERVICE.NS','^CNXIT','^NSEMDCP50',
@@ -387,7 +388,6 @@ function detectPatterns(candles, ind) {
   }
 
   // ── LINDA RASCHKE: 80-20 ──
-  // Open near high, close near low = bearish 80-20
   if(last.o>last.h-(range(last)*0.1)&&last.c<last.l+(range(last)*0.2))
     pats.push({name:'Raschke: 80-20 bearish — open near high, close near low',dir:'bear',str:4,detail:'Classic momentum exhaustion — sellers dominating'});
   if(last.o<last.l+(range(last)*0.1)&&last.c>last.h-(range(last)*0.2))
@@ -404,13 +404,11 @@ function scoreForScreen(d) {
   let score=0;
   const reasons=[];
 
-  // Price action patterns (primary — highest weight)
   for(const p of pats){
     score+=p.str;
     if(p.str>=4) reasons.push(`${p.name.split(':')[0]}: ${p.name.split(':')[1]?.trim()||p.name}`);
   }
 
-  // Indicator confluence (secondary)
   if(ind.macd?.crossover==='bullish'){score+=3;reasons.push('MACD bullish cross');}
   if(ind.macd?.crossover==='bearish'){score+=3;reasons.push('MACD bearish cross');}
   if(ind.macd?.rising&&ind.macd?.histogram>0){score+=1;reasons.push('MACD hist rising');}
@@ -426,7 +424,6 @@ function scoreForScreen(d) {
   if(ind.stoch?.crossover==='bearish'){score+=2;reasons.push('Stoch bear cross');}
   if(ind.adx?.trending&&ind.adx?.adx>30){score+=2;reasons.push(`ADX ${ind.adx.adx} trending`);}
 
-  // Volume and range
   if(d.volRatio>1.5){score+=2;reasons.push(`Vol ${d.volRatio}x avg`);}
   if(d.volRatio>2.5){score+=1;reasons.push('Extreme volume');}
   const dayRangePct=d.low>0?(d.high-d.low)/d.low*100:0;
@@ -487,6 +484,63 @@ async function fetchDaily(sym) {
   }
 }
 
+// ─── FETCH — FRESH PRICE ONLY (lightweight, for watchlist strip) ─────────────
+// Uses 1-minute interval, last 1 day — gets the most current price quickly
+async function fetchFreshPrice(sym) {
+  try {
+    const yfSym = sym.includes('.') || sym.startsWith('^') ? sym : sym + '.NS';
+    const r = await axios.get(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yfSym)}?interval=1m&range=1d&includePrePost=false`,
+      { headers: YF_HDR, timeout: 8000 }
+    );
+    const result = r.data?.chart?.result?.[0];
+    if (!result) throw new Error('No data');
+    const meta = result.meta || {};
+    const price = meta.regularMarketPrice || meta.previousClose || 0;
+    const prev  = meta.chartPreviousClose || meta.previousClose || price;
+    const symClean = sym.replace('.NS','').replace('.BO','').replace('^','');
+    return {
+      sym: symClean,
+      price: +price.toFixed(2),
+      prevClose: +prev.toFixed(2),
+      changePct: prev > 0 ? +((price - prev) / prev * 100).toFixed(2) : 0,
+      high: +(meta.regularMarketDayHigh || price).toFixed(2),
+      low:  +(meta.regularMarketDayLow  || price).toFixed(2),
+      open: +(meta.regularMarketOpen    || price).toFixed(2),
+      marketState: meta.marketState || 'CLOSED',
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch(e) {
+    // Fallback: try daily endpoint
+    try {
+      const yfSym = sym.includes('.') || sym.startsWith('^') ? sym : sym + '.NS';
+      const r = await axios.get(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yfSym)}?interval=1d&range=5d`,
+        { headers: YF_HDR, timeout: 8000 }
+      );
+      const result = r.data?.chart?.result?.[0];
+      if (!result) return { sym, error: e.message };
+      const meta = result.meta || {};
+      const price = meta.regularMarketPrice || 0;
+      const prev  = meta.chartPreviousClose || price;
+      const symClean = sym.replace('.NS','').replace('.BO','').replace('^','');
+      return {
+        sym: symClean,
+        price: +price.toFixed(2),
+        prevClose: +prev.toFixed(2),
+        changePct: prev > 0 ? +((price - prev) / prev * 100).toFixed(2) : 0,
+        high: +(meta.regularMarketDayHigh || price).toFixed(2),
+        low:  +(meta.regularMarketDayLow  || price).toFixed(2),
+        open: +(meta.regularMarketOpen    || price).toFixed(2),
+        marketState: meta.marketState || 'CLOSED',
+        fetchedAt: new Date().toISOString(),
+      };
+    } catch(e2) {
+      return { sym, error: e2.message };
+    }
+  }
+}
+
 // ─── FETCH — TIER 2 (adds LIVE 5-min intraday on top of daily) ────────────────
 async function fetchLive(stock) {
   try {
@@ -495,7 +549,7 @@ async function fetchLive(stock) {
       {headers:YF_HDR,timeout:10000}
     );
     const result=r.data?.chart?.result?.[0];
-    if(!result) return stock; // return daily data if intraday fails
+    if(!result) return stock;
     const q=result.indicators?.quote?.[0]||{};
     const ts=result.timestamp||[];
     const ic=ts.map((t,i)=>({
@@ -507,7 +561,6 @@ async function fetchLive(stock) {
       v:q.volume?.[i]||0,
     })).filter(c=>c.c!=null&&c.h!=null&&c.l!=null);
 
-    // Update current price from intraday (more fresh than daily meta)
     const meta=result.meta||{};
     const freshPrice=meta.regularMarketPrice||stock.price;
 
@@ -525,7 +578,7 @@ async function fetchLive(stock) {
       liveAt:new Date().toISOString(),
     };
   } catch(e) {
-    return stock; // graceful fallback to daily data
+    return stock;
   }
 }
 
@@ -552,7 +605,7 @@ async function runTier1() {
   }
 
   results.sort((a,b)=>b.screenScore-a.screenScore);
-  CACHE.tier1=results.slice(0,40); // keep top 40
+  CACHE.tier1=results.slice(0,40);
   CACHE.tier1At=new Date().toISOString();
   CACHE.tier1Running=false;
   CACHE.tier1Progress.status='done';
@@ -560,7 +613,6 @@ async function runTier1() {
 }
 
 // ─── TIER 2 ON-DEMAND LIVE REFRESH ───────────────────────────────────────────
-// Called when user clicks Generate — refreshes top 40 with live 5-min data
 async function runTier2() {
   if(!CACHE.tier1.length) return [];
   console.log(`[${new Date().toISOString()}] Tier2 live refresh — ${CACHE.tier1.length} stocks`);
@@ -574,11 +626,10 @@ async function runTier2() {
     });
     if(i+batchSize<CACHE.tier1.length) await new Promise(r=>setTimeout(r,300));
   }
-  // Re-score with live data (intraday patterns may add/remove from list)
   const rescored=results.map(d=>{
     const allPats=[...(d.patterns||[]),...(d.intradayPatterns||[])];
     const scored=scoreForScreen({...d,patterns:allPats});
-    return scored||d; // keep even if below threshold (daily score still valid)
+    return scored||d;
   });
   rescored.sort((a,b)=>(b.screenScore||0)-(a.screenScore||0));
   CACHE.tier2=rescored;
@@ -593,7 +644,7 @@ setInterval(runTier1, 55*60*1000);
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 app.get('/', (req,res)=>res.json({
-  name:'Signal Server v5 — Two-tier screener',
+  name:'Signal Server v5.1 — Two-tier screener (fresh prices fix)',
   universe:NSE_UNIVERSE.length,
   tier1:{cached:CACHE.tier1.length,at:CACHE.tier1At,running:CACHE.tier1Running,progress:CACHE.tier1Progress},
   tier2:{cached:CACHE.tier2.length,at:CACHE.tier2At},
@@ -604,15 +655,12 @@ app.get('/health',(req,res)=>res.json({
   screenerReady:!!CACHE.tier1At,tier1Stocks:CACHE.tier1.length,
 }));
 
-// Status endpoint — app polls this to show progress
 app.get('/status',(req,res)=>res.json({
   universe:NSE_UNIVERSE.length,
   tier1:{cached:CACHE.tier1.length,at:CACHE.tier1At,running:CACHE.tier1Running,progress:CACHE.tier1Progress},
   tier2:{cached:CACHE.tier2.length,at:CACHE.tier2At},
 }));
 
-// ★ GENERATE — the main endpoint called when user clicks Generate
-// Runs Tier 2 live refresh then returns final list for Claude
 app.get('/generate',async(req,res)=>{
   if(!CACHE.tier1.length){
     return res.json({error:'Tier1 screener still running first scan. Wait 2-3 min.',tier1Progress:CACHE.tier1Progress});
@@ -628,39 +676,50 @@ app.get('/generate',async(req,res)=>{
   });
 });
 
-// Batch prices for watchlist strip (uses cached tier1/tier2 if available, else fetches)
-app.get('/prices',async(req,res)=>{
-  const raw=req.query.symbols||'';
-  const syms=raw.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean).slice(0,30);
-  if(!syms.length) return res.json({error:'Provide ?symbols=RELIANCE,HDFCBANK'});
+// ★ FIXED: /prices now ALWAYS fetches fresh data from Yahoo Finance
+// Cache is used only as emergency fallback if Yahoo fetch fails
+app.get('/prices', async (req, res) => {
+  const raw = req.query.symbols || '';
+  const syms = raw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
+  if (!syms.length) return res.json({ error: 'Provide ?symbols=RELIANCE,HDFCBANK' });
 
-  // Try to serve from cache first
-  const data={};
-  const toFetch=[];
-  syms.forEach(s=>{
-    const cached=[...CACHE.tier2,...CACHE.tier1].find(x=>x.sym===s);
-    if(cached) data[s]=cached;
-    else toFetch.push(s);
-  });
-
-  // Fetch uncached ones
-  if(toFetch.length){
-    const yfSyms=toFetch.map(s=>NSE_UNIVERSE.find(u=>u.replace('.NS','').replace('^','')===s)||s+'.NS');
-    const results=await Promise.allSettled(yfSyms.map(fetchDaily));
-    results.forEach((r,i)=>{data[toFetch[i]]=r.status==='fulfilled'?r.value:{sym:toFetch[i],error:r.reason?.message};});
+  // Always fetch fresh — batch in groups of 5 to avoid rate limits
+  const data = {};
+  const batchSize = 5;
+  for (let i = 0; i < syms.length; i += batchSize) {
+    const batch = syms.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map(s => fetchFreshPrice(s)));
+    results.forEach((r, idx) => {
+      const sym = batch[idx];
+      if (r.status === 'fulfilled' && r.value && !r.value.error) {
+        data[sym] = r.value;
+      } else {
+        // Fallback to cache if fresh fetch failed
+        const cached = [...CACHE.tier2, ...CACHE.tier1].find(x => x.sym === sym);
+        if (cached) {
+          data[sym] = { ...cached, fromCache: true };
+        } else {
+          data[sym] = { sym, error: r.reason?.message || 'Fetch failed' };
+        }
+      }
+    });
+    if (i + batchSize < syms.length) await new Promise(r => setTimeout(r, 200));
   }
-  res.json({fetchedAt:new Date().toISOString(),count:syms.length,data});
+
+  res.json({ fetchedAt: new Date().toISOString(), count: syms.length, data });
 });
 
-app.get('/price/:symbol',async(req,res)=>{
-  const sym=req.params.symbol.toUpperCase();
-  // Check cache first
-  const cached=[...CACHE.tier2,...CACHE.tier1].find(x=>x.sym===sym);
-  if(cached) return res.json(cached);
-  const yf=NSE_UNIVERSE.find(u=>u.replace('.NS','').replace('^','')===sym)||sym+'.NS';
+app.get('/price/:symbol', async (req, res) => {
+  const sym = req.params.symbol.toUpperCase();
+  const fresh = await fetchFreshPrice(sym);
+  if (!fresh.error) return res.json(fresh);
+  // Fallback to cache
+  const cached = [...CACHE.tier2, ...CACHE.tier1].find(x => x.sym === sym);
+  if (cached) return res.json({ ...cached, fromCache: true });
+  const yf = NSE_UNIVERSE.find(u => u.replace('.NS','').replace('^','') === sym) || sym + '.NS';
   res.json(await fetchDaily(yf));
 });
 
-app.get('/symbols',(req,res)=>res.json({count:NSE_UNIVERSE.length,universe:NSE_UNIVERSE}));
+app.get('/symbols', (req, res) => res.json({ count: NSE_UNIVERSE.length, universe: NSE_UNIVERSE }));
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`Signal server v5 on port ${PORT} — ${NSE_UNIVERSE.length} stocks in universe`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Signal server v5.1 on port ${PORT} — ${NSE_UNIVERSE.length} stocks in universe`));

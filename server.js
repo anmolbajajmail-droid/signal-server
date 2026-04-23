@@ -170,6 +170,42 @@ app.get('/kite/status', (req, res) => {
       : '⚠️ Not logged in — click "Login with Zerodha" for live prices',
   });
 });
+// ─── KITE DATA DOWNLOADER PROXY ROUTES ──────────────────────────────────────
+// These routes allow the kite_downloader.html tool to fetch data through the
+// server (bypassing browser CORS restrictions on direct Kite API calls)
+
+// Returns current access token so downloader knows server is authenticated
+app.get('/kite/token', (req, res) => {
+  if (!kiteReady()) {
+    return res.status(401).json({ error: 'Not authenticated. Open the trading app and login with Zerodha first.' });
+  }
+  res.json({ ready: true, authenticatedAt: KITE.authenticatedAt });
+});
+
+// Proxy for Kite historical data API
+// Usage: GET /kite/historical?token=341249&interval=5minute&from=2026-03-02&to=2026-04-16
+app.get('/kite/historical', async (req, res) => {
+  if (!kiteReady()) {
+    return res.status(401).json({ error: 'Not authenticated. Login via trading app first.' });
+  }
+  const { token, interval, from, to } = req.query;
+  if (!token || !interval || !from || !to) {
+    return res.status(400).json({ error: 'Missing params. Need: token, interval, from, to' });
+  }
+  try {
+    const url = `${KITE_BASE}/instruments/historical/${token}/${interval}?from=${from}&to=${to}&continuous=0&oi=0`;
+    const resp = await axios.get(url, {
+      headers: { 'X-Kite-Version': '3', 'Authorization': `token ${KITE_API_KEY}:${KITE.accessToken}` }
+    });
+    res.json(resp.data);
+  } catch(e) {
+    const errMsg = e.response?.data?.message || e.message;
+    console.error('[Kite Historical] Error:', errMsg);
+    res.status(500).json({ error: errMsg });
+  }
+});
+
+
 
 // ─── KITE PRICE FETCH ─────────────────────────────────────────────────────────
 // Converts clean symbol (RELIANCE) to NSE trading symbol format

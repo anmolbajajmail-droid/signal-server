@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.0 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.1 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -211,33 +211,32 @@ app.get('/kite/historical', async (req, res) => {
   }
 });
 
-// ─── KITE 5-MIN HISTORICAL FETCH (for screener) ───────────────────────────────
+// ─── YAHOO 5-MIN FETCH (for screener — reliable, no token needed) ────────────
+// Note: Kite tokens need live refresh from /instruments API before Kite can be
+// used here. Using Yahoo for now — same 5-min data, works without token mapping.
+// TODO: fetch fresh tokens from Kite /instruments and switch back to Kite.
 async function fetchKite5Min(symbol) {
-  const token = INSTRUMENT_TOKENS[symbol];
-  if (!token) return null;
-  if (!kiteReady()) return null;
-
-  // Fetch last 2 sessions of 5-min data (enough for pattern detection)
-  const now   = new Date();
-  const from  = new Date(now); from.setDate(from.getDate() - 3); // 3 days back covers weekends
-  const fromStr = from.toISOString().split('T')[0];
-  const toStr   = now.toISOString().split('T')[0];
-
+  // Yahoo Finance symbol format
+  const yfSym = symbol + '.NS';
   try {
-    const url = `${KITE_BASE}/instruments/historical/${token}/5minute?from=${fromStr}&to=${toStr}&continuous=0&oi=0`;
-    const resp = await axios.get(url, {
-      headers: { 'X-Kite-Version': '3', 'Authorization': `token ${KITE_API_KEY}:${KITE.accessToken}` },
-      timeout: 8000,
-    });
-    const candles = (resp.data?.data?.candles || []).map(c => ({
-      t: c[0], o: +c[1], h: +c[2], l: +c[3], c: +c[4], v: +c[5]
-    })).filter(c => c.c > 0);
+    const r = await axios.get(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yfSym)}?interval=5m&range=2d&includePrePost=false`,
+      { headers: YF_HDR, timeout: 10000 }
+    );
+    const result = r.data?.chart?.result?.[0];
+    if (!result) return null;
+    const q  = result.indicators?.quote?.[0] || {};
+    const ts = result.timestamp || [];
+    const candles = ts.map((t, i) => ({
+      t: new Date(t * 1000).toISOString(),
+      o: q.open?.[i]  != null ? +q.open[i].toFixed(2)  : null,
+      h: q.high?.[i]  != null ? +q.high[i].toFixed(2)  : null,
+      l: q.low?.[i]   != null ? +q.low[i].toFixed(2)   : null,
+      c: q.close?.[i] != null ? +q.close[i].toFixed(2) : null,
+      v: q.volume?.[i] || 0,
+    })).filter(c => c.c != null && c.h != null && c.l != null && c.c > 0);
     return candles.length >= 10 ? candles : null;
   } catch(e) {
-    if (e.response?.status === 403) {
-      KITE.accessToken = null;
-      console.log('[Kite] Token expired');
-    }
     return null;
   }
 }
@@ -744,10 +743,9 @@ async function runTier1() {
     console.log(`[${new Date().toISOString()}] Tier1 skipped — outside market hours`);
     return;
   }
-  if (!kiteReady()) {
-    console.log(`[${new Date().toISOString()}] Tier1 skipped — Kite not authenticated`);
-    return;
-  }
+  // Note: screener uses Yahoo Finance for 5-min data — no Kite token needed
+  // Kite is only needed for real-time price quotes (/prices endpoint)
+  // So Tier 1 runs regardless of Kite auth status
 
   CACHE.tier1Running = true;
   CACHE.tier1Progress = { scanned: 0, total: NSE_UNIVERSE.length, status: 'running' };
@@ -908,7 +906,7 @@ setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v6.0 — H2 + RT Pattern Engine',
+  name: 'Signal Server v6.1 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   tier1: {
@@ -1098,13 +1096,6 @@ app.get('/symbols', (req, res) => res.json({
 // Allows user to force a Tier 1 rescan without waiting for 20-min interval
 // Returns immediately — scan runs in background
 app.get('/scan', (req, res) => {
-  if (!kiteReady()) {
-    return res.json({
-      ok: false,
-      error: 'Kite not authenticated. Login with Zerodha first.',
-      kiteLoginUrl: `${SERVER_URL}/kite/login`,
-    });
-  }
   if (CACHE.tier1Running) {
     return res.json({
       ok: false,
@@ -1123,5 +1114,5 @@ app.get('/scan', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.0 on port ${PORT} — H2+RT Pattern Engine | Kite API | 20-min scan`)
+  console.log(`Signal server v6.1 on port ${PORT} — H2+RT Pattern Engine | Yahoo 5min | Kite prices | 20-min scan`)
 );

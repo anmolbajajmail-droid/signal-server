@@ -1093,6 +1093,35 @@ app.get('/symbols', (req, res) => res.json({
   withTokens: Object.keys(INSTRUMENT_TOKENS).length,
 }));
 
+
+// ─── MANUAL TIER 1 TRIGGER ───────────────────────────────────────────────────
+// Allows user to force a Tier 1 rescan without waiting for 20-min interval
+// Returns immediately — scan runs in background
+app.get('/scan', (req, res) => {
+  if (!kiteReady()) {
+    return res.json({
+      ok: false,
+      error: 'Kite not authenticated. Login with Zerodha first.',
+      kiteLoginUrl: `${SERVER_URL}/kite/login`,
+    });
+  }
+  if (CACHE.tier1Running) {
+    return res.json({
+      ok: false,
+      message: 'Tier 1 scan already running.',
+      progress: CACHE.tier1Progress,
+    });
+  }
+  // Trigger scan in background — don't await, return immediately
+  runTier1().catch(e => console.error('[Manual scan] Error:', e.message));
+  res.json({
+    ok: true,
+    message: 'Tier 1 scan started. Check /status for progress. Takes ~60 seconds.',
+    universe: NSE_UNIVERSE.length,
+    startedAt: new Date().toISOString(),
+  });
+});
+
 app.listen(PORT, '0.0.0.0', () =>
   console.log(`Signal server v6.0 on port ${PORT} — H2+RT Pattern Engine | Kite API | 20-min scan`)
 );

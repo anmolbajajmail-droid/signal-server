@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.1 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -33,9 +33,59 @@ let KITE = {
   accessToken: null,
   authenticatedAt: null,
   authenticatedDate: null,
+  instrumentTokens: {},   // symbol -> token, fetched fresh after each login
+  instrumentsFetchedAt: null,
 };
 function kiteToday() { return new Date().toISOString().split('T')[0]; }
 function kiteReady() { return KITE.accessToken && KITE.authenticatedDate === kiteToday(); }
+
+// ─── FETCH FRESH INSTRUMENT TOKENS FROM KITE ─────────────────────────────────
+// Called once after each successful login
+// Kite tokens can change — always fetch fresh, never hardcode
+async function fetchInstrumentTokens() {
+  if (!kiteReady()) return;
+  try {
+    console.log('[Kite] Fetching fresh instrument tokens from NSE...');
+    const resp = await axios.get(`${KITE_BASE}/instruments/NSE`, {
+      headers: {
+        'X-Kite-Version': '3',
+        'Authorization': `token ${KITE_API_KEY}:${KITE.accessToken}`
+      },
+      timeout: 15000,
+    });
+    // Response is CSV text: instrument_token,exchange_token,tradingsymbol,...
+    const lines = resp.data.split('\n');
+    const header = lines[0].toLowerCase().split(',');
+    const tokenIdx  = header.indexOf('instrument_token');
+    const symbolIdx = header.indexOf('tradingsymbol');
+    const typeIdx   = header.indexOf('instrument_type');
+    const map = {};
+    let count = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(',');
+      if (parts.length < 3) continue;
+      const type   = parts[typeIdx]?.trim();
+      const symbol = parts[symbolIdx]?.trim();
+      const token  = parseInt(parts[tokenIdx]?.trim());
+      // Only EQ (equity) instruments, skip futures/options
+      if (type === 'EQ' && symbol && token && NSE_UNIVERSE.includes(symbol)) {
+        map[symbol] = token;
+        count++;
+      }
+    }
+    KITE.instrumentTokens = map;
+    KITE.instrumentsFetchedAt = new Date().toISOString();
+    console.log(`[Kite] Instrument tokens loaded: ${count} stocks mapped`);
+    // Trigger a fresh Tier 1 scan now that we have tokens
+    if (isMarketHours()) {
+      console.log('[Kite] Triggering Tier 1 scan with fresh tokens...');
+      runTier1().catch(e => console.error('[Tier1 post-login] Error:', e.message));
+    }
+  } catch(e) {
+    console.error('[Kite] Failed to fetch instruments:', e.response?.data?.message || e.message);
+    // Will fall back to Yahoo Finance in fetchKite5Min
+  }
+}
 
 // ─── INSTRUMENT TOKEN MAP (symbol → Kite token) ───────────────────────────────
 // Used by Tier 1 to fetch 5-min historical data via Kite API
@@ -169,6 +219,8 @@ app.get('/kite/callback', async (req, res) => {
     KITE.authenticatedAt   = new Date().toISOString();
     KITE.authenticatedDate = kiteToday();
     console.log(`[Kite] Authenticated at ${KITE.authenticatedAt}`);
+    // Fetch fresh instrument tokens in background (don't await — let login page respond fast)
+    fetchInstrumentTokens().catch(e => console.error('[Instruments] Error:', e.message));
     res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0d1117;color:#e6edf3">
       <h1 style="color:#3fb950">✅ Zerodha Connected!</h1>
       <p>Pattern screener is now active. Tier 1 scan will use live Kite data.</p>
@@ -211,12 +263,41 @@ app.get('/kite/historical', async (req, res) => {
   }
 });
 
-// ─── YAHOO 5-MIN FETCH (for screener — reliable, no token needed) ────────────
-// Note: Kite tokens need live refresh from /instruments API before Kite can be
-// used here. Using Yahoo for now — same 5-min data, works without token mapping.
-// TODO: fetch fresh tokens from Kite /instruments and switch back to Kite.
+// ─── 5-MIN CANDLE FETCH — Kite primary, Yahoo fallback ──────────────────────
+// Uses fresh instrument tokens fetched from Kite /instruments/NSE after login
+// Falls back to Yahoo Finance if token not available yet (e.g. before first login)
 async function fetchKite5Min(symbol) {
-  // Yahoo Finance symbol format
+  // Try Kite first (authoritative NSE data)
+  const token = KITE.instrumentTokens[symbol];
+  if (token && kiteReady()) {
+    const now     = new Date();
+    const from    = new Date(now); from.setDate(from.getDate() - 3);
+    const fromStr = from.toISOString().split('T')[0];
+    const toStr   = now.toISOString().split('T')[0];
+    try {
+      const url = `${KITE_BASE}/instruments/historical/${token}/5minute?from=${fromStr}&to=${toStr}&continuous=0&oi=0`;
+      const resp = await axios.get(url, {
+        headers: {
+          'X-Kite-Version': '3',
+          'Authorization': `token ${KITE_API_KEY}:${KITE.accessToken}`
+        },
+        timeout: 8000,
+      });
+      const candles = (resp.data?.data?.candles || []).map(c => ({
+        t: c[0], o: +c[1], h: +c[2], l: +c[3], c: +c[4], v: +c[5]
+      })).filter(c => c.c > 0);
+      if (candles.length >= 10) return candles;
+      // If Kite returned empty (holiday/error), fall through to Yahoo
+    } catch(e) {
+      if (e.response?.status === 403) {
+        KITE.accessToken = null;
+        console.log('[Kite] Token expired — re-login required');
+      }
+      // Fall through to Yahoo
+    }
+  }
+
+  // Fallback: Yahoo Finance (used before first login or if Kite fails)
   const yfSym = symbol + '.NS';
   try {
     const r = await axios.get(
@@ -906,7 +987,7 @@ setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v6.1 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
+  name: 'Signal Server v6.2 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   tier1: {
@@ -941,7 +1022,13 @@ app.get('/status', (req, res) => res.json({
     marketHours: isMarketHours(),
   },
   tier2: { cached: CACHE.tier2.length, at: CACHE.tier2At },
-  kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
+  kite: {
+    ready: kiteReady(),
+    authenticatedAt: KITE.authenticatedAt,
+    instrumentTokensLoaded: Object.keys(KITE.instrumentTokens).length,
+    instrumentsFetchedAt: KITE.instrumentsFetchedAt,
+    dataSource: Object.keys(KITE.instrumentTokens).length > 0 ? 'Kite API' : 'Yahoo Finance (pre-login fallback)',
+  },
 }));
 
 app.get('/generate', async (req, res) => {
@@ -1114,5 +1201,5 @@ app.get('/scan', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.1 on port ${PORT} — H2+RT Pattern Engine | Yahoo 5min | Kite prices | 20-min scan`)
+  console.log(`Signal server v6.2 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

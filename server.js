@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.4 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -133,113 +133,6 @@ const INSTRUMENT_TOKENS = {
   'DEEPAKNTR':2172929,'NAVINFLUOR':3016193,'SRF':3796225,'PIIND':3703041,
   'TATACHEM':871681,'TATACOMM':3035137,'VOLTAS':951809,'CROMPTON':3463681,
   'POLYCAB':3898241,'HAVELLS':1512193,'DIXON':3446529,'CONCOR':3063553,
-  // ── EXPANSION: Nifty Midcap + popular F&O ──────────────────────────────
-  'HAL':2513409,'BEL':98049,'BHARATFORG':81153,'ESCORTS':2901249,
-  'MAXHEALTH':3916801,'NIACL':3875585,'GICRE':2974721,
-  'MCX':3732737,'IEX':3920897,'CDSL':3445249,'CAMS':2704129,
-  'MANAPPURAM':3400961,'ANGELONE':3771905,'MOTILALOS':3424513,
-  'SBICARD':10666497,'LICHOUSING':511233,'CANFINHOME':149249,
-  'PAYTM':3897601,'DELHIVERY':3905025,'NAUKRI':13209089,
-  'ZYDUSLIFE':4003329,'GRANULES':2407425,'NATCOPHARM':3871489,
-  'SUNDRPHARM':3957505,'IPCALAB':3878913,'AJANTPHARM':14977,
-  'ALKEM':3748609,'AUROPHARMA':69121,'GLENMARK':305921,
-  'LUPIN':2672641,'MANKIND':17857793,'TORNTPHARM':900609,
-  'DIVISLAB':2800641,'BIOCON':3536129,
-  'DEEPAKNTR':2172929,'NAVINFLUOR':3016193,'SRF':3796225,
-  'FINEORG':3835393,'NOCIL':3881985,'VINATIORGA':3980801,
-  'ROSSARI':3935745,'SUDARSCHEM':3955969,'LINDEINDIA':2938369,
-  'GSFC':3475713,'GNFC':2937601,'CHAMBLFERT':194561,
-  'ASTRAL':975873,'RELAXO':3927553,'BATAINDIA':70401,
-  'RAYMOND':3924993,'WHIRLPOOL':3985921,'WESTLIFE':3984897,
-  'PHOENIXLTD':3901697,'PRESTIGE':1790977,'SOBHA':3603969,
-  'BRIGADE':3696641,'OBEROIRLTY':3633153,
-  'DALBHARAT':2203073,'RAMCOCEM':3921921,'JKCEMENT':3832321,
-  'IRCTC':3379969,'IRFC':3884545,'IRCON':3895297,'HUDCO':3519489,
-  'GMRINFRA':3514369,'ADANIGREEN':2530049,'INOXWIND':2945793,
-  'CESC':166913,'RPOWER':3939073,'NLCINDIA':3879937,
-  'LATENTVIEW':3921921,'HAPPSTMNDS':3397121,'MASTEK':3851265,
-  'TANLA':3965697,'INTELLECT':2979073,'TATATECH':23650049,
-  'MINDTREE':3421441,'TATACOMM':3035137,
-  'CHOLAFIN':175361,'SUNDARMFIN':857345,'MFSL':1068545,
-  'RECLTD':3739137,'GODREJPROP':3061633,
-  'MOIL':3404801,'JSPL':3001089,'JINDALSTEL':3001089,
-  'BOSCHLTD':1136385,'TVSMOTOR':2170625,'MOTHERSON':4506753,
-  'ENDURANCE':13209857,'JKTYRE':3664641,
-  'APOLLOHOSP':41729,'LALPATHLAB':2983169,'METROPOLIS':17884161,
-  'IIFL':3739393,'MUTHOOTFIN':3400961,'UJJIVAN':3974401,
-  'UJJIVANSFB':3975425,'PNBHOUSING':3899649,
-  'INDUSTOWER':3951617,'ZEEL':3991041,'SAREGAMA':3940865,
-  'DELTACORP':2906881,'DEVYANI':2379265,'INDHOTEL':500209,
-  'TEAMLEASE':3968257,'QUESS':3916545,
-  'MPHASIS':4125697,'PERSISTENT':685569,'COFORGE':3358465,
-  'LTTS':10751745,'HEXAWARE':3812609,'OFSS':621569,
-  // ── BATCH 2: Nifty Midcap 150 + SmallCap F&O ──────────────────────────
-  'ABCAPITAL':5533,'ABFRL':4668,'APLLTD':1956353,'ATUL':4337,
-  'BAJAJHLDNG':2513,'CROMPTON':3463681,'DCMSHRIRAM':2205697,
-  'ELGIEQUIP':2913,'ENGINERSIN':3536897,'GILLETTE':3492353,
-  'GLAXO':2768641,'GODFRYPHLP':2937857,'GRAPHITE':393473,
-  'GUJGASLTD':3001857,'HFCL':2697473,'HINDPETRO':359937,
-  'IOC':415745,'JBCHEPHARM':3791105,'JINDALSAW':3504897,
-  'JMFINANCIL':3749121,'KANSAINER':3840769,'KARURVYSYA':3845889,
-  'KEI':3744513,'KNRCON':3714305,'KRBL':3805953,'L&TFH':2370049,
-  'LUXIND':3848449,'MAHINDCIE':3826177,'MRPL':3869697,
-  'NILKAMAL':3877633,'ORIENTELEC':3889409,'PGHH':3899393,
-  'POLYMED':3905793,'PRAJIND':3910913,'PRINCEPIPE':3911425,
-  'RAJESHEXPO':3921665,'RATNAMANI':3923969,'REDINGTON':3926529,
-  'RITES':3931649,'ROUTE':3936257,'SAFARI':3939841,
-  'SCHAEFFLER':3942657,'SKFINDIA':3948033,'SOLARINDS':3950337,
-  'STARCEMENT':3952129,'STLTECH':3952641,'SUMICHEM':3956993,
-  'SUPREMEIND':3960577,'SYNGENE':3963393,'VAIBHAVGBL':3977217,
-  'VIPIND':3981569,'VSTIND':3982593,'WOCKPHARMA':3987713,
-  'ZYDUSWELL':3992577,'BAJAJELEC':3459073,'BLUESTARCO':3469697,
-  'BORORENEW':3471489,'CEATLTD':158465,'CENTURYPLY':3473281,
-  'CHAMBLFERT':194561,'CMSINFO':3475585,'COCHINSHIP':178433,
-  'CREDITACC':2796801,'CRISIL':2994177,'DATAPATTNS':3410433,
-  'EIHOTEL':3490817,'EQUITASBNK':3995393,'FIVESTAR':3997441,
-  'FORTIS':3803905,'FSL':3820289,'GRINDWELL':3831553,
-  'HATSUN':2508289,'HGS':3823873,'HIKAL':2984449,
-  'HINDCOPPER':3505921,'HUDCO':3519489,'IGPL':3521025,
-  'INDIAMART':3843329,'INTELLECT':2979073,'ISGEC':3534337,
-  'ITDCEM':3536129,'J&KBANK':3362561,'JKLAKSHMI':3542529,
-  'JKPAPER':3545601,'JKTYRE':3664641,'JSWENERGY':3547393,
-  'JUBILANT':3549697,'KALPATPOWR':3553537,'KAVERI':3554817,
-  'KFINTECH':3744769,'KNR':3714305,'KOTAKBANK':492033,
-  'KPRMILL':3563777,'LANTMANH':3566081,'LAXMIMACH':3567361,
-  'LEMONTREE':3774209,'LICHOUSING':511233,'LLOYDSENGG':3574209,
-  'MAFANG':3577025,'MARICO':1041153,'MASTEK':3851265,
-  'MAXIND':3584769,'MCDOWELL-N':3586817,'MINDAIND':3590913,
-  'MIRZAINT':3592961,'MGL':3595777,'MMTC':3867649,
-  'MOSCHIP':3601025,'MSTCLTD':3603329,'NAUKRI':13209089,
-  'NAVA':3609601,'NAVNETEDUL':3611393,'NBCC':3050497,
-  'NESCO':3613697,'NETWORK18':3615489,'NLCINDIA':3879937,
-  'NOCIL':3881985,'NRBBEARING':3619329,'NUVOCO':3621377,
-  'OLECTRA':3625729,'PAGEIND':3628033,'PANACHE':3629825,
-  'PCBL':3632129,'PDSL':3634177,'PFIZER':3636481,
-  'PNCINFRA':3638785,'PNBHOUSING':3899649,'POLYCAB':3898241,
-  'POWERINDIA':3641089,'POWERIND':3642625,'PRESTIGE':1790977,
-  'PRICOLLTD':3644929,'PRISMJOHNS':3646721,'PRIVISCL':3913473,
-  'QUESS':3916545,'RAIN':3651841,'RAJRATAN':3653633,
-  'RAMCOIND':3655681,'RAMKRISHNA':3657729,'RANE':3659777,
-  'RBLBANK':4707329,'RECLTD':3739137,'REPCO':3665985,
-  'ROSSARI':3935745,'RPSGVENT':3938305,'RTNPOWER':3672321,
-  'SADBHAV':3676161,'SANOFI':3678209,'SAPPHIRE':3680257,
-  'SBILIFE':21001217,'SEQUENT':3944705,'SHARDACROP':3686401,
-  'SHRIRAMFIN':3688449,'SIEMENS':806401,'SOBHA':3603969,
-  'SOLARA':3693825,'SPANDANA':3951105,'SPARC':3695361,
-  'SSWL':3699201,'SURYAROSNI':3701249,'SUZLON':837633,
-  'SYMPHONY':3703553,'TANLA':3965697,'TATACONSUM':878593,
-  'TATAINVEST':3966721,'TATAPOWER':877057,'TCNSCLOTH':3967489,
-  'TEAMLEASE':3968257,'TECHNOE':3969793,'TEXRAIL':3971073,
-  'THYROCARE':3972609,'TIMKEN':3974401,'TITAN':897537,
-  'TRENT':1598465,'TRIDENT':3977729,'TRITURBINE':3978497,
-  'UJJIVAN':3974401,'ULTRACEMCO':2952193,'UNIPARTS':3981057,
-  'VAIBHAVGBL':3977217,'VARDHMAN':3983105,'VBL':2988801,
-  'VEDL':784129,'VINATIORGA':3980801,'VOLTAMP':3986433,
-  'VSTIND':3982593,'WELCORP':3990017,'WENDT':3991297,
-  'WESTLIFE':3984897,'WHIRLPOOL':3985921,'WIPRO':969473,
-  'WOCKPHARMA':3987713,'WONDERLA':3989249,'YESBANK':3250049,
-  'ZEEL':3991041,'ZENSARTECH':3993089,'ZOMATO':2123777,
-  'ZENTEC':3992577,'ZUARIIND':3994881,
 };
 
 // All stocks we scan — symbols only (Kite tokens looked up from map above)
@@ -293,38 +186,7 @@ const SECTORS = {
   'TATACHEM':'Chemicals','IRCTC':'Consumer','NAUKRI':'IT','ZOMATO':'Consumer',
   'DMART':'Consumer','IGL':'Energy','GRASIM':'Cement','BOSCHLTD':'Auto',
   'CONCOR':'Infra','TATACHEM':'Chemicals','TATACOMM':'IT',
-  'HAL':'Defence','BEL':'Defence','MIDHANI':'Defence','BHARAT FORGE':'Defence',
-  'BHARATFORG':'Auto','ESCORTS':'Auto','FORCEMOT':'Auto',
-  'MAXHEALTH':'Healthcare','APOLLOHOSP':'Healthcare','METROPOLIS':'Healthcare',
-  'RITES':'Infra','IRCON':'Infra','IRFC':'Infra','HUDCO':'Infra','NBCC':'Infra',
-  'INDUSTOWER':'Telecom','ZEEL':'Media','ZEEMEDIA':'Media','SAREGAMA':'Media',
-  'MCX':'Finance','IEX':'Finance','CDSL':'Finance','CAMS':'Finance',
-  'MANAPPURAM':'Finance','MUTHOOTFIN':'Finance','LICHSGFIN':'Finance',
-  'ANGELONE':'Finance','NUVAMA':'Finance','MOTILALOS':'Finance',
-  'PAYTM':'FinTech','SBICARD':'Finance',
-  'ZYDUSLIFE':'Pharma','SUNDRPHARM':'Pharma','GRANULES':'Pharma',
-  'NATCOPHARM':'Pharma','SEQUENT':'Pharma','SUVENPHAR':'Pharma',
-  'DEEPAKNTR':'Chemicals','NAVINFLUOR':'Chemicals','SRF':'Chemicals',
-  'FINEORG':'Chemicals','NOCIL':'Chemicals','SUDARSCHEM':'Chemicals',
-  'TATACHEM':'Chemicals','ROSSARI':'Chemicals','VINATIORGA':'Chemicals',
-  'ASTRAL':'Consumer','RELAXO':'Consumer','BATA':'Consumer','BATAINDIA':'Consumer',
-  'RAYMOND':'Consumer','WHIRLPOOL':'Consumer','WESTLIFE':'Consumer',
-  'TEAMLEASE':'Services','QUESS':'Services','HGS':'Services',
-  'DELHIVERY':'Logistics','CONCOR':'Logistics','SNOWMAN':'Logistics',
-  'LATENTVIEW':'IT','HAPPSTMNDS':'IT','MASTEK':'IT','TANLA':'IT',
-  'KPITTECH':'IT','INTELLECT':'IT','BIRLASOFT':'IT','CYIENT':'IT',
-  'GMRINFRA':'Infra','ADANIGREEN':'Energy','INOXWIND':'Energy',
-  'TATAPOWER':'Energy','SUZLON':'Energy','NHPC':'Energy','SJVN':'Energy',
-  'CESC':'Energy','RPOWER':'Energy',
-  'DALBHARAT':'Cement','RAMCOCEM':'Cement','JKCEMENT':'Cement',
-  'PHOENIXLTD':'Realty','PRESTIGE':'Realty','SOBHA':'Realty',
-  'BRIGADE':'Realty','OBEROIRLTY':'Realty','GODREJPROP':'Realty',
-  'JKTYRE':'Auto','APOLLOTYRE':'Auto','CEATLTD':'Auto','MRF':'Auto',
-  'BALKRISIND':'Auto','MOTHERSON':'Auto','BOSCHLTD':'Auto',
-  'LINDEINDIA':'Chemicals','GSFC':'Chemicals','GNFC':'Chemicals',
-  'CHAMBLFERT':'Chemicals','EIDPARRY':'FMCG','GODREJCP':'FMCG',
-  'TATACONSUM':'FMCG','JUBLFOOD':'Consumer','VBL':'FMCG',
-}
+};
 
 // ─── CACHE ────────────────────────────────────────────────────────────────────
 let CACHE = {
@@ -668,62 +530,8 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const pushVol  = candles.slice(ps, me+1).reduce((s, b) => s + b.v, 0) / (me - ps + 1);
     const volPre   = candles.slice(Math.max(0, ps-20), ps).map(b => b.v);
     const avgVolPre = volPre.length ? volPre.reduce((a, b) => a+b, 0) / volPre.length : pushVol;
-    // ── F1: EXTENDED TREND PENALTY (score reduction only, no hard skip) ─────
-    // Not backtested as hard gate — use as score penalty only
-    // >4×ATR push = reduce P1 score. No hard skip.
-    const pushATRRatio = pushMove / atrV;
-    const extendedPenalty = pushATRRatio > 5.0 ? Math.min(Math.round((pushATRRatio - 5.0) * 3), 10) : 0;
-
-    // ── SPIKE BAR FILTER ─────────────────────────────────────────────────────
-    // Only flag if the bar that SET the push extreme is a spike that was immediately reversed
-    // This is specific to UPL-type situations, not general high-volume bars
-    let hasSpikeOrigin = false;
-    {
-      const pushBars = candles.slice(ps, me+1);
-      // Find the bar that actually set the push extreme
-      let extremeBarIdx = 0;
-      if (iu) {
-        // Bull push: find bar with highest high
-        let maxH = -Infinity;
-        pushBars.forEach((b,i) => { if (b.h > maxH) { maxH = b.h; extremeBarIdx = i; }});
-      } else {
-        // Bear push: find bar with lowest low
-        let minL = Infinity;
-        pushBars.forEach((b,i) => { if (b.l < minL) { minL = b.l; extremeBarIdx = i; }});
-      }
-      // Only check the extreme bar and ±1 bars around it
-      const checkFrom = Math.max(0, extremeBarIdx - 1);
-      const checkTo   = Math.min(pushBars.length - 2, extremeBarIdx + 1);
-      for (let pi = checkFrom; pi <= checkTo; pi++) {
-        const pb  = pushBars[pi];
-        const nxt = pushBars[pi + 1];
-        if (!nxt) continue;
-        const volR = pb.v / (avgVolPre || 1);
-        if (volR < 4.0) continue; // Raised to 4× to avoid false positives
-        const bodyRatio = Math.abs(pb.c - pb.o) / ((pb.h - pb.l) || 0.01);
-        if (bodyRatio < 0.5) continue; // Must be a strong body bar
-        if (iu) {
-          // Bull push: spike = bar that set the high, next bar reverses hard
-          if (pb.h === pushBars.reduce((m,b) => Math.max(m,b.h), -Infinity)) {
-            if (nxt.c < pb.o) { hasSpikeOrigin = true; break; } // next bar closes below spike open
-          }
-        } else {
-          // Bear push: spike = bar that set the low, next bar reverses hard
-          if (pb.l === pushBars.reduce((m,b) => Math.min(m,b.l), Infinity)) {
-            if (nxt.c > pb.o) { hasSpikeOrigin = true; break; } // next bar closes above spike open
-          }
-        }
-      }
-    }
-    if (hasSpikeOrigin) {
-      // TEMPORARILY DISABLED — re-enable after market hours with proper backtest
-      // continue; // Silent skip — spike filter
-    }
-
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
-    p1 = Math.max(0, p1 - extendedPenalty); // Extended trend reduces push quality score
     if (pushVol > avgVolPre * 1.2) p1 = Math.min(p1 + 3, 15);
-    p1 = Math.max(0, p1 - extendedPenalty); // F1: extended trend reduces P1
 
     // Find pullback zone
     let pbz = null;
@@ -736,7 +544,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 
     const pbs = pbz.start, pbe = pbz.end, pbb = pbz.bars;
     if (pbe + 1 >= n) continue;
-    if (candles[pbe].t.slice(11, 16) >= '15:25') continue;
+    if (candles[pbe].t.slice(11, 16) >= '14:30') continue;
 
     const pbExtreme = iu
       ? Math.min(...candles.slice(pbs, pbe+1).map(b => b.l))
@@ -796,36 +604,19 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       p7 = Math.min(p7, 15); break;
     }
     if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '15:25') continue;
+    // Resumption bar must be in last 3 bars (15 min) for Tier 2
+    if (rbi < n - 3) continue;
+
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
     if (score < minScore || retracePct > 0.80 || pbc !== 2) continue;
 
     const ep  = candles[rbi].c;
     const stop   = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // Target logic: use push extreme if clean (≤5×ATR from entry), else percentage floor
-    // Push extreme = structural target (where price was before the pullback)
-    const pePushTarget = iu ? pushExtreme : pushExtreme; // bull: push high, bear: push low
-    const peDist = Math.abs(pePushTarget - ep);
-    const pctFloor = ep * 0.005; // 0.5% of entry price minimum
-    const atrTarget = atrV * 1.5;
-    // Use push extreme if: it is in the right direction AND within 5×ATR AND larger than 1.5×ATR
-    const usePushExtreme = iu
-      ? (pePushTarget > ep && peDist <= atrV*5 && peDist >= atrTarget)
-      : (pePushTarget < ep && peDist <= atrV*5 && peDist >= atrTarget);
-    const targetMove = usePushExtreme ? peDist : Math.max(atrTarget, pctFloor);
+    const pctFloor = ep * 0.005;
+    const targetMove = Math.max(atrV * 1.5, pctFloor);
     const target = iu ? ep + targetMove : ep - targetMove;
-    const targetType = usePushExtreme ? 'pushExtreme' : (pctFloor > atrTarget ? 'pctFloor' : 'atr');
     const stopDist = Math.abs(ep - stop);
-
-    const stopLevel = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // NOTE: Stop breach check removed from H2 signal generation.
-    // Reason: stop = pbExtreme ± 0.5×ATR, which is naturally inside the pullback range.
-    // Any check against session bars or push bars will falsely trigger.
-    // The UPL situation (spike bar breaching stop zone) is now handled by:
-    //   1. Spike bar filter (removes spike-origin pushes)
-    //   2. 20-min recency check in Tier 2 (removes stale signals)
-    //   3. Most-recent-signal-first selection in Tier 2
-    // App staleness banner handles entry zone validity for the user.
 
     signals.push({
       type: 'H2', dir: dire, score,
@@ -838,8 +629,6 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       stopDist:   +stopDist.toFixed(2),
       atr: +atrV.toFixed(2),
       pushExtreme: +pushExtreme.toFixed(2),
-      targetType,
-      pushATRRatio: +pushATRRatio.toFixed(1),
       retracePct:  +retracePct.toFixed(3),
     });
   }
@@ -849,7 +638,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 // ─── BREAKOUT SCORE (for RT detection) ───────────────────────────────────────
 function computeBreakoutScore(candles, i, sr, atr) {
   const n = candles.length;
-  if (i < 6 || i >= n-1) return null;  // Need at least 1 bar after signal
+  if (i < 6 || i >= n-3) return null;
   const bar = candles[i];
   const isBull = bar.c > bar.o, isBear = bar.c < bar.o;
   if (!isBull && !isBear) return null;
@@ -943,28 +732,16 @@ function computeBreakoutScore(candles, i, sr, atr) {
 }
 
 // ─── RT RETEST SCORING ────────────────────────────────────────────────────────
-function computeRSI(candles, idx, period=14){
-  if(idx < period+1) return null;
-  const slice = candles.slice(idx-period*2, idx+1);
-  if(slice.length < period+1) return null;
-  let gains=0, losses=0;
-  for(let i=slice.length-period; i<slice.length; i++){
-    const d = slice[i].c - slice[i-1].c;
-    if(d>0) gains+=d; else losses+=(-d);
-  }
-  const ag=gains/period, al=losses/period;
-  if(al===0) return 100;
-  return Math.round(100 - 100/(1+ag/al));
-}
-
 function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
   const n = candles.length;
   const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
   const signals = [];
 
-  for (let i = 6; i < n - 1; i++) {  // Need i+1 (retest bar) to exist
+  for (let i = 6; i < n - 3; i++) {
     const tStr = candles[i].t.slice(11, 16);
-    if (tStr >= '14:00') continue;  // Block 14:xx entries
+    if (tStr >= '14:00') continue;
+    // Entry bar (i+1) must be in last 3 bars (15 min)
+    if (i + 1 < n - 3) continue;
 
     const bs = computeBreakoutScore(candles, i, sr, atr);
     if (!bs || bs.score < minScore || (bs.f3 || 0) < minF3) continue;
@@ -1004,11 +781,7 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
 
     const entry  = n1.c;
     const stop   = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
-    // Same target logic: 0.5% floor or 1.5×ATR, whichever is larger
-    const rtPctFloor = entry * 0.005;
-    const rtAtrTarget = atr * 1.5;
-    const rtTargetMove = Math.max(rtAtrTarget, rtPctFloor);
-    const target = isBull ? entry + rtTargetMove : entry - rtTargetMove;
+    const target = isBull ? entry + atr*1.5 : entry - atr*1.5;
     const stopDist = Math.abs(entry - stop);
 
     // Stop floor filter — skip if stop < 0.5×ATR from entry
@@ -1018,34 +791,9 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
-    // RSI confirmation filter — validated on Oct-Dec 2025 data
-    // Bull RT: RSI 50-75 = momentum zone (59% WR vs 38% for RSI>75)
-    // Bear RT: RSI 25-50 = momentum zone (49% WR vs 43% for RSI<25)
-    // Block overbought Bull RT (RSI>75) and oversold Bear RT (RSI<25)
-    const rsiAtSignal = computeRSI(candles, i);
-    if(rsiAtSignal !== null){
-      if(isBull && rsiAtSignal > 75){
-        // Overbought bull breakout — exhaustion risk, skip
-        continue;
-      }
-      if(!isBull && rsiAtSignal < 25){
-        // Oversold bear breakdown — exhaustion risk, skip
-        continue;
-      }
-    }
-    // Store RSI for context
-    const rsiVal = rsiAtSignal;
-
-    // NOTE: Intraday stop breach check intentionally NOT applied to RT.
-    // Reason: RT stop = S/R ± 0.5×ATR. The S/R level is touched multiple times
-    // during pre-breakout consolidation — this is normal, not invalidation.
-    // Backtest confirmed: breach-dropped RT signals = 49% WR (same as baseline 48%).
-    // The check adds no value for RT and kills 97% of valid signals.
-
     signals.push({
       type: 'RT', dir: isBull ? 'bull' : 'bear',
       score: bs.score, f3: bs.f3, f4: bs.f4, f5: bs.f5,
-      rsi: rsiVal,
       signalBar: i, entryBar: i+1,
       entryTime: n1.t,
       entryPrice: +entry.toFixed(2),
@@ -1073,7 +821,7 @@ function isMarketHours() {
   const istMs = utcMs + (5.5 * 60 * 60 * 1000);
   const ist   = new Date(istMs);
   const hm    = ist.getHours() * 100 + ist.getMinutes();
-  return hm >= 915 && hm <= 1525;
+  return hm >= 915 && hm <= 1430;
 }
 
 async function runTier1() {
@@ -1106,40 +854,45 @@ async function runTier1() {
       const zones = computeMicroZones(candles);
 
       // ── H2 PRE-FILTER ──
-      // Does this stock have a push+pullback structure that could yield H2?
-      const h2Sigs = findH2Signals(candles, zones, sr, atr, 55); // Lower threshold for pre-filter
+      // Tier 1 job: find stocks where push+pullback formed in last 60 min (12 bars)
+      // Do NOT require resumption bar — Tier 2 checks for fresh resumption bar
+      const recentCandles = candles.slice(-50); // last 50 bars for pattern detection
+      const h2Sigs = findH2Signals(recentCandles, zones, sr, atr, 45);
       if (h2Sigs.length > 0) {
-        const best = h2Sigs.reduce((a, b) => a.score > b.score ? a : b);
-        h2Candidates.push({
-          sym: symbol,
-          sector: SECTORS[symbol] || 'Other',
-          price: candles[candles.length-1].c,
-          h2Score: best.score,
-          h2Signal: best,
-          atr,
-          candles: candles.slice(-120), // Keep last 120 bars for Tier 2 re-scoring
-          sr,
-          zones,
-          fetchedAt: new Date().toISOString(),
-        });
+        // Only keep if pullback/resumption bar is within last 12 bars (60 min)
+        const n = recentCandles.length;
+        const recentH2 = h2Sigs.filter(sig =>
+          (sig.resumptionBar !== undefined ? sig.resumptionBar : n-1) >= n - 12
+        );
+        if (recentH2.length > 0) {
+          const best = recentH2.reduce((a, b) => a.score > b.score ? a : b);
+          h2Candidates.push({
+            sym: symbol, sector: SECTORS[symbol] || 'Other',
+            price: candles[candles.length-1].c,
+            h2Score: best.score, h2Signal: best,
+            atr, candles: candles.slice(-120), sr, zones,
+            fetchedAt: new Date().toISOString(),
+          });
+        }
       }
 
       // ── RT PRE-FILTER ──
-      // Recent strong S/R break (F3≥14) with incomplete follow-through?
-      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
+      const rtSigs = findRTSignals(recentCandles, sr, atr, 55, 14);
       if (rtSigs.length > 0) {
-        const best = rtSigs.reduce((a, b) => a.score > b.score ? a : b);
-        rtCandidates.push({
-          sym: symbol,
-          sector: SECTORS[symbol] || 'Other',
-          price: candles[candles.length-1].c,
-          rtScore: best.score,
-          rtSignal: best,
-          atr,
-          candles: candles.slice(-120),
-          sr,
-          fetchedAt: new Date().toISOString(),
-        });
+        const n = recentCandles.length;
+        const recentRT = rtSigs.filter(sig =>
+          (sig.signalBar !== undefined ? sig.signalBar : n-2) >= n - 12
+        );
+        if (recentRT.length > 0) {
+          const best = recentRT.reduce((a, b) => a.score > b.score ? a : b);
+          rtCandidates.push({
+            sym: symbol, sector: SECTORS[symbol] || 'Other',
+            price: candles[candles.length-1].c,
+            rtScore: best.score, rtSignal: best,
+            atr, candles: candles.slice(-120), sr,
+            fetchedAt: new Date().toISOString(),
+          });
+        }
       }
 
     } catch(e) {
@@ -1190,64 +943,33 @@ async function runTier2() {
 
       const atr   = computeATR(candles);
       const sr    = freshCandles ? computeSR(candles) : candidate.sr;
-      const zones = computeMicroZones(candles);
 
-      // Run full H2 scoring
-      const h2Sigs = findH2Signals(candles, zones, sr, atr, 60);
-      // Run full RT scoring (with all filters)
-      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
+      // Tier 2: use last 50 bars for pattern context
+      // Resumption bar must be in last 3 bars (15 min) — enforced in findH2Signals
+      const recentCandles2 = candles.slice(-50);
+      const zones = computeMicroZones(recentCandles2);
+
+      // Full H2 scoring — only signals with resumption in last 3 bars returned
+      const h2Sigs = findH2Signals(recentCandles2, zones, sr, atr, 60);
+      // Full RT scoring — only signals with entry in last 3 bars returned
+      const rtSigs = findRTSignals(recentCandles2, sr, atr, 60, 14);
 
       const allSigs = [...h2Sigs, ...rtSigs];
       if (!allSigs.length) continue;
 
-      // Pick MOST RECENT valid signal, not highest scoring
-      // Reason: high-scoring early session signals can override fresh recent ones
-      // Sort by entryTime descending (most recent first), then by score as tiebreak
+      // Pick most recent signal first, then by score
       allSigs.sort((a, b) => {
         const ta = a.entryTime ? new Date(a.entryTime).getTime() : 0;
         const tb = b.entryTime ? new Date(b.entryTime).getTime() : 0;
-        if (tb !== ta) return tb - ta; // most recent first
-        return b.score - a.score;      // tiebreak by score
+        if (tb !== ta) return tb - ta;
+        return b.score - a.score;
       });
       const best = allSigs[0];
 
-      // Synthesise 1-hour context from the same 5-min candles (zero extra API calls)
-      const hourlyBars    = synthesiseHourlyBars(candles);
-      const hourlyContext = computeHourlyContext(hourlyBars);
-
-      // ── STALE SIGNAL CHECK ────────────────────────────────────────────────
-      const currentPrice = candles[candles.length - 1].c;
-      const isBullSig    = best.dir === 'bull';
-
-      // Recency check: compare signal entryTime to last candle time (both IST strings)
-      // This avoids timezone/UTC issues — both are from the same data source
-      if (best.entryTime) {
-        const lastCandleTime = new Date(candles[candles.length-1].t);
-        const signalTime     = new Date(best.entryTime);
-        const minsAgo        = (lastCandleTime - signalTime) / 60000;
-        if (minsAgo > 20) {
-          console.log('[Tier2] '+candidate.sym+' skipped — signal '+minsAgo.toFixed(0)+'min old (>20min cutoff) (entry at '+best.entryTime.slice(11,16)+')');
-          continue;
-        }
-      }
-
-      // Already past target → trade has fully played out
-      const alreadyDone = isBullSig
-        ? currentPrice >= best.targetPrice
-        : currentPrice <= best.targetPrice;
-
-      if (alreadyDone) {
-        console.log('[Tier2] '+candidate.sym+' skipped — target already reached');
-        continue;
-      }
-
-      // R:R gate — if risk:reward < 1.2:1 do not recommend
+      // R:R gate
       const rrCheck = Math.abs(best.targetPrice - best.entryPrice) /
-                      Math.abs(best.stopPrice  - best.entryPrice);
-      if (rrCheck < 1.2) {
-        console.log('[Tier2] '+candidate.sym+' skipped — poor R:R '+rrCheck.toFixed(2)+':1 (min 1.2:1 required)');
-        continue;
-      }
+                      (Math.abs(best.stopPrice - best.entryPrice) || 0.01);
+      if (rrCheck < 1.2) { continue; }
 
       results.push({
         sym: candidate.sym,
@@ -1267,9 +989,6 @@ async function runTier2() {
         entryTime: best.entryTime,
         tier: best.tier || null,
         f3: best.f3 || null,
-        hourlyTrend: hourlyContext?.trend || null,
-        hourlyEmaSlope: hourlyContext?.emaSlope || null,
-        hourlyBars: hourlyContext?.hourlyBarsCount || null,
         // Include all signals for Claude context
         allSignals: allSigs.map(s => ({
           type: s.type, dir: s.dir, score: s.score,
@@ -1293,7 +1012,7 @@ async function runTier2() {
 // ─── START TIER 1 ─────────────────────────────────────────────────────────────
 // Run on startup (will skip if outside market hours or Kite not ready)
 setTimeout(runTier1, 5000); // 5s delay on startup to let Kite auth load
-setInterval(runTier1, 10 * 60 * 1000); // Every 10 minutes
+setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
@@ -1342,68 +1061,6 @@ app.get('/status', (req, res) => res.json({
   },
 }));
 
-// ─── SYNTHESISE 1-HOUR BARS FROM 5-MIN CANDLES ──────────────────────────────
-// Zero extra API calls — uses 5-min data already fetched in Tier 2
-// NSE session: 09:15-10:14 = hour 1, 10:15-11:14 = hour 2, etc.
-function synthesiseHourlyBars(candles5m) {
-  if (!candles5m || candles5m.length < 12) return [];
-  const hourMap = {};
-  for (const c of candles5m) {
-    const timeStr = c.t.slice(11, 16); // HH:MM
-    const [h, m] = timeStr.split(':').map(Number);
-    // Offset from NSE open (09:15)
-    const minsFromOpen = (h - 9) * 60 + (m - 15);
-    const hourKey = Math.floor(minsFromOpen / 60);
-    if (hourKey < 0) continue;
-    if (!hourMap[hourKey]) {
-      hourMap[hourKey] = { o: c.o, h: c.h, l: c.l, c: c.c, v: c.v, t: c.t, bars: 1 };
-    } else {
-      const hb = hourMap[hourKey];
-      hb.h = Math.max(hb.h, c.h);
-      hb.l = Math.min(hb.l, c.l);
-      hb.c = c.c;
-      hb.v += c.v;
-      hb.bars++;
-    }
-  }
-  return Object.keys(hourMap).sort((a,b)=>+a-+b).map(k => hourMap[k]);
-}
-
-function computeHourlyContext(hourlyBars) {
-  if (!hourlyBars || hourlyBars.length < 2) return null;
-  // EMA21 on hourly bars (or all bars if fewer)
-  const n = hourlyBars.length;
-  const period = Math.min(21, n);
-  const k = 2 / (period + 1);
-  let ema = hourlyBars[0].c;
-  for (let i = 1; i < n; i++) {
-    ema = hourlyBars[i].c * k + ema * (1 - k);
-  }
-  const lastBar = hourlyBars[n-1];
-  const prevBar = hourlyBars[n-2];
-  // Trend direction from last 3-5 hourly closes
-  const last5 = hourlyBars.slice(-5);
-  const higherHighs = last5.every((b, i) => i === 0 || b.h >= last5[i-1].h);
-  const lowerLows   = last5.every((b, i) => i === 0 || b.l <= last5[i-1].l);
-  const higherCloses= last5.filter((b,i)=> i>0 && b.c > last5[i-1].c).length;
-  const lowerCloses = last5.filter((b,i)=> i>0 && b.c < last5[i-1].c).length;
-  const emaSlope = n >= 3
-    ? (hourlyBars[n-1].c - hourlyBars[n-3].c) / hourlyBars[n-3].c * 100
-    : 0;
-  let trend = 'sideways';
-  if (emaSlope > 0.15 || higherCloses >= 3) trend = 'up';
-  else if (emaSlope < -0.15 || lowerCloses >= 3) trend = 'down';
-  const priceVsEma = ((lastBar.c - ema) / ema * 100).toFixed(2);
-  return {
-    trend,                                    // 'up' | 'down' | 'sideways'
-    emaSlope: +emaSlope.toFixed(3),
-    ema: +ema.toFixed(2),
-    priceVsEma: +priceVsEma,
-    hourlyBarsCount: n,
-    lastHourDir: lastBar.c > lastBar.o ? 'up' : 'down',
-  };
-}
-
 app.get('/generate', async (req, res) => {
   if (!kiteReady()) {
     return res.json({
@@ -1425,19 +1082,11 @@ app.get('/generate', async (req, res) => {
   const stocksSummary = top.map(s => {
     const zoneLow  = s.entryPrice && s.atr ? +(s.entryPrice - s.atr*0.5).toFixed(2) : null;
     const zoneHigh = s.entryPrice && s.atr ? +(s.entryPrice + s.atr*0.5).toFixed(2) : null;
-    const htCtx = s.hourlyTrend
-      ? ` 1H=${s.hourlyTrend.toUpperCase()}(slope${s.hourlyEmaSlope>0?'+':''}${s.hourlyEmaSlope}%)`
-      : '';
-    const htAlign = s.hourlyTrend && (
-      (s.dir==='bull' && s.hourlyTrend==='up')   ||
-      (s.dir==='bear' && s.hourlyTrend==='down')
-    ) ? ' ALIGNED' : s.hourlyTrend && s.hourlyTrend!=='sideways' ? ' COUNTER-TREND' : '';
     return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
       `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
-      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh} targetType=${s.targetType||'atr'}` +
+      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
       `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
-      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}` +
-      htCtx + htAlign;
+      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`;
   }).join('\n');
 
   res.json({
@@ -1608,5 +1257,5 @@ app.get('/candles/:symbol', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.4 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log(`Signal server v6.2 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

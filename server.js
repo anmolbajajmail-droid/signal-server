@@ -1195,7 +1195,16 @@ async function runTier2() {
       const allSigs = [...h2Sigs, ...rtSigs];
       if (!allSigs.length) continue;
 
-      const best = allSigs.reduce((a, b) => a.score > b.score ? a : b);
+      // Pick MOST RECENT valid signal, not highest scoring
+      // Reason: high-scoring early session signals can override fresh recent ones
+      // Sort by entryTime descending (most recent first), then by score as tiebreak
+      allSigs.sort((a, b) => {
+        const ta = a.entryTime ? new Date(a.entryTime).getTime() : 0;
+        const tb = b.entryTime ? new Date(b.entryTime).getTime() : 0;
+        if (tb !== ta) return tb - ta; // most recent first
+        return b.score - a.score;      // tiebreak by score
+      });
+      const best = allSigs[0];
 
       // Synthesise 1-hour context from the same 5-min candles (zero extra API calls)
       const hourlyBars    = synthesiseHourlyBars(candles);
@@ -1205,13 +1214,16 @@ async function runTier2() {
       const currentPrice = candles[candles.length - 1].c;
       const isBullSig    = best.dir === 'bull';
 
-      // Recency check using wall clock time — signal must be within 30 min
-      // This works correctly even when cached candle arrays are used
-      const signalTime   = best.entryTime || best.resumptionBar;
-      const signalDate   = signalTime ? new Date(signalTime) : null;
-      const minsOld      = signalDate ? (Date.now() - signalDate.getTime()) / 60000 : 0;
-      if (signalDate && minsOld > 30) {
-        continue; // Signal too old — entry was more than 30 min ago
+      // Recency check: compare signal entryTime to last candle time (both IST strings)
+      // This avoids timezone/UTC issues — both are from the same data source
+      if (best.entryTime) {
+        const lastCandleTime = new Date(candles[candles.length-1].t);
+        const signalTime     = new Date(best.entryTime);
+        const minsAgo        = (lastCandleTime - signalTime) / 60000;
+        if (minsAgo > 20) {
+          console.log('[Tier2] '+candidate.sym+' skipped — signal '+minsAgo.toFixed(0)+'min old (>20min cutoff) (entry at '+best.entryTime.slice(11,16)+')');
+          continue;
+        }
       }
 
       // Already past target → trade has fully played out

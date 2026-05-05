@@ -784,12 +784,6 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       p7 = Math.min(p7, 15); break;
     }
     if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
-    // Recency check: resumption bar must be within last 6 bars (30 min)
-    // Covers: Tier1 cycle (10 min) + Generate time (30s) + reading (2 min)
-    if (rbi < n - 6) {
-      continue;
-    }
-
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
     if (score < minScore || retracePct > 0.80 || pbc !== 2) continue;
@@ -1019,11 +1013,6 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
-    // Recency check: entry bar (N+1) must be within last 6 bars (30 min)
-    if (i + 1 < n - 6) {
-      continue;
-    }
-
     // RSI confirmation filter — validated on Oct-Dec 2025 data
     // Bull RT: RSI 50-75 = momentum zone (59% WR vs 38% for RSI>75)
     // Bear RT: RSI 25-50 = momentum zone (49% WR vs 43% for RSI<25)
@@ -1213,20 +1202,25 @@ async function runTier2() {
       const hourlyContext = computeHourlyContext(hourlyBars);
 
       // ── STALE SIGNAL CHECK ────────────────────────────────────────────────
-      // If current price has already moved past target → trade has played out
-      // Do not present a signal that is 3 hours old and already completed
       const currentPrice = candles[candles.length - 1].c;
       const isBullSig    = best.dir === 'bull';
 
-      // Already past target → trade has played out
+      // Recency check using wall clock time — signal must be within 30 min
+      // This works correctly even when cached candle arrays are used
+      const signalTime   = best.entryTime || best.resumptionBar;
+      const signalDate   = signalTime ? new Date(signalTime) : null;
+      const minsOld      = signalDate ? (Date.now() - signalDate.getTime()) / 60000 : 0;
+      if (signalDate && minsOld > 30) {
+        continue; // Signal too old — entry was more than 30 min ago
+      }
+
+      // Already past target → trade has fully played out
       const alreadyDone = isBullSig
         ? currentPrice >= best.targetPrice
         : currentPrice <= best.targetPrice;
 
-      // Drop only if target already hit (trade has fully played out)
-      // Entry zone validity is shown to user via app staleness banners — not a server gate
       if (alreadyDone) {
-        console.log('[Tier2] '+candidate.sym+' skipped — target already reached. Entry='+best.entryPrice+' Current='+currentPrice+' Target='+best.targetPrice);
+        console.log('[Tier2] '+candidate.sym+' skipped — target already reached');
         continue;
       }
 

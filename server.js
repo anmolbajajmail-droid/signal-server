@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.3 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -530,6 +530,35 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const pushVol  = candles.slice(ps, me+1).reduce((s, b) => s + b.v, 0) / (me - ps + 1);
     const volPre   = candles.slice(Math.max(0, ps-20), ps).map(b => b.v);
     const avgVolPre = volPre.length ? volPre.reduce((a, b) => a+b, 0) / volPre.length : pushVol;
+    // ── SPIKE BAR FILTER (validated: spike-origin signals = 40% WR vs 69% clean) ──
+    // A spike bar = single bar with vol >3× avg that is IMMEDIATELY REVERSED next bar
+    // If the push extreme (high for bull push, low for bear push) was set by a spike bar
+    // with no follow-through → this is not a real push → skip signal
+    let hasSpikeOrigin = false;
+    {
+      const pushBars = candles.slice(ps, me+1);
+      for (let pi = 0; pi < pushBars.length - 1; pi++) {
+        const pb  = pushBars[pi];
+        const nxt = pushBars[pi + 1];
+        const pbAvg = pb.v > 0 ? avgVolPre : 1;
+        const volR  = pb.v / (pbAvg || 1);
+        if (volR < 3.0) continue; // not a spike volume-wise
+        // For bull push: spike = bear bar (big down) immediately reversed up
+        // For bear push: spike = bull bar (big up) immediately reversed down
+        if (iu) {
+          // Bull push looking for bear spike that reverses up
+          if (pb.c < pb.o && nxt.c > pb.c) { hasSpikeOrigin = true; break; }
+        } else {
+          // Bear push looking for bull spike that reverses down
+          if (pb.c > pb.o && nxt.c < pb.c) { hasSpikeOrigin = true; break; }
+        }
+      }
+    }
+    if (hasSpikeOrigin) {
+      console.log('[H2] Spike-origin signal skipped — push contained a rejected spike bar (40% WR in backtest)');
+      continue;
+    }
+
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
     if (pushVol > avgVolPre * 1.2) p1 = Math.min(p1 + 3, 15);
 
@@ -613,6 +642,23 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const stop   = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
     const target = iu ? ep + atrV*1.5 : ep - atrV*1.5;
     const stopDist = Math.abs(ep - stop);
+
+    // Intraday invalidation check: has stop level been breached at any point today?
+    // Get today's date from the resumption bar
+    const todayDate = candles[rbi].t.slice(0,10);
+    const todayBars = candles.filter(c=>c.t.slice(0,10)===todayDate);
+    const sessionH = todayBars.length ? Math.max(...todayBars.map(b=>b.h)) : Infinity;
+    const sessionL = todayBars.length ? Math.min(...todayBars.map(b=>b.l)) : -Infinity;
+    const stopLevel = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
+    // If stop level was breached at any bar today before resumption = pattern already invalid
+    const stopEverBreached = iu
+      ? todayBars.slice(0, todayBars.findIndex(b=>b.t===candles[rbi].t)+1).some(b=>b.l<=stopLevel)
+      : todayBars.slice(0, todayBars.findIndex(b=>b.t===candles[rbi].t)+1).some(b=>b.h>=stopLevel);
+    if(stopEverBreached){
+      // Pattern was already invalidated intraday — do not generate signal
+      console.log('[H2] '+dire+' signal on '+candles[rbi].t.slice(11,16)+' SKIPPED — stop level '+stopLevel.toFixed(2)+' was breached earlier in session');
+      continue;
+    }
 
     signals.push({
       type: 'H2', dir: dire, score,
@@ -785,6 +831,19 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
+    // Intraday invalidation check for RT: was stop level breached before this signal?
+    const rtTodayDate = candles[i+1].t.slice(0,10);
+    const rtTodayBars = candles.filter(c=>c.t.slice(0,10)===rtTodayDate);
+    const rtStopLevel = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
+    const rtSignalBarIdx = rtTodayBars.findIndex(b=>b.t===candles[i+1].t);
+    const rtStopBreached = isBull
+      ? rtTodayBars.slice(0, rtSignalBarIdx+1).some(b=>b.l<=rtStopLevel)
+      : rtTodayBars.slice(0, rtSignalBarIdx+1).some(b=>b.h>=rtStopLevel);
+    if(rtStopBreached){
+      console.log('[RT] signal SKIPPED — stop level '+rtStopLevel.toFixed(2)+' was breached earlier in session');
+      continue;
+    }
+
     signals.push({
       type: 'RT', dir: isBull ? 'bull' : 'bear',
       score: bs.score, f3: bs.f3, f4: bs.f4, f5: bs.f5,
@@ -944,6 +1003,10 @@ async function runTier2() {
 
       const best = allSigs.reduce((a, b) => a.score > b.score ? a : b);
 
+      // Synthesise 1-hour context from the same 5-min candles (zero extra API calls)
+      const hourlyBars    = synthesiseHourlyBars(candles);
+      const hourlyContext = computeHourlyContext(hourlyBars);
+
       results.push({
         sym: candidate.sym,
         sector: candidate.sector,
@@ -962,6 +1025,9 @@ async function runTier2() {
         entryTime: best.entryTime,
         tier: best.tier || null,
         f3: best.f3 || null,
+        hourlyTrend: hourlyContext?.trend || null,
+        hourlyEmaSlope: hourlyContext?.emaSlope || null,
+        hourlyBars: hourlyContext?.hourlyBarsCount || null,
         // Include all signals for Claude context
         allSignals: allSigs.map(s => ({
           type: s.type, dir: s.dir, score: s.score,
@@ -1034,6 +1100,68 @@ app.get('/status', (req, res) => res.json({
   },
 }));
 
+// ─── SYNTHESISE 1-HOUR BARS FROM 5-MIN CANDLES ──────────────────────────────
+// Zero extra API calls — uses 5-min data already fetched in Tier 2
+// NSE session: 09:15-10:14 = hour 1, 10:15-11:14 = hour 2, etc.
+function synthesiseHourlyBars(candles5m) {
+  if (!candles5m || candles5m.length < 12) return [];
+  const hourMap = {};
+  for (const c of candles5m) {
+    const timeStr = c.t.slice(11, 16); // HH:MM
+    const [h, m] = timeStr.split(':').map(Number);
+    // Offset from NSE open (09:15)
+    const minsFromOpen = (h - 9) * 60 + (m - 15);
+    const hourKey = Math.floor(minsFromOpen / 60);
+    if (hourKey < 0) continue;
+    if (!hourMap[hourKey]) {
+      hourMap[hourKey] = { o: c.o, h: c.h, l: c.l, c: c.c, v: c.v, t: c.t, bars: 1 };
+    } else {
+      const hb = hourMap[hourKey];
+      hb.h = Math.max(hb.h, c.h);
+      hb.l = Math.min(hb.l, c.l);
+      hb.c = c.c;
+      hb.v += c.v;
+      hb.bars++;
+    }
+  }
+  return Object.keys(hourMap).sort((a,b)=>+a-+b).map(k => hourMap[k]);
+}
+
+function computeHourlyContext(hourlyBars) {
+  if (!hourlyBars || hourlyBars.length < 2) return null;
+  // EMA21 on hourly bars (or all bars if fewer)
+  const n = hourlyBars.length;
+  const period = Math.min(21, n);
+  const k = 2 / (period + 1);
+  let ema = hourlyBars[0].c;
+  for (let i = 1; i < n; i++) {
+    ema = hourlyBars[i].c * k + ema * (1 - k);
+  }
+  const lastBar = hourlyBars[n-1];
+  const prevBar = hourlyBars[n-2];
+  // Trend direction from last 3-5 hourly closes
+  const last5 = hourlyBars.slice(-5);
+  const higherHighs = last5.every((b, i) => i === 0 || b.h >= last5[i-1].h);
+  const lowerLows   = last5.every((b, i) => i === 0 || b.l <= last5[i-1].l);
+  const higherCloses= last5.filter((b,i)=> i>0 && b.c > last5[i-1].c).length;
+  const lowerCloses = last5.filter((b,i)=> i>0 && b.c < last5[i-1].c).length;
+  const emaSlope = n >= 3
+    ? (hourlyBars[n-1].c - hourlyBars[n-3].c) / hourlyBars[n-3].c * 100
+    : 0;
+  let trend = 'sideways';
+  if (emaSlope > 0.15 || higherCloses >= 3) trend = 'up';
+  else if (emaSlope < -0.15 || lowerCloses >= 3) trend = 'down';
+  const priceVsEma = ((lastBar.c - ema) / ema * 100).toFixed(2);
+  return {
+    trend,                                    // 'up' | 'down' | 'sideways'
+    emaSlope: +emaSlope.toFixed(3),
+    ema: +ema.toFixed(2),
+    priceVsEma: +priceVsEma,
+    hourlyBarsCount: n,
+    lastHourDir: lastBar.c > lastBar.o ? 'up' : 'down',
+  };
+}
+
 app.get('/generate', async (req, res) => {
   if (!kiteReady()) {
     return res.json({
@@ -1055,11 +1183,19 @@ app.get('/generate', async (req, res) => {
   const stocksSummary = top.map(s => {
     const zoneLow  = s.entryPrice && s.atr ? +(s.entryPrice - s.atr*0.5).toFixed(2) : null;
     const zoneHigh = s.entryPrice && s.atr ? +(s.entryPrice + s.atr*0.5).toFixed(2) : null;
+    const htCtx = s.hourlyTrend
+      ? ` 1H=${s.hourlyTrend.toUpperCase()}(slope${s.hourlyEmaSlope>0?'+':''}${s.hourlyEmaSlope}%)`
+      : '';
+    const htAlign = s.hourlyTrend && (
+      (s.dir==='bull' && s.hourlyTrend==='up')   ||
+      (s.dir==='bear' && s.hourlyTrend==='down')
+    ) ? ' ALIGNED' : s.hourlyTrend && s.hourlyTrend!=='sideways' ? ' COUNTER-TREND' : '';
     return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
       `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
       `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
       `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
-      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`;
+      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}` +
+      htCtx + htAlign;
   }).join('\n');
 
   res.json({
@@ -1230,5 +1366,5 @@ app.get('/candles/:symbol', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.2 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log(`Signal server v6.3 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

@@ -800,22 +800,15 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const targetType = usePushExtreme ? 'pushExtreme' : (pctFloor > atrTarget ? 'pctFloor' : 'atr');
     const stopDist = Math.abs(ep - stop);
 
-    // Intraday invalidation check: has stop level been breached at any point today?
-    // Get today's date from the resumption bar
-    const todayDate = candles[rbi].t.slice(0,10);
-    const todayBars = candles.filter(c=>c.t.slice(0,10)===todayDate);
-    const sessionH = todayBars.length ? Math.max(...todayBars.map(b=>b.h)) : Infinity;
-    const sessionL = todayBars.length ? Math.min(...todayBars.map(b=>b.l)) : -Infinity;
     const stopLevel = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // If stop level was breached at any bar today before resumption = pattern already invalid
-    const stopEverBreached = iu
-      ? todayBars.slice(0, todayBars.findIndex(b=>b.t===candles[rbi].t)+1).some(b=>b.l<=stopLevel)
-      : todayBars.slice(0, todayBars.findIndex(b=>b.t===candles[rbi].t)+1).some(b=>b.h>=stopLevel);
-    if(stopEverBreached){
-      // Pattern was already invalidated intraday — do not generate signal
-      console.log('[H2] '+dire+' signal on '+candles[rbi].t.slice(11,16)+' SKIPPED — stop level '+stopLevel.toFixed(2)+' was breached earlier in session');
-      continue;
-    }
+    // NOTE: Stop breach check removed from H2 signal generation.
+    // Reason: stop = pbExtreme ± 0.5×ATR, which is naturally inside the pullback range.
+    // Any check against session bars or push bars will falsely trigger.
+    // The UPL situation (spike bar breaching stop zone) is now handled by:
+    //   1. Spike bar filter (removes spike-origin pushes)
+    //   2. 20-min recency check in Tier 2 (removes stale signals)
+    //   3. Most-recent-signal-first selection in Tier 2
+    // App staleness banner handles entry zone validity for the user.
 
     signals.push({
       type: 'H2', dir: dire, score,

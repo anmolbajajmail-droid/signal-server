@@ -674,33 +674,49 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const pushATRRatio = pushMove / atrV;
     const extendedPenalty = pushATRRatio > 5.0 ? Math.min(Math.round((pushATRRatio - 5.0) * 3), 10) : 0;
 
-    // ── SPIKE BAR FILTER (validated: spike-origin signals = 40% WR vs 69% clean) ──
-    // A spike bar = single bar with vol >3× avg that is IMMEDIATELY REVERSED next bar
-    // If the push extreme (high for bull push, low for bear push) was set by a spike bar
-    // with no follow-through → this is not a real push → skip signal
+    // ── SPIKE BAR FILTER ─────────────────────────────────────────────────────
+    // Only flag if the bar that SET the push extreme is a spike that was immediately reversed
+    // This is specific to UPL-type situations, not general high-volume bars
     let hasSpikeOrigin = false;
     {
       const pushBars = candles.slice(ps, me+1);
-      for (let pi = 0; pi < pushBars.length - 1; pi++) {
+      // Find the bar that actually set the push extreme
+      let extremeBarIdx = 0;
+      if (iu) {
+        // Bull push: find bar with highest high
+        let maxH = -Infinity;
+        pushBars.forEach((b,i) => { if (b.h > maxH) { maxH = b.h; extremeBarIdx = i; }});
+      } else {
+        // Bear push: find bar with lowest low
+        let minL = Infinity;
+        pushBars.forEach((b,i) => { if (b.l < minL) { minL = b.l; extremeBarIdx = i; }});
+      }
+      // Only check the extreme bar and ±1 bars around it
+      const checkFrom = Math.max(0, extremeBarIdx - 1);
+      const checkTo   = Math.min(pushBars.length - 2, extremeBarIdx + 1);
+      for (let pi = checkFrom; pi <= checkTo; pi++) {
         const pb  = pushBars[pi];
         const nxt = pushBars[pi + 1];
-        const pbAvg = pb.v > 0 ? avgVolPre : 1;
-        const volR  = pb.v / (pbAvg || 1);
-        if (volR < 3.0) continue; // not a spike volume-wise
-        // For bull push: spike = bear bar (big down) immediately reversed up
-        // For bear push: spike = bull bar (big up) immediately reversed down
+        if (!nxt) continue;
+        const volR = pb.v / (avgVolPre || 1);
+        if (volR < 4.0) continue; // Raised to 4× to avoid false positives
+        const bodyRatio = Math.abs(pb.c - pb.o) / ((pb.h - pb.l) || 0.01);
+        if (bodyRatio < 0.5) continue; // Must be a strong body bar
         if (iu) {
-          // Bull push looking for bear spike that reverses up
-          if (pb.c < pb.o && nxt.c > pb.c) { hasSpikeOrigin = true; break; }
+          // Bull push: spike = bar that set the high, next bar reverses hard
+          if (pb.h === pushBars.reduce((m,b) => Math.max(m,b.h), -Infinity)) {
+            if (nxt.c < pb.o) { hasSpikeOrigin = true; break; } // next bar closes below spike open
+          }
         } else {
-          // Bear push looking for bull spike that reverses down
-          if (pb.c > pb.o && nxt.c < pb.c) { hasSpikeOrigin = true; break; }
+          // Bear push: spike = bar that set the low, next bar reverses hard
+          if (pb.l === pushBars.reduce((m,b) => Math.min(m,b.l), Infinity)) {
+            if (nxt.c > pb.o) { hasSpikeOrigin = true; break; } // next bar closes above spike open
+          }
         }
       }
     }
     if (hasSpikeOrigin) {
-      console.log('[H2] Spike-origin signal skipped — push contained a rejected spike bar (40% WR in backtest)');
-      continue;
+      continue; // Silent skip — spike filter
     }
 
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;

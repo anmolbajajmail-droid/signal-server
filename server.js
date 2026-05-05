@@ -668,17 +668,11 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const pushVol  = candles.slice(ps, me+1).reduce((s, b) => s + b.v, 0) / (me - ps + 1);
     const volPre   = candles.slice(Math.max(0, ps-20), ps).map(b => b.v);
     const avgVolPre = volPre.length ? volPre.reduce((a, b) => a+b, 0) / volPre.length : pushVol;
-    // ── F1: EXTENDED TREND PENALTY ───────────────────────────────────────────
-    // If the total push from swing origin is too extended, bears are exhausted
-    // H2 Bear on 5-6×ATR push = likely near reversal, not continuation
-    // Penalty: >4×ATR → -8 from P1. >6×ATR → skip entirely.
+    // ── F1: EXTENDED TREND PENALTY (score reduction only, no hard skip) ─────
+    // Not backtested as hard gate — use as score penalty only
+    // >4×ATR push = reduce P1 score. No hard skip.
     const pushATRRatio = pushMove / atrV;
-    if (pushATRRatio > 6.0) {
-      console.log('[H2] Extended trend skip: push='+pushATRRatio.toFixed(1)+'×ATR (>6)');
-      continue;
-    }
-    const extendedPenalty = pushATRRatio > 4.0 ? Math.round((pushATRRatio - 4.0) * 4) : 0;
-    // extendedPenalty: 4×ATR=0, 5×ATR=4, 6×ATR=8 (capped by skip above)
+    const extendedPenalty = pushATRRatio > 5.0 ? Math.min(Math.round((pushATRRatio - 5.0) * 3), 10) : 0;
 
     // ── SPIKE BAR FILTER (validated: spike-origin signals = 40% WR vs 69% clean) ──
     // A spike bar = single bar with vol >3× avg that is IMMEDIATELY REVERSED next bar
@@ -710,6 +704,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     }
 
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
+    p1 = Math.max(0, p1 - extendedPenalty); // Extended trend reduces push quality score
     if (pushVol > avgVolPre * 1.2) p1 = Math.min(p1 + 3, 15);
     p1 = Math.max(0, p1 - extendedPenalty); // F1: extended trend reduces P1
 

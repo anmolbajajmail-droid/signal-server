@@ -1055,13 +1055,37 @@ async function runTier2() {
       // Do not present a signal that is 3 hours old and already completed
       const currentPrice = candles[candles.length - 1].c;
       const isBullSig    = best.dir === 'bull';
-      const alreadyDone  = isBullSig
-        ? currentPrice >= best.targetPrice                     // Bull target already hit
-        : currentPrice <= best.targetPrice;                    // Bear target already hit
-      const tooFarFromEntry = Math.abs(currentPrice - best.entryPrice) > best.atr * 2.0;
-      if (alreadyDone || tooFarFromEntry) {
-        const reason = alreadyDone ? 'target already reached' : 'price moved 2×ATR from entry';
-        console.log(`[Tier2] ${candidate.sym} skipped — signal stale (${reason}). Entry=${best.entryPrice} Current=${currentPrice} Target=${best.targetPrice}`);
+
+      // Already past target → trade has played out
+      const alreadyDone = isBullSig
+        ? currentPrice >= best.targetPrice
+        : currentPrice <= best.targetPrice;
+
+      // Entry is unreachable:
+      // For LONG: current price is more than 0.5×ATR ABOVE entry = already ran past entry
+      // For SHORT: current price is more than 0.5×ATR BELOW entry = can't sell at that price
+      const entryUnreachable = isBullSig
+        ? currentPrice > best.entryPrice + best.atr * 0.5   // bull: price above entry zone
+        : currentPrice < best.entryPrice - best.atr * 0.5;  // short: price below entry zone
+
+      // Price moved too far in wrong direction (against signal)
+      const tooFarWrongWay = isBullSig
+        ? currentPrice < best.entryPrice - best.atr * 2.0   // bull: price fell 2×ATR below entry
+        : currentPrice > best.entryPrice + best.atr * 2.0;  // short: price rose 2×ATR above entry
+
+      if (alreadyDone || entryUnreachable || tooFarWrongWay) {
+        const reason = alreadyDone ? 'target already reached'
+          : entryUnreachable ? 'entry price unreachable (price moved past entry zone)'
+          : 'price moved 2×ATR against signal';
+        console.log('[Tier2] '+candidate.sym+' skipped — signal stale ('+reason+'). Entry='+best.entryPrice+' Current='+currentPrice);
+        continue;
+      }
+
+      // R:R gate — if risk:reward < 1.2:1 do not recommend
+      const rrCheck = Math.abs(best.targetPrice - best.entryPrice) /
+                      Math.abs(best.stopPrice  - best.entryPrice);
+      if (rrCheck < 1.2) {
+        console.log('[Tier2] '+candidate.sym+' skipped — poor R:R '+rrCheck.toFixed(2)+':1 (min 1.2:1 required)');
         continue;
       }
 

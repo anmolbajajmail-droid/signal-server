@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.3 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.4 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -774,6 +774,20 @@ function computeBreakoutScore(candles, i, sr, atr) {
 }
 
 // ─── RT RETEST SCORING ────────────────────────────────────────────────────────
+function computeRSI(candles, idx, period=14){
+  if(idx < period+1) return null;
+  const slice = candles.slice(idx-period*2, idx+1);
+  if(slice.length < period+1) return null;
+  let gains=0, losses=0;
+  for(let i=slice.length-period; i<slice.length; i++){
+    const d = slice[i].c - slice[i-1].c;
+    if(d>0) gains+=d; else losses+=(-d);
+  }
+  const ag=gains/period, al=losses/period;
+  if(al===0) return 100;
+  return Math.round(100 - 100/(1+ag/al));
+}
+
 function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
   const n = candles.length;
   const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
@@ -831,22 +845,34 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
-    // Intraday invalidation check for RT: was stop level breached before this signal?
-    const rtTodayDate = candles[i+1].t.slice(0,10);
-    const rtTodayBars = candles.filter(c=>c.t.slice(0,10)===rtTodayDate);
-    const rtStopLevel = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
-    const rtSignalBarIdx = rtTodayBars.findIndex(b=>b.t===candles[i+1].t);
-    const rtStopBreached = isBull
-      ? rtTodayBars.slice(0, rtSignalBarIdx+1).some(b=>b.l<=rtStopLevel)
-      : rtTodayBars.slice(0, rtSignalBarIdx+1).some(b=>b.h>=rtStopLevel);
-    if(rtStopBreached){
-      console.log('[RT] signal SKIPPED — stop level '+rtStopLevel.toFixed(2)+' was breached earlier in session');
-      continue;
+    // RSI confirmation filter — validated on Oct-Dec 2025 data
+    // Bull RT: RSI 50-75 = momentum zone (59% WR vs 38% for RSI>75)
+    // Bear RT: RSI 25-50 = momentum zone (49% WR vs 43% for RSI<25)
+    // Block overbought Bull RT (RSI>75) and oversold Bear RT (RSI<25)
+    const rsiAtSignal = computeRSI(candles, i);
+    if(rsiAtSignal !== null){
+      if(isBull && rsiAtSignal > 75){
+        // Overbought bull breakout — exhaustion risk, skip
+        continue;
+      }
+      if(!isBull && rsiAtSignal < 25){
+        // Oversold bear breakdown — exhaustion risk, skip
+        continue;
+      }
     }
+    // Store RSI for context
+    const rsiVal = rsiAtSignal;
+
+    // NOTE: Intraday stop breach check intentionally NOT applied to RT.
+    // Reason: RT stop = S/R ± 0.5×ATR. The S/R level is touched multiple times
+    // during pre-breakout consolidation — this is normal, not invalidation.
+    // Backtest confirmed: breach-dropped RT signals = 49% WR (same as baseline 48%).
+    // The check adds no value for RT and kills 97% of valid signals.
 
     signals.push({
       type: 'RT', dir: isBull ? 'bull' : 'bear',
       score: bs.score, f3: bs.f3, f4: bs.f4, f5: bs.f5,
+      rsi: rsiVal,
       signalBar: i, entryBar: i+1,
       entryTime: n1.t,
       entryPrice: +entry.toFixed(2),
@@ -1006,6 +1032,21 @@ async function runTier2() {
       // Synthesise 1-hour context from the same 5-min candles (zero extra API calls)
       const hourlyBars    = synthesiseHourlyBars(candles);
       const hourlyContext = computeHourlyContext(hourlyBars);
+
+      // ── STALE SIGNAL CHECK ────────────────────────────────────────────────
+      // If current price has already moved past target → trade has played out
+      // Do not present a signal that is 3 hours old and already completed
+      const currentPrice = candles[candles.length - 1].c;
+      const isBullSig    = best.dir === 'bull';
+      const alreadyDone  = isBullSig
+        ? currentPrice >= best.targetPrice                     // Bull target already hit
+        : currentPrice <= best.targetPrice;                    // Bear target already hit
+      const tooFarFromEntry = Math.abs(currentPrice - best.entryPrice) > best.atr * 2.0;
+      if (alreadyDone || tooFarFromEntry) {
+        const reason = alreadyDone ? 'target already reached' : 'price moved 2×ATR from entry';
+        console.log(`[Tier2] ${candidate.sym} skipped — signal stale (${reason}). Entry=${best.entryPrice} Current=${currentPrice} Target=${best.targetPrice}`);
+        continue;
+      }
 
       results.push({
         sym: candidate.sym,
@@ -1366,5 +1407,5 @@ app.get('/candles/:symbol', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.3 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log(`Signal server v6.4 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

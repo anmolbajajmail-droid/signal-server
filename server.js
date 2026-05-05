@@ -821,7 +821,7 @@ function isMarketHours() {
   const istMs = utcMs + (5.5 * 60 * 60 * 1000);
   const ist   = new Date(istMs);
   const hm    = ist.getHours() * 100 + ist.getMinutes();
-  return hm >= 915 && hm <= 1430;
+  return hm >= 915 && hm <= 1525;
 }
 
 async function runTier1() {

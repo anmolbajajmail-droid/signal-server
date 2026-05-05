@@ -633,6 +633,12 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       p7 = Math.min(p7, 15); break;
     }
     if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
+    // Recency check: resumption bar must be within last 3 bars (15 min)
+    // After 15 min the trade has either worked or failed — no longer actionable
+    // Tier 2 runs on fresh candles so this catches stale historical signals
+    if (rbi < n - 3) {
+      continue; // Signal too old — not logged to avoid noise
+    }
 
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
@@ -862,6 +868,11 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
+    // Recency check: entry bar (N+1) must be within last 3 bars (15 min)
+    if (i + 1 < n - 3) {
+      continue; // RT signal too old
+    }
+
     // RSI confirmation filter — validated on Oct-Dec 2025 data
     // Bull RT: RSI 50-75 = momentum zone (59% WR vs 38% for RSI>75)
     // Bear RT: RSI 25-50 = momentum zone (49% WR vs 43% for RSI<25)
@@ -1061,23 +1072,10 @@ async function runTier2() {
         ? currentPrice >= best.targetPrice
         : currentPrice <= best.targetPrice;
 
-      // Entry is unreachable:
-      // For LONG: current price is more than 0.5×ATR ABOVE entry = already ran past entry
-      // For SHORT: current price is more than 0.5×ATR BELOW entry = can't sell at that price
-      const entryUnreachable = isBullSig
-        ? currentPrice > best.entryPrice + best.atr * 0.5   // bull: price above entry zone
-        : currentPrice < best.entryPrice - best.atr * 0.5;  // short: price below entry zone
-
-      // Price moved too far in wrong direction (against signal)
-      const tooFarWrongWay = isBullSig
-        ? currentPrice < best.entryPrice - best.atr * 2.0   // bull: price fell 2×ATR below entry
-        : currentPrice > best.entryPrice + best.atr * 2.0;  // short: price rose 2×ATR above entry
-
-      if (alreadyDone || entryUnreachable || tooFarWrongWay) {
-        const reason = alreadyDone ? 'target already reached'
-          : entryUnreachable ? 'entry price unreachable (price moved past entry zone)'
-          : 'price moved 2×ATR against signal';
-        console.log('[Tier2] '+candidate.sym+' skipped — signal stale ('+reason+'). Entry='+best.entryPrice+' Current='+currentPrice);
+      // Drop only if target already hit (trade has fully played out)
+      // Entry zone validity is shown to user via app staleness banners — not a server gate
+      if (alreadyDone) {
+        console.log('[Tier2] '+candidate.sym+' skipped — target already reached. Entry='+best.entryPrice+' Current='+currentPrice+' Target='+best.targetPrice);
         continue;
       }
 

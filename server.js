@@ -640,7 +640,19 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 
     const ep  = candles[rbi].c;
     const stop   = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    const target = iu ? ep + atrV*1.5 : ep - atrV*1.5;
+    // Target logic: use push extreme if clean (≤5×ATR from entry), else percentage floor
+    // Push extreme = structural target (where price was before the pullback)
+    const pePushTarget = iu ? pushExtreme : pushExtreme; // bull: push high, bear: push low
+    const peDist = Math.abs(pePushTarget - ep);
+    const pctFloor = ep * 0.005; // 0.5% of entry price minimum
+    const atrTarget = atrV * 1.5;
+    // Use push extreme if: it is in the right direction AND within 5×ATR AND larger than 1.5×ATR
+    const usePushExtreme = iu
+      ? (pePushTarget > ep && peDist <= atrV*5 && peDist >= atrTarget)
+      : (pePushTarget < ep && peDist <= atrV*5 && peDist >= atrTarget);
+    const targetMove = usePushExtreme ? peDist : Math.max(atrTarget, pctFloor);
+    const target = iu ? ep + targetMove : ep - targetMove;
+    const targetType = usePushExtreme ? 'pushExtreme' : (pctFloor > atrTarget ? 'pctFloor' : 'atr');
     const stopDist = Math.abs(ep - stop);
 
     // Intraday invalidation check: has stop level been breached at any point today?
@@ -671,6 +683,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       stopDist:   +stopDist.toFixed(2),
       atr: +atrV.toFixed(2),
       pushExtreme: +pushExtreme.toFixed(2),
+      targetType,
       retracePct:  +retracePct.toFixed(3),
     });
   }
@@ -835,7 +848,11 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
 
     const entry  = n1.c;
     const stop   = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
-    const target = isBull ? entry + atr*1.5 : entry - atr*1.5;
+    // Same target logic: 0.5% floor or 1.5×ATR, whichever is larger
+    const rtPctFloor = entry * 0.005;
+    const rtAtrTarget = atr * 1.5;
+    const rtTargetMove = Math.max(rtAtrTarget, rtPctFloor);
+    const target = isBull ? entry + rtTargetMove : entry - rtTargetMove;
     const stopDist = Math.abs(entry - stop);
 
     // Stop floor filter — skip if stop < 0.5×ATR from entry
@@ -1233,7 +1250,7 @@ app.get('/generate', async (req, res) => {
     ) ? ' ALIGNED' : s.hourlyTrend && s.hourlyTrend!=='sideways' ? ' COUNTER-TREND' : '';
     return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
       `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
-      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
+      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh} targetType=${s.targetType||'atr'}` +
       `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
       `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}` +
       htCtx + htAlign;

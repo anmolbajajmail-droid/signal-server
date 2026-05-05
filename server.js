@@ -956,6 +956,9 @@ async function runTier2() {
         targetPrice: best.targetPrice,
         stopDist: best.stopDist,
         atr: best.atr,
+        pushExtreme: best.pushExtreme || null,
+        entryZoneLow:  best.entryPrice && best.atr ? +(best.entryPrice - best.atr*0.5).toFixed(2) : null,
+        entryZoneHigh: best.entryPrice && best.atr ? +(best.entryPrice + best.atr*0.5).toFixed(2) : null,
         entryTime: best.entryTime,
         tier: best.tier || null,
         f3: best.f3 || null,
@@ -1049,11 +1052,15 @@ app.get('/generate', async (req, res) => {
   const top  = live.slice(0, 12); // Top 12 for Claude
 
   // Build compact prompt-ready string for Claude
-  const stocksSummary = top.map(s =>
-    `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
-    `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
-    `ATR=${s.atr}${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`
-  ).join('\n');
+  const stocksSummary = top.map(s => {
+    const zoneLow  = s.entryPrice && s.atr ? +(s.entryPrice - s.atr*0.5).toFixed(2) : null;
+    const zoneHigh = s.entryPrice && s.atr ? +(s.entryPrice + s.atr*0.5).toFixed(2) : null;
+    return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
+      `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
+      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
+      `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
+      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`;
+  }).join('\n');
 
   res.json({
     scanned: NSE_UNIVERSE.length,
@@ -1198,6 +1205,28 @@ app.get('/scan', (req, res) => {
     universe: NSE_UNIVERSE.length,
     startedAt: new Date().toISOString(),
   });
+});
+
+// ─── /candles/:symbol — fetch recent 5-min candles for live trade tracking ────
+// Used by Live Position Tracker to give Claude candle-level context
+app.get('/candles/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const n = Math.min(parseInt(req.query.n||'20'), 40); // max 40 bars
+  try{
+    const candles = await fetchKite5Min(symbol);
+    if(!candles || !candles.length){
+      return res.status(404).json({ error: 'No candle data for '+symbol });
+    }
+    // Return last n candles with formatted time
+    const recent = candles.slice(-n).map(c=>({
+      t: c.t, o: +c.o.toFixed(2), h: +c.h.toFixed(2),
+      l: +c.l.toFixed(2), c: +c.c.toFixed(2), v: c.v,
+    }));
+    const atr = computeATR(candles.slice(-20));
+    res.json({ symbol, candles: recent, atr: +atr.toFixed(2), fetchedAt: new Date().toISOString() });
+  } catch(e){
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () =>

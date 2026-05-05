@@ -716,7 +716,8 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       }
     }
     if (hasSpikeOrigin) {
-      continue; // Silent skip — spike filter
+      // TEMPORARILY DISABLED — re-enable after market hours with proper backtest
+      // continue; // Silent skip — spike filter
     }
 
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
@@ -735,7 +736,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 
     const pbs = pbz.start, pbe = pbz.end, pbb = pbz.bars;
     if (pbe + 1 >= n) continue;
-    if (candles[pbe].t.slice(11, 16) >= '14:30') continue;
+    if (candles[pbe].t.slice(11, 16) >= '15:25') continue;
 
     const pbExtreme = iu
       ? Math.min(...candles.slice(pbs, pbe+1).map(b => b.l))
@@ -794,7 +795,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       if ((iu && rb.h > pbExtreme + atrV*0.1) || (!iu && rb.l < pbExtreme - atrV*0.1)) p7 += 3;
       p7 = Math.min(p7, 15); break;
     }
-    if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
+    if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '15:25') continue;
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
     if (score < minScore || retracePct > 0.80 || pbc !== 2) continue;
@@ -1072,7 +1073,7 @@ function isMarketHours() {
   const istMs = utcMs + (5.5 * 60 * 60 * 1000);
   const ist   = new Date(istMs);
   const hm    = ist.getHours() * 100 + ist.getMinutes();
-  return hm >= 915 && hm <= 1430;
+  return hm >= 915 && hm <= 1525;
 }
 
 async function runTier1() {

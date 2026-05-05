@@ -784,11 +784,10 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       p7 = Math.min(p7, 15); break;
     }
     if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
-    // Recency check: resumption bar must be within last 3 bars (15 min)
-    // After 15 min the trade has either worked or failed — no longer actionable
-    // Tier 2 runs on fresh candles so this catches stale historical signals
-    if (rbi < n - 3) {
-      continue; // Signal too old — not logged to avoid noise
+    // Recency check: resumption bar must be within last 6 bars (30 min)
+    // Covers: Tier1 cycle (10 min) + Generate time (30s) + reading (2 min)
+    if (rbi < n - 6) {
+      continue;
     }
 
     lastPB[dire] = { bar: pbe, count: pbc };
@@ -851,7 +850,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 // ─── BREAKOUT SCORE (for RT detection) ───────────────────────────────────────
 function computeBreakoutScore(candles, i, sr, atr) {
   const n = candles.length;
-  if (i < 6 || i >= n-3) return null;
+  if (i < 6 || i >= n-1) return null;  // Need at least 1 bar after signal
   const bar = candles[i];
   const isBull = bar.c > bar.o, isBear = bar.c < bar.o;
   if (!isBull && !isBear) return null;
@@ -964,7 +963,7 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
   const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
   const signals = [];
 
-  for (let i = 6; i < n - 3; i++) {
+  for (let i = 6; i < n - 1; i++) {  // Need i+1 (retest bar) to exist
     const tStr = candles[i].t.slice(11, 16);
     if (tStr >= '14:00') continue;  // Block 14:xx entries
 
@@ -1020,9 +1019,9 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
-    // Recency check: entry bar (N+1) must be within last 3 bars (15 min)
-    if (i + 1 < n - 3) {
-      continue; // RT signal too old
+    // Recency check: entry bar (N+1) must be within last 6 bars (30 min)
+    if (i + 1 < n - 6) {
+      continue;
     }
 
     // RSI confirmation filter — validated on Oct-Dec 2025 data
@@ -1283,7 +1282,7 @@ async function runTier2() {
 // ─── START TIER 1 ─────────────────────────────────────────────────────────────
 // Run on startup (will skip if outside market hours or Kite not ready)
 setTimeout(runTier1, 5000); // 5s delay on startup to let Kite auth load
-setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
+setInterval(runTier1, 10 * 60 * 1000); // Every 10 minutes
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 

@@ -652,6 +652,9 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const iu = pz.dir === 'up';
     const ps = pz.start, pe = pz.end;
     if (pe + 3 >= n) continue;
+    // CROSS-DAY FIX: push must start from TODAY (prevents VBL-type false signals)
+    // Yesterday push + today gap-down looks like H1 pullback to the engine
+    if (candles[ps].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
 
     // Merge consecutive same-dir zones
     let me = pe, zi2 = zi + 1;

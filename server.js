@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.4-fixed — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -1188,7 +1188,7 @@ setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v6.2 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
+  name: 'Signal Server v6.4-fixed — H2+RT Pattern Engine | Yahoo screener | Kite prices',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   tier1: {
@@ -1471,5 +1471,5 @@ app.get('/candles/:symbol', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.2 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log(`Signal server v6.4-fixed on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

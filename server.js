@@ -746,9 +746,8 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
     // FIX 1: Resumption bar must be from TODAY (candle array has 3 days of history)
     if (candles[rbi].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
-    // FIX 3: Resumption bar within last 8 bars (40 min expiry)
-    // Prevents 11:25 AM signal appearing at 2:00 PM
-    if (rbi < n - 8) continue;
+    // NOTE: Fix 3 (40-min expiry) is applied in Tier 2 only, NOT here
+    // Tier 1 finds all valid today signals; Tier 2 filters by recency
 
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
@@ -899,8 +898,7 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     if (tStr >= '14:00') continue;  // Block 14:xx entries
     // FIX 1b: Signal bar must be from TODAY
     if (candles[i].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
-    // FIX 3b: RT entry bar (i+1) within last 8 bars
-    if (i + 1 < n - 8) continue;
+    // NOTE: Fix 3b (40-min expiry) applied in Tier 2 only
 
     const bs = computeBreakoutScore(candles, i, sr, atr);
     if (!bs || bs.score < minScore || (bs.f3 || 0) < minF3) continue;
@@ -1116,7 +1114,6 @@ async function runTier2() {
       if (!allSigs.length) continue;
 
       // FIX 2: Most recent signal first, score as tiebreak
-      // Prevents stale morning signals overriding fresh afternoon ones
       allSigs.sort((a, b) => {
         const ta = a.entryTime ? new Date(a.entryTime).getTime() : 0;
         const tb = b.entryTime ? new Date(b.entryTime).getTime() : 0;
@@ -1125,12 +1122,26 @@ async function runTier2() {
       });
       const best = allSigs[0];
 
+      // FIX 3: Apply 40-min expiry HERE in Tier 2 (not in Tier 1)
+      // Tier 1 caches today's signals; Tier 2 checks they are still fresh
+      if (best && best.entryTime) {
+        const freshCandle  = candles[candles.length - 1];
+        const lastCandleMs = new Date(freshCandle.t).getTime();
+        const sigMs        = new Date(best.entryTime).getTime();
+        const minsOld      = (lastCandleMs - sigMs) / 60000;
+        if (minsOld > 40) {
+          console.log('[Tier2] ' + candidate.sym + ' skipped — signal ' + minsOld.toFixed(0) + 'min old (>40min expiry)');
+          continue;
+        }
+      }
+
       // 1-hour context from 5-min candles
       const hourlyBars    = synthesiseHourlyBars(candles);
       const hourlyContext = computeHourlyContext(hourlyBars);
 
       results.push({
         sym: candidate.sym,
+        ticker: candidate.sym,   // alias — Claude prompt uses ticker field
         sector: candidate.sector,
         hourlyTrend: hourlyContext ? hourlyContext.trend : null,
         hourlyEmaSlope: hourlyContext ? hourlyContext.emaSlope : null,
@@ -1285,7 +1296,7 @@ app.get('/generate', async (req, res) => {
     const htAlign = s.hourlyTrend && (
       (s.dir==='bull'&&s.hourlyTrend==='up')||(s.dir==='bear'&&s.hourlyTrend==='down')
     ) ? ' ALIGNED' : (s.hourlyTrend&&s.hourlyTrend!=='sideways') ? ' COUNTER-TREND' : '';
-    return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
+    return `${s.ticker||s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
       `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
       `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
       `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +

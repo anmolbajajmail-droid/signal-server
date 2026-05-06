@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.4 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -337,6 +337,8 @@ let CACHE = {
   tier2At: null,
 };
 
+// ─── CACHE ────────────────────────────────────────────────────────────────────
+
 // ─── KITE ROUTES (unchanged from v5.2) ───────────────────────────────────────
 app.get('/kite/login', (req, res) => {
   res.redirect(`https://kite.zerodha.com/connect/login?v=3&api_key=${KITE_API_KEY}`);
@@ -409,8 +411,6 @@ async function fetchKite5Min(symbol) {
   const token = KITE.instrumentTokens[symbol];
   if (token && kiteReady()) {
     const now     = new Date();
-    // Fetch 3 days for S/R context (multi-day levels needed for priorDayTouches)
-    // Signal detection is limited to TODAY via resumption bar date check
     const from    = new Date(now); from.setDate(from.getDate() - 3);
     const fromStr = from.toISOString().split('T')[0];
     const toStr   = now.toISOString().split('T')[0];
@@ -670,62 +670,8 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
     const pushVol  = candles.slice(ps, me+1).reduce((s, b) => s + b.v, 0) / (me - ps + 1);
     const volPre   = candles.slice(Math.max(0, ps-20), ps).map(b => b.v);
     const avgVolPre = volPre.length ? volPre.reduce((a, b) => a+b, 0) / volPre.length : pushVol;
-    // ── F1: EXTENDED TREND PENALTY (score reduction only, no hard skip) ─────
-    // Not backtested as hard gate — use as score penalty only
-    // >4×ATR push = reduce P1 score. No hard skip.
-    const pushATRRatio = pushMove / atrV;
-    const extendedPenalty = pushATRRatio > 5.0 ? Math.min(Math.round((pushATRRatio - 5.0) * 3), 10) : 0;
-
-    // ── SPIKE BAR FILTER ─────────────────────────────────────────────────────
-    // Only flag if the bar that SET the push extreme is a spike that was immediately reversed
-    // This is specific to UPL-type situations, not general high-volume bars
-    let hasSpikeOrigin = false;
-    {
-      const pushBars = candles.slice(ps, me+1);
-      // Find the bar that actually set the push extreme
-      let extremeBarIdx = 0;
-      if (iu) {
-        // Bull push: find bar with highest high
-        let maxH = -Infinity;
-        pushBars.forEach((b,i) => { if (b.h > maxH) { maxH = b.h; extremeBarIdx = i; }});
-      } else {
-        // Bear push: find bar with lowest low
-        let minL = Infinity;
-        pushBars.forEach((b,i) => { if (b.l < minL) { minL = b.l; extremeBarIdx = i; }});
-      }
-      // Only check the extreme bar and ±1 bars around it
-      const checkFrom = Math.max(0, extremeBarIdx - 1);
-      const checkTo   = Math.min(pushBars.length - 2, extremeBarIdx + 1);
-      for (let pi = checkFrom; pi <= checkTo; pi++) {
-        const pb  = pushBars[pi];
-        const nxt = pushBars[pi + 1];
-        if (!nxt) continue;
-        const volR = pb.v / (avgVolPre || 1);
-        if (volR < 4.0) continue; // Raised to 4× to avoid false positives
-        const bodyRatio = Math.abs(pb.c - pb.o) / ((pb.h - pb.l) || 0.01);
-        if (bodyRatio < 0.5) continue; // Must be a strong body bar
-        if (iu) {
-          // Bull push: spike = bar that set the high, next bar reverses hard
-          if (pb.h === pushBars.reduce((m,b) => Math.max(m,b.h), -Infinity)) {
-            if (nxt.c < pb.o) { hasSpikeOrigin = true; break; } // next bar closes below spike open
-          }
-        } else {
-          // Bear push: spike = bar that set the low, next bar reverses hard
-          if (pb.l === pushBars.reduce((m,b) => Math.min(m,b.l), Infinity)) {
-            if (nxt.c > pb.o) { hasSpikeOrigin = true; break; } // next bar closes above spike open
-          }
-        }
-      }
-    }
-    if (hasSpikeOrigin) {
-      // TEMPORARILY DISABLED — re-enable after market hours with proper backtest
-      // continue; // Silent skip — spike filter
-    }
-
     let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
-    p1 = Math.max(0, p1 - extendedPenalty); // Extended trend reduces push quality score
     if (pushVol > avgVolPre * 1.2) p1 = Math.min(p1 + 3, 15);
-    p1 = Math.max(0, p1 - extendedPenalty); // F1: extended trend reduces P1
 
     // Find pullback zone
     let pbz = null;
@@ -738,7 +684,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 
     const pbs = pbz.start, pbe = pbz.end, pbb = pbz.bars;
     if (pbe + 1 >= n) continue;
-    if (candles[pbe].t.slice(11, 16) >= '15:25') continue;
+    if (candles[pbe].t.slice(11, 16) >= '14:30') continue;
 
     const pbExtreme = iu
       ? Math.min(...candles.slice(pbs, pbe+1).map(b => b.l))
@@ -797,40 +743,23 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       if ((iu && rb.h > pbExtreme + atrV*0.1) || (!iu && rb.l < pbExtreme - atrV*0.1)) p7 += 3;
       p7 = Math.min(p7, 15); break;
     }
-    if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '15:25') continue;
-        // Resumption bar must be in last 3 bars (15 min)
-        // Tier 1 identified the push+pullback. Tier 2 confirms resumption is fresh.
-        if (rbi < n - 3) continue;
+    if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
+    // FIX 1: Resumption bar must be from TODAY (candle array has 3 days of history)
+    if (candles[rbi].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
+    // FIX 3: Resumption bar within last 8 bars (40 min expiry)
+    // Prevents 11:25 AM signal appearing at 2:00 PM
+    if (rbi < n - 8) continue;
+
     lastPB[dire] = { bar: pbe, count: pbc };
     const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
     if (score < minScore || retracePct > 0.80 || pbc !== 2) continue;
 
     const ep  = candles[rbi].c;
     const stop   = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // Target logic: use push extreme if clean (≤5×ATR from entry), else percentage floor
-    // Push extreme = structural target (where price was before the pullback)
-    const pePushTarget = iu ? pushExtreme : pushExtreme; // bull: push high, bear: push low
-    const peDist = Math.abs(pePushTarget - ep);
-    const pctFloor = ep * 0.005; // 0.5% of entry price minimum
-    const atrTarget = atrV * 1.5;
-    // Use push extreme if: it is in the right direction AND within 5×ATR AND larger than 1.5×ATR
-    const usePushExtreme = iu
-      ? (pePushTarget > ep && peDist <= atrV*5 && peDist >= atrTarget)
-      : (pePushTarget < ep && peDist <= atrV*5 && peDist >= atrTarget);
-    const targetMove = usePushExtreme ? peDist : Math.max(atrTarget, pctFloor);
+    // Target: 0.5% price floor prevents tiny targets on high-priced stocks
+    const targetMove = Math.max(atrV * 1.5, ep * 0.005);
     const target = iu ? ep + targetMove : ep - targetMove;
-    const targetType = usePushExtreme ? 'pushExtreme' : (pctFloor > atrTarget ? 'pctFloor' : 'atr');
     const stopDist = Math.abs(ep - stop);
-
-    const stopLevel = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // NOTE: Stop breach check removed from H2 signal generation.
-    // Reason: stop = pbExtreme ± 0.5×ATR, which is naturally inside the pullback range.
-    // Any check against session bars or push bars will falsely trigger.
-    // The UPL situation (spike bar breaching stop zone) is now handled by:
-    //   1. Spike bar filter (removes spike-origin pushes)
-    //   2. 20-min recency check in Tier 2 (removes stale signals)
-    //   3. Most-recent-signal-first selection in Tier 2
-    // App staleness banner handles entry zone validity for the user.
 
     signals.push({
       type: 'H2', dir: dire, score,
@@ -843,8 +772,6 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
       stopDist:   +stopDist.toFixed(2),
       atr: +atrV.toFixed(2),
       pushExtreme: +pushExtreme.toFixed(2),
-      targetType,
-      pushATRRatio: +pushATRRatio.toFixed(1),
       retracePct:  +retracePct.toFixed(3),
     });
   }
@@ -854,7 +781,7 @@ function findH2Signals(candles, zones, sr, atr, minScore = 60) {
 // ─── BREAKOUT SCORE (for RT detection) ───────────────────────────────────────
 function computeBreakoutScore(candles, i, sr, atr) {
   const n = candles.length;
-  if (i < 6 || i >= n-1) return null;  // Need at least 1 bar after signal
+  if (i < 6 || i >= n-1) return null; // Fixed: was n-3
   const bar = candles[i];
   const isBull = bar.c > bar.o, isBear = bar.c < bar.o;
   if (!isBull && !isBear) return null;
@@ -950,7 +877,7 @@ function computeBreakoutScore(candles, i, sr, atr) {
 // ─── RT RETEST SCORING ────────────────────────────────────────────────────────
 function computeRSI(candles, idx, period=14){
   if(idx < period+1) return null;
-  const slice = candles.slice(idx-period*2, idx+1);
+  const slice = candles.slice(Math.max(0,idx-period*2), idx+1);
   if(slice.length < period+1) return null;
   let gains=0, losses=0;
   for(let i=slice.length-period; i<slice.length; i++){
@@ -967,11 +894,13 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
   const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
   const signals = [];
 
-  for (let i = 6; i < n - 1; i++) {  // Need i+1 (retest bar) to exist
+  for (let i = 6; i < n - 1; i++) { // Fixed: was n-3, now n-1
     const tStr = candles[i].t.slice(11, 16);
     if (tStr >= '14:00') continue;  // Block 14:xx entries
-    // Entry bar (i+1) must be in last 3 bars (15 min)
-    if (i + 1 < n - 3) continue;
+    // FIX 1b: Signal bar must be from TODAY
+    if (candles[i].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
+    // FIX 3b: RT entry bar (i+1) within last 8 bars
+    if (i + 1 < n - 8) continue;
 
     const bs = computeBreakoutScore(candles, i, sr, atr);
     if (!bs || bs.score < minScore || (bs.f3 || 0) < minF3) continue;
@@ -1011,11 +940,7 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
 
     const entry  = n1.c;
     const stop   = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
-    // Same target logic: 0.5% floor or 1.5×ATR, whichever is larger
-    const rtPctFloor = entry * 0.005;
-    const rtAtrTarget = atr * 1.5;
-    const rtTargetMove = Math.max(rtAtrTarget, rtPctFloor);
-    const target = isBull ? entry + rtTargetMove : entry - rtTargetMove;
+    const target = isBull ? entry + atr*1.5 : entry - atr*1.5;
     const stopDist = Math.abs(entry - stop);
 
     // Stop floor filter — skip if stop < 0.5×ATR from entry
@@ -1025,34 +950,17 @@ function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
     const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
     if (tier === 'T3') continue;
 
-    // RSI confirmation filter — validated on Oct-Dec 2025 data
-    // Bull RT: RSI 50-75 = momentum zone (59% WR vs 38% for RSI>75)
-    // Bear RT: RSI 25-50 = momentum zone (49% WR vs 43% for RSI<25)
-    // Block overbought Bull RT (RSI>75) and oversold Bear RT (RSI<25)
-    const rsiAtSignal = computeRSI(candles, i);
-    if(rsiAtSignal !== null){
-      if(isBull && rsiAtSignal > 75){
-        // Overbought bull breakout — exhaustion risk, skip
-        continue;
-      }
-      if(!isBull && rsiAtSignal < 25){
-        // Oversold bear breakdown — exhaustion risk, skip
-        continue;
-      }
+    // RSI filter: validated Oct-Dec 2025 — 59% WR for bull RSI 50-75
+    // Block overbought bull RT (>75) and oversold bear RT (<25)
+    const rsiVal = computeRSI(candles, i);
+    if(rsiVal !== null){
+      if(isBull && rsiVal > 75) continue;   // overbought — exhaustion risk
+      if(!isBull && rsiVal < 25) continue;  // oversold — exhaustion risk
     }
-    // Store RSI for context
-    const rsiVal = rsiAtSignal;
-
-    // NOTE: Intraday stop breach check intentionally NOT applied to RT.
-    // Reason: RT stop = S/R ± 0.5×ATR. The S/R level is touched multiple times
-    // during pre-breakout consolidation — this is normal, not invalidation.
-    // Backtest confirmed: breach-dropped RT signals = 49% WR (same as baseline 48%).
-    // The check adds no value for RT and kills 97% of valid signals.
 
     signals.push({
       type: 'RT', dir: isBull ? 'bull' : 'bear',
-      score: bs.score, f3: bs.f3, f4: bs.f4, f5: bs.f5,
-      rsi: rsiVal,
+      score: bs.score, f3: bs.f3, rsi: rsiVal, f4: bs.f4, f5: bs.f5,
       signalBar: i, entryBar: i+1,
       entryTime: n1.t,
       entryPrice: +entry.toFixed(2),
@@ -1080,7 +988,7 @@ function isMarketHours() {
   const istMs = utcMs + (5.5 * 60 * 60 * 1000);
   const ist   = new Date(istMs);
   const hm    = ist.getHours() * 100 + ist.getMinutes();
-  return hm >= 915 && hm <= 1525;
+  return hm >= 915 && hm <= 1430;
 }
 
 async function runTier1() {
@@ -1109,61 +1017,49 @@ async function runTier1() {
       if (!candles || candles.length < 30) { await sleep(100); continue; }
 
       const atr   = computeATR(candles);
-      const sr    = computeSR(candles); // Full 3-day data for S/R levels
+      const sr    = computeSR(candles);
+      const zones = computeMicroZones(candles);
 
-      // TIER 1 JOB: Find stocks where push + pullback has formed in last 60 min
-      // We do NOT check for resumption bar here — Tier 2 does that on fresh candles
-      // Use last 50 bars for pattern detection, full candles for S/R
-      const recentCandles = candles.slice(-50);
-      const zones = computeMicroZones(recentCandles);
-
-      // H2 pre-filter: push+pullback must have completed within last 12 bars (60 min)
-      // Score threshold lowered to 45 since we're not requiring resumption bar
-      const h2Sigs = findH2Signals(recentCandles, zones, sr, atr, 45);
+      // ── H2 PRE-FILTER ──
+      // Does this stock have a push+pullback structure that could yield H2?
+      const h2Sigs = findH2Signals(candles, zones, sr, atr, 55); // Lower threshold for pre-filter
       if (h2Sigs.length > 0) {
-        // Filter: pullback end (pbe) must be within last 12 bars
-        const recentH2 = h2Sigs.filter(sig => {
-          const n = recentCandles.length;
-          // resumptionBar index in recentCandles — pullback ends just before it
-          const rbi = sig.resumptionBar !== undefined ? sig.resumptionBar : n - 1;
-          return rbi >= n - 12; // pullback completed within last 12 bars = 60 min
+        const best = h2Sigs.reduce((a, b) => a.score > b.score ? a : b);
+        h2Candidates.push({
+          sym: symbol,
+          sector: SECTORS[symbol] || 'Other',
+          price: candles[candles.length-1].c,
+          h2Score: best.score,
+          h2Signal: best,
+          atr,
+          candles: candles.slice(-120), // Keep last 120 bars for Tier 2 re-scoring
+          sr,
+          zones,
+          fetchedAt: new Date().toISOString(),
         });
-        if (recentH2.length > 0) {
-          const best = recentH2.reduce((a, b) => a.score > b.score ? a : b);
-          h2Candidates.push({
-            sym: symbol, sector: SECTORS[symbol] || 'Other',
-            price: candles[candles.length-1].c,
-            h2Score: best.score, h2Signal: best,
-            atr, candles: candles.slice(-120), sr, zones,
-            fetchedAt: new Date().toISOString(),
-          });
-        }
       }
 
-      // RT pre-filter: breakout+retest within last 12 bars
-      const rtSigs = findRTSignals(recentCandles, sr, atr, 55, 14);
+      // ── RT PRE-FILTER ──
+      // Recent strong S/R break (F3≥14) with incomplete follow-through?
+      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
       if (rtSigs.length > 0) {
-        const recentRT = rtSigs.filter(sig => {
-          const n = recentCandles.length;
-          const sbar = sig.signalBar !== undefined ? sig.signalBar : n - 2;
-          return sbar >= n - 12;
+        const best = rtSigs.reduce((a, b) => a.score > b.score ? a : b);
+        rtCandidates.push({
+          sym: symbol,
+          sector: SECTORS[symbol] || 'Other',
+          price: candles[candles.length-1].c,
+          rtScore: best.score,
+          rtSignal: best,
+          atr,
+          candles: candles.slice(-120),
+          sr,
+          fetchedAt: new Date().toISOString(),
         });
-        if (recentRT.length > 0) {
-          const best = recentRT.reduce((a, b) => a.score > b.score ? a : b);
-          rtCandidates.push({
-            sym: symbol, sector: SECTORS[symbol] || 'Other',
-            price: candles[candles.length-1].c,
-            rtScore: best.score, rtSignal: best,
-            atr, candles: candles.slice(-120), sr,
-            fetchedAt: new Date().toISOString(),
-          });
-        }
       }
 
     } catch(e) {
-      console.warn('[Tier1] '+symbol+' error:', e.message);
+      console.warn(`[Tier1] ${symbol} error:`, e.message);
     }
-
 
     await sleep(100); // 100ms between stocks — 3.1 req/s, within Kite limit
   }
@@ -1208,64 +1104,36 @@ async function runTier2() {
       if (!candles || candles.length < 20) continue;
 
       const atr   = computeATR(candles);
-      const sr    = freshCandles ? computeSR(candles) : candidate.sr; // Full 3-day S/R
+      const sr    = freshCandles ? computeSR(candles) : candidate.sr;
+      const zones = computeMicroZones(candles);
 
-      // Tier 2: use last 50 bars for pattern context
-      // But resumption bar MUST be in last 3 bars (15 min) — confirms signal is fresh
-      const recentCandles2 = candles.slice(-50);
-      const zones = computeMicroZones(recentCandles2);
-
-      // Full H2 scoring — resumption bar in last 3 bars enforced inside findH2Signals
-      const h2Sigs = findH2Signals(recentCandles2, zones, sr, atr, 60);
-      // Full RT scoring — signal bar in last 3 bars enforced inside findRTSignals
-      const rtSigs = findRTSignals(recentCandles2, sr, atr, 60, 14);
+      // Run full H2 scoring
+      const h2Sigs = findH2Signals(candles, zones, sr, atr, 60);
+      // Run full RT scoring (with all filters)
+      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
 
       const allSigs = [...h2Sigs, ...rtSigs];
       if (!allSigs.length) continue;
 
-      // Pick MOST RECENT valid signal, not highest scoring
-      // Reason: high-scoring early session signals can override fresh recent ones
-      // Sort by entryTime descending (most recent first), then by score as tiebreak
+      // FIX 2: Most recent signal first, score as tiebreak
+      // Prevents stale morning signals overriding fresh afternoon ones
       allSigs.sort((a, b) => {
         const ta = a.entryTime ? new Date(a.entryTime).getTime() : 0;
         const tb = b.entryTime ? new Date(b.entryTime).getTime() : 0;
-        if (tb !== ta) return tb - ta; // most recent first
-        return b.score - a.score;      // tiebreak by score
+        if (tb !== ta) return tb - ta;
+        return b.score - a.score;
       });
       const best = allSigs[0];
 
-      // Synthesise 1-hour context from the same 5-min candles (zero extra API calls)
+      // 1-hour context from 5-min candles
       const hourlyBars    = synthesiseHourlyBars(candles);
       const hourlyContext = computeHourlyContext(hourlyBars);
-
-      // ── STALE SIGNAL CHECK ────────────────────────────────────────────────
-      const currentPrice = candles[candles.length - 1].c;
-      const isBullSig    = best.dir === 'bull';
-
-      // Recency enforced inside findH2Signals/findRTSignals (last 8 bars = 40 min)
-      // No separate wall-clock check needed here
-
-      // Already past target → trade has fully played out
-      const alreadyDone = isBullSig
-        ? currentPrice >= best.targetPrice
-        : currentPrice <= best.targetPrice;
-
-      if (alreadyDone) {
-        console.log('[Tier2] '+candidate.sym+' skipped — target already reached');
-        continue;
-      }
-
-      // R:R gate — if risk:reward < 1.2:1 do not recommend
-      const rrCheck = Math.abs(best.targetPrice - best.entryPrice) /
-                      Math.abs(best.stopPrice  - best.entryPrice);
-      if (rrCheck < 1.2) {
-        console.log('[Tier2] '+candidate.sym+' skipped — poor R:R '+rrCheck.toFixed(2)+':1 (min 1.2:1 required)');
-        continue;
-      }
 
       results.push({
         sym: candidate.sym,
         sector: candidate.sector,
+        hourlyTrend: hourlyContext ? hourlyContext.trend : null,
+        hourlyEmaSlope: hourlyContext ? hourlyContext.emaSlope : null,
         price: candles[candles.length-1].c,
         type: best.type,
         dir: best.dir,
@@ -1281,9 +1149,6 @@ async function runTier2() {
         entryTime: best.entryTime,
         tier: best.tier || null,
         f3: best.f3 || null,
-        hourlyTrend: hourlyContext?.trend || null,
-        hourlyEmaSlope: hourlyContext?.emaSlope || null,
-        hourlyBars: hourlyContext?.hourlyBarsCount || null,
         // Include all signals for Claude context
         allSignals: allSigs.map(s => ({
           type: s.type, dir: s.dir, score: s.score,
@@ -1307,7 +1172,7 @@ async function runTier2() {
 // ─── START TIER 1 ─────────────────────────────────────────────────────────────
 // Run on startup (will skip if outside market hours or Kite not ready)
 setTimeout(runTier1, 5000); // 5s delay on startup to let Kite auth load
-setInterval(runTier1, 10 * 60 * 1000); // Every 10 minutes
+setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
@@ -1356,66 +1221,41 @@ app.get('/status', (req, res) => res.json({
   },
 }));
 
-// ─── SYNTHESISE 1-HOUR BARS FROM 5-MIN CANDLES ──────────────────────────────
-// Zero extra API calls — uses 5-min data already fetched in Tier 2
-// NSE session: 09:15-10:14 = hour 1, 10:15-11:14 = hour 2, etc.
+// ── 1-HOUR CONTEXT: synthesised from 5-min candles ────────────────────────
 function synthesiseHourlyBars(candles5m) {
-  if (!candles5m || candles5m.length < 12) return [];
+  if(!candles5m || candles5m.length < 12) return [];
   const hourMap = {};
-  for (const c of candles5m) {
-    const timeStr = c.t.slice(11, 16); // HH:MM
-    const [h, m] = timeStr.split(':').map(Number);
-    // Offset from NSE open (09:15)
-    const minsFromOpen = (h - 9) * 60 + (m - 15);
-    const hourKey = Math.floor(minsFromOpen / 60);
-    if (hourKey < 0) continue;
-    if (!hourMap[hourKey]) {
-      hourMap[hourKey] = { o: c.o, h: c.h, l: c.l, c: c.c, v: c.v, t: c.t, bars: 1 };
+  for(const c of candles5m){
+    const timeStr = c.t.slice(11,16);
+    const [h,m] = timeStr.split(':').map(Number);
+    const minsFromOpen = (h-9)*60 + (m-15);
+    const hourKey = Math.floor(minsFromOpen/60);
+    if(hourKey < 0) continue;
+    if(!hourMap[hourKey]){
+      hourMap[hourKey] = {o:c.o,h:c.h,l:c.l,c:c.c,v:c.v,t:c.t,bars:1};
     } else {
       const hb = hourMap[hourKey];
-      hb.h = Math.max(hb.h, c.h);
-      hb.l = Math.min(hb.l, c.l);
-      hb.c = c.c;
-      hb.v += c.v;
-      hb.bars++;
+      hb.h = Math.max(hb.h,c.h); hb.l = Math.min(hb.l,c.l);
+      hb.c = c.c; hb.v += c.v; hb.bars++;
     }
   }
-  return Object.keys(hourMap).sort((a,b)=>+a-+b).map(k => hourMap[k]);
+  return Object.keys(hourMap).sort((a,b)=>+a-+b).map(k=>hourMap[k]);
 }
 
 function computeHourlyContext(hourlyBars) {
-  if (!hourlyBars || hourlyBars.length < 2) return null;
-  // EMA21 on hourly bars (or all bars if fewer)
+  if(!hourlyBars || hourlyBars.length < 2) return null;
   const n = hourlyBars.length;
-  const period = Math.min(21, n);
-  const k = 2 / (period + 1);
+  const k = 2/(Math.min(21,n)+1);
   let ema = hourlyBars[0].c;
-  for (let i = 1; i < n; i++) {
-    ema = hourlyBars[i].c * k + ema * (1 - k);
-  }
-  const lastBar = hourlyBars[n-1];
-  const prevBar = hourlyBars[n-2];
-  // Trend direction from last 3-5 hourly closes
+  for(let i=1;i<n;i++) ema = hourlyBars[i].c*k + ema*(1-k);
   const last5 = hourlyBars.slice(-5);
-  const higherHighs = last5.every((b, i) => i === 0 || b.h >= last5[i-1].h);
-  const lowerLows   = last5.every((b, i) => i === 0 || b.l <= last5[i-1].l);
-  const higherCloses= last5.filter((b,i)=> i>0 && b.c > last5[i-1].c).length;
-  const lowerCloses = last5.filter((b,i)=> i>0 && b.c < last5[i-1].c).length;
-  const emaSlope = n >= 3
-    ? (hourlyBars[n-1].c - hourlyBars[n-3].c) / hourlyBars[n-3].c * 100
-    : 0;
+  const higherCloses = last5.filter((b,i)=>i>0&&b.c>last5[i-1].c).length;
+  const lowerCloses  = last5.filter((b,i)=>i>0&&b.c<last5[i-1].c).length;
+  const emaSlope = n>=3?(hourlyBars[n-1].c-hourlyBars[n-3].c)/hourlyBars[n-3].c*100:0;
   let trend = 'sideways';
-  if (emaSlope > 0.15 || higherCloses >= 3) trend = 'up';
-  else if (emaSlope < -0.15 || lowerCloses >= 3) trend = 'down';
-  const priceVsEma = ((lastBar.c - ema) / ema * 100).toFixed(2);
-  return {
-    trend,                                    // 'up' | 'down' | 'sideways'
-    emaSlope: +emaSlope.toFixed(3),
-    ema: +ema.toFixed(2),
-    priceVsEma: +priceVsEma,
-    hourlyBarsCount: n,
-    lastHourDir: lastBar.c > lastBar.o ? 'up' : 'down',
-  };
+  if(emaSlope>0.15||higherCloses>=3) trend='up';
+  else if(emaSlope<-0.15||lowerCloses>=3) trend='down';
+  return {trend, emaSlope:+emaSlope.toFixed(3), ema:+ema.toFixed(2)};
 }
 
 app.get('/generate', async (req, res) => {
@@ -1440,18 +1280,16 @@ app.get('/generate', async (req, res) => {
     const zoneLow  = s.entryPrice && s.atr ? +(s.entryPrice - s.atr*0.5).toFixed(2) : null;
     const zoneHigh = s.entryPrice && s.atr ? +(s.entryPrice + s.atr*0.5).toFixed(2) : null;
     const htCtx = s.hourlyTrend
-      ? ` 1H=${s.hourlyTrend.toUpperCase()}(slope${s.hourlyEmaSlope>0?'+':''}${s.hourlyEmaSlope}%)`
+      ? ' 1H='+s.hourlyTrend.toUpperCase()+'(slope'+(s.hourlyEmaSlope>0?'+':'')+s.hourlyEmaSlope+'%)'
       : '';
     const htAlign = s.hourlyTrend && (
-      (s.dir==='bull' && s.hourlyTrend==='up')   ||
-      (s.dir==='bear' && s.hourlyTrend==='down')
-    ) ? ' ALIGNED' : s.hourlyTrend && s.hourlyTrend!=='sideways' ? ' COUNTER-TREND' : '';
+      (s.dir==='bull'&&s.hourlyTrend==='up')||(s.dir==='bear'&&s.hourlyTrend==='down')
+    ) ? ' ALIGNED' : (s.hourlyTrend&&s.hourlyTrend!=='sideways') ? ' COUNTER-TREND' : '';
     return `${s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
       `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
-      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh} targetType=${s.targetType||'atr'}` +
+      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
       `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
-      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}` +
-      htCtx + htAlign;
+      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`+ htCtx + htAlign;
   }).join('\n');
 
   res.json({
@@ -1622,5 +1460,5 @@ app.get('/candles/:symbol', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.4 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log(`Signal server v6.2 on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
 );

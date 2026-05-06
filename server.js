@@ -1,5 +1,5 @@
 /**
- * SIGNAL SERVER v6.4-fixed — H2 + RT Pattern Engine
+ * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
  *
  * WHAT'S NEW in v6.0:
  *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
@@ -335,6 +335,8 @@ let CACHE = {
   tier1Progress: { scanned: 0, total: 0, status: 'idle' },
   tier2: [],
   tier2At: null,
+  autoAlerts:   [],   // Latest signals from auto Tier 2
+  autoAlertsAt: null, // When last generated
 };
 
 // ─── CACHE ────────────────────────────────────────────────────────────────────
@@ -1183,12 +1185,34 @@ async function runTier2() {
 // ─── START TIER 1 ─────────────────────────────────────────────────────────────
 // Run on startup (will skip if outside market hours or Kite not ready)
 setTimeout(runTier1, 5000); // 5s delay on startup to let Kite auth load
-setInterval(runTier1, 20 * 60 * 1000); // Every 20 minutes
+setInterval(() => {
+  if (isMarketHours() && !CACHE.tier1Running) runTier1();
+}, 10 * 60 * 1000); // Every 10 minutes (was 20)
+
+// ── AUTO TIER 2 — every 3 min, stores results for app polling ─────────────────
+async function runAutoTier2() {
+  if (!isMarketHours()) return;
+  if (CACHE.tier2Running) return;                              // don't overlap with manual Generate
+  if (!CACHE.tier1H2.length && !CACHE.tier1RT.length) return; // no candidates yet
+  try {
+    const results = await runTier2();
+    CACHE.autoAlerts   = results || [];
+    CACHE.autoAlertsAt = new Date().toISOString();
+    if (results && results.length > 0) {
+      console.log('[AutoT2] ' + results.length + ' fresh signal(s) found — cached for app');
+    }
+  } catch(e) {
+    console.warn('[AutoT2] Error:', e.message);
+  }
+}
+setInterval(() => {
+  if (isMarketHours() && !CACHE.tier2Running) runAutoTier2();
+}, 3 * 60 * 1000); // Every 3 minutes
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v6.4-fixed — H2+RT Pattern Engine | Yahoo screener | Kite prices',
+  name: 'Signal Server v6.2 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   tier1: {
@@ -1468,6 +1492,15 @@ app.get('/candles/:symbol', async (req, res) => {
   } catch(e){
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── AUTO ALERTS ENDPOINT — app polls every 30 sec to detect new signals ─────
+app.get('/auto-alerts', (req, res) => {
+  res.json({
+    alerts:    CACHE.autoAlerts    || [],
+    updatedAt: CACHE.autoAlertsAt  || null,
+    count:     (CACHE.autoAlerts   || []).length,
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () =>

@@ -613,10 +613,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
-// NEW ENGINE v7 — Port of Python tier2_engine + streaming_push_detector
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW ENGINE v7.1 — Full port of Python tier2_engine.py
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── CONSTANTS (from tier2_engine.py) ────────────────────────────────────────
 const ENG = {
   MIN_SLOPE_PCT: 0.30, MIN_ATR_MULT: 2.0, MIN_BARS: 3,
   RETRACE_CANCEL: 0.80, RETRACE_MIN: 0.20, RETRACE_FLAG: 0.30,
@@ -631,392 +631,212 @@ const ENG = {
   PUSH_EXPIRY_BARS: 2,
 };
 
-// ── RULE FLAGS (all 5 locked + Fix 1 locked) ──────────────────────────────
 const RULE = {
-  H2_ENDS_MONITOR: true,
-  H1_CONFIRMATION: false,
-  EXHAUSTION_FILTER: true,
-  TARGET_VS_RESIST: true,
-  STOP_VALIDATION: true,
-  BROKEN_BY_CLOSE: true,   // Fix 1
+  H2_ENDS_MONITOR: true, H1_CONFIRMATION: false,
+  EXHAUSTION_FILTER: true, TARGET_VS_RESIST: true,
+  STOP_VALIDATION: true, BROKEN_BY_CLOSE: true,
 };
 
-// ── ZONE DETECTION (port of pattern_detector_zones.py compute_zones_pd) ───
-function computeZonesPD(candles, minRun=3, dropThr=0.0005, riseThr=0.0005, minZoneBars=3, sharpMove=0.0025) {
-  const n = candles.length;
-  if (n < 2) return [];
-  const barMove = new Array(n).fill('flat');
-  if (candles[0].c > candles[0].o) barMove[0] = 'up';
-  else if (candles[0].c < candles[0].o) barMove[0] = 'down';
-  for (let i = 1; i < n; i++) {
-    const change = (candles[i].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
-    if (change > 0.005) barMove[i] = 'up';
-    else if (change < -0.005) barMove[i] = 'down';
-    else {
-      if (candles[i].c < candles[i].o) barMove[i] = 'down';
-      else if (candles[i].c > candles[i].o) barMove[i] = 'up';
-    }
-  }
-  const barDir = new Array(n).fill('range');
-  const sharpBars = new Set();
-  let i = 1;
-  while (i < n) {
-    const runDir = barMove[i];
-    if (runDir === 'flat') { i++; continue; }
-    let runEnd = i, interruptions = 0;
-    for (let j = i+1; j < n; j++) {
-      if (barMove[j] === runDir) { runEnd = j; interruptions = 0; }
-      else if (barMove[j] === 'flat' && interruptions < 1) interruptions++;
-      else break;
-    }
-    let runStart = i;
-    if (i > 0 && barMove[i-1] === runDir && barDir[i-1] === 'range') runStart = i - 1;
-    const runLen = runEnd - runStart + 1;
-    if (runLen >= minRun) {
-      const startPrice = runStart > 0 ? candles[runStart-1].c : candles[0].o;
-      const endPrice = candles[runEnd].c;
-      const totalMove = (endPrice - startPrice) / (startPrice || 1) * 100;
-      const qualifies = (runDir === 'down' && totalMove < -dropThr*100) ||
-                        (runDir === 'up' && totalMove > riseThr*100);
-      if (qualifies) {
-        for (let k = runStart; k <= runEnd; k++) barDir[k] = runDir;
-        i = runEnd + 1; continue;
-      }
-    }
-    i++;
-  }
-  // 2-bar sharp override
-  for (let i = 1; i < n-1; i++) {
-    if (barDir[i] !== 'range' && barDir[i+1] !== 'range') continue;
-    const d1 = barMove[i], d2 = barMove[i+1];
-    if (d1 !== d2 || d1 === 'flat') continue;
-    const totalMove = (candles[i+1].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
-    const qualifies = (d1 === 'up' && totalMove > sharpMove*100) ||
-                      (d1 === 'down' && totalMove < -sharpMove*100);
-    if (qualifies) { barDir[i] = d1; barDir[i+1] = d1; sharpBars.add(i); sharpBars.add(i+1); }
-  }
-  // Build zones
-  const rawZones = [];
-  let zStart = 0;
-  for (let i = 1; i <= n; i++) {
-    if (i === n || barDir[i] !== barDir[i-1]) {
-      rawZones.push({ start: zStart, end: i-1, dir: barDir[i-1], bars: i-zStart });
-      zStart = i;
-    }
-  }
-  // Merge adjacent same-dir
-  const merged = [];
-  for (const z of rawZones) {
-    if (merged.length && merged[merged.length-1].dir === z.dir) {
-      merged[merged.length-1].end = z.end;
-      merged[merged.length-1].bars += z.bars;
-    } else merged.push({...z});
-  }
-  // Absorb tiny
-  const absorbed = [];
-  for (const z of merged) {
-    let hasSharp = false;
-    for (let k = z.start; k <= z.end; k++) if (sharpBars.has(k)) { hasSharp = true; break; }
-    if (z.bars >= minZoneBars || hasSharp) absorbed.push({...z});
-    else if (absorbed.length) {
-      absorbed[absorbed.length-1].end = z.end;
-      absorbed[absorbed.length-1].bars += z.bars;
-    } else absorbed.push({...z});
-  }
-  // Slope + strength
-  const MID_SLOPE_MIN = 0.15;
-  for (const z of absorbed) {
-    const zBars = candles.slice(z.start, z.end+1);
-    z.slope = zBars.length > 1 ? ((zBars[zBars.length-1].c - zBars[0].o) / (zBars[0].o || 1) * 100) : 0;
-    if (zBars.length > 1) {
-      const midF = (zBars[0].h + zBars[0].l) / 2;
-      const midL = (zBars[zBars.length-1].h + zBars[zBars.length-1].l) / 2;
-      z.slope_mid = (midL - midF) / (midF || 1) * 100;
-    } else z.slope_mid = 0;
-    if (z.dir !== 'range' && Math.abs(z.slope_mid) < MID_SLOPE_MIN) z.dir = 'range';
-    if (z.dir !== 'range') {
-      const thr = z.dir === 'up' ? riseThr : dropThr;
-      const ratio = Math.abs(z.slope) / ((thr*100) || 0.05);
-      z.strength = ratio >= 5 ? 'Strong' : ratio >= 2 ? 'Moderate' : 'Weak';
-    } else {
-      if (zBars.length < 2) z.strength = 'Weak';
-      else {
-        const ranges = zBars.map(b => (b.h-b.l)/(b.l||1)*100);
-        const mean = ranges.reduce((a,b)=>a+b,0)/ranges.length || 1;
-        const variance = ranges.reduce((s,r)=>s+(r-mean)**2,0)/ranges.length;
-        const cv = Math.sqrt(variance) / mean;
-        z.strength = cv < 0.25 ? 'Strong' : cv < 0.50 ? 'Moderate' : 'Weak';
-      }
-    }
-  }
-  // Merge adjacent ranges
-  const final = [];
-  for (const z of absorbed) {
-    if (final.length && final[final.length-1].dir === 'range' && z.dir === 'range') {
-      final[final.length-1].end = z.end;
-      final[final.length-1].bars += z.bars;
-    } else final.push({...z});
-  }
-  return final;
+function barMove(bar, prevClose) {
+  if (prevClose <= 0) return bar.c > bar.o ? 'up' : bar.c < bar.o ? 'down' : 'flat';
+  const chg = (bar.c - prevClose) / prevClose * 100;
+  if (chg > 0.005) return 'up';
+  if (chg < -0.005) return 'down';
+  if (bar.c > bar.o) return 'up';
+  if (bar.c < bar.o) return 'down';
+  return 'flat';
 }
-
-// ── STREAMING PUSH DETECTOR (port of streaming_push_detector.py) ──────────
-// Event-driven push detector. Bar-by-bar process. Emits event when push qualifies.
-class StreamingPushDetector {
-  constructor(atr, minBars = 3) {
-    this.atr = atr;
-    this.minBars = minBars;
-    this.candles = [];                  // all bars fed so far
-    this.pushDir = null;                // 'up' | 'down' | null
-    this.pushStartIdx = -1;
-    this.lastPushIdx = -1;
-    this.counterIndices = [];           // indices forming counter since last push bar
-    this.lastEmittedEnd = -1;           // to avoid duplicate emits
-  }
-
-  _barDir(i) {
-    if (i === 0) {
-      const b = this.candles[0];
-      return b.c > b.o ? 'up' : b.c < b.o ? 'down' : 'flat';
-    }
-    const prev = this.candles[i-1], cur = this.candles[i];
-    const chg = (cur.c - prev.c) / (prev.c || 1) * 100;
-    if (chg > 0.005) return 'up';
-    if (chg < -0.005) return 'down';
-    if (cur.c < cur.o) return 'down';
-    if (cur.c > cur.o) return 'up';
-    return 'flat';
-  }
-
-  processBar(bar) {
-    this.candles.push(bar);
-    const i = this.candles.length - 1;
-    const dir = this._barDir(i);
-
-    // Initialize push on first directional bar
-    if (this.pushDir === null) {
-      if (dir === 'up' || dir === 'down') {
-        this.pushDir = dir;
-        this.pushStartIdx = i;
-        this.lastPushIdx = i;
-        this.counterIndices = [];
-      }
-      return null;
-    }
-
-    // Push continues
-    if (dir === this.pushDir) {
-      this.lastPushIdx = i;
-      this.counterIndices = [];
-      return null;
-    }
-
-    // Counter or flat
-    this.counterIndices.push(i);
-
-    // After 2+ counter bars, the push has ended — emit event
-    // Trigger condition: push has >= minBars and we now have >= 2 counter bars
-    const pushBars = this.lastPushIdx - this.pushStartIdx + 1;
-    if (this.counterIndices.length >= 2 && pushBars >= this.minBars && this.lastPushIdx > this.lastEmittedEnd) {
-      const event = {
-        dir: this.pushDir,
-        is_up: this.pushDir === 'up',
-        start_idx: this.pushStartIdx,
-        end_idx: this.lastPushIdx,
-        counter_indices: [...this.counterIndices],
-        bars: pushBars,
-      };
-      this.lastEmittedEnd = this.lastPushIdx;
-      // Check if counter has become a new push in opposite direction
-      const counterDirCount = this.counterIndices.filter(ci => this._barDir(ci) !== this.pushDir).length;
-      if (counterDirCount >= this.minBars) {
-        // The "counter" was actually a new push opposite direction
-        this.pushDir = this.pushDir === 'up' ? 'down' : 'up';
-        this.pushStartIdx = this.counterIndices[0];
-        this.lastPushIdx = i;
-        this.counterIndices = [];
-      } else {
-        // Reset for new push detection
-        this.pushDir = (dir === 'up' || dir === 'down') ? dir : null;
-        this.pushStartIdx = (dir === 'up' || dir === 'down') ? i : -1;
-        this.lastPushIdx = (dir === 'up' || dir === 'down') ? i : -1;
-        this.counterIndices = [];
-      }
-      return event;
-    }
-
-    return null;
-  }
+function bodyPct(bar) { const br = bar.h - bar.l; return br <= 0 ? 0 : Math.abs(bar.c - bar.o) / br; }
+function isDoji(bar) { const br = bar.h - bar.l; if (br <= 0) return true; return Math.abs(bar.c - bar.o) / br < ENG.DOJI_BODY; }
+function computeRetrace(bar, push) {
+  const pushRange = push.push_range || Math.abs(push.extreme - push.start_price);
+  if (pushRange <= 0) return 0;
+  let diff;
+  if (push.is_up) { const sh = push.swing_high || push.extreme; diff = sh - bar.l; }
+  else { const sl = push.swing_low || push.extreme; diff = bar.h - sl; }
+  return Math.max(0, diff) / pushRange;
 }
-
-function eventToQualifyingPush(event, candles, atr, minAtrMult, minSlopePct, minBars) {
-  // Legacy stub - kept for backwards compat
-  const pushBars = candles.slice(event.start_idx, event.end_idx + 1);
-  if (pushBars.length < minBars) return null;
-  const isUp = event.is_up;
-  const swingHigh = Math.max(...pushBars.map(b => b.h));
-  const swingLow = Math.min(...pushBars.map(b => b.l));
-  const extreme = isUp ? swingHigh : swingLow;
-  const startOpen = pushBars[0].o;
-  const endClose = pushBars[pushBars.length-1].c;
-  const netMove = swingHigh - swingLow;
-  if (netMove < atr * minAtrMult) return null;
-  // slope_mid is TOTAL slope across zone, not per-bar
-  const midF = (pushBars[0].h + pushBars[0].l) / 2;
-  const midL = (pushBars[pushBars.length-1].h + pushBars[pushBars.length-1].l) / 2;
-  const slopeMid = (midL - midF) / (midF || 1) * 100;  // TOTAL %, not per bar
-  if (Math.abs(slopeMid) < minSlopePct) return null;
-  const highestClose = Math.max(...pushBars.map(b => b.c));
-  const lowestClose = Math.min(...pushBars.map(b => b.c));
-  return {
-    dir: event.dir, is_up: isUp,
-    start_idx: event.start_idx, end_idx: event.end_idx,
-    bars: pushBars.length,
-    start_time: pushBars[0].t, end_time: pushBars[pushBars.length-1].t,
-    start_price: +startOpen.toFixed(2),
-    end_price: +endClose.toFixed(2),
-    extreme: +extreme.toFixed(2),
-    highest_close: +highestClose.toFixed(2),
-    lowest_close: +lowestClose.toFixed(2),
-    swing_high: +swingHigh.toFixed(2),
-    swing_low: +swingLow.toFixed(2),
-    push_range: +netMove.toFixed(2),
-    net_move: +netMove.toFixed(2),       // industry-standard: extremes
-    move: +netMove.toFixed(2),
-    slope_mid: +slopeMid.toFixed(3),
-    atr: +atr.toFixed(2),
-    push_id: `${event.dir}_${pushBars[0].t.slice(11,16)}_${Math.round(extreme*10)/10}`,
-    counter_indices: event.counter_indices,
-  };
-}
-
-// ── ZONE-BASED PUSH FINDER (port of Python find_qualifying_push) ────────
-// This is what Python actually uses — zone-based, requires Strong strength
-function findQualifyingPush(todayBars, atr) {
-  if (todayBars.length < 6) return null;
-  const zones = computeZonesPD(todayBars);
-  const n = todayBars.length;
-  const qualifying = [];
-  for (const z of zones) {
-    if (z.dir !== 'up' && z.dir !== 'down') continue;
-    if (z.bars < ENG.MIN_BARS) continue;
-    if (z.strength !== 'Strong') continue;
-    if ((n - 1 - z.end) < 2) continue;   // need at least 2 counter bars after push
-    const ts = todayBars[z.start].t.slice(11, 16);
-    const te = todayBars[z.end].t.slice(11, 16);
-    const net = Math.abs(todayBars[z.end].c - todayBars[z.start].o);
-    const mid = Math.abs(z.slope_mid || 0);
-    if (mid < ENG.MIN_SLOPE_PCT || net < atr * ENG.MIN_ATR_MULT) continue;
-    const isUp = z.dir === 'up';
-    const pb = todayBars.slice(z.start, z.end+1);
-    const swingHigh = Math.max(...pb.map(b => b.h));
-    const swingLow = Math.min(...pb.map(b => b.l));
-    const extreme = isUp ? swingHigh : swingLow;
-    const highestClose = Math.max(...pb.map(b => b.c));
-    const lowestClose = Math.min(...pb.map(b => b.c));
-    const pushRange = swingHigh - swingLow;
-    qualifying.push({
-      dir: z.dir, is_up: isUp,
-      start_idx: z.start, end_idx: z.end,
-      bars: z.bars, start_time: ts, end_time: te,
-      start_price: todayBars[z.start].o,
-      end_price: todayBars[z.end].c,
-      extreme: +extreme.toFixed(2),
-      highest_close: +highestClose.toFixed(2),
-      lowest_close: +lowestClose.toFixed(2),
-      swing_high: +swingHigh.toFixed(2),
-      swing_low: +swingLow.toFixed(2),
-      push_range: +pushRange.toFixed(2),
-      net_move: +pushRange.toFixed(2),
-      move: +pushRange.toFixed(2),
-      slope_mid: +mid.toFixed(3),
-      atr: +atr.toFixed(2),
-      push_id: `${z.dir}_${ts}_${Math.round(extreme*10)/10}`,
-    });
-  }
-  return qualifying.length ? qualifying[qualifying.length - 1] : null;   // most recent
-}
-
-// ── RSI (port of compute_rsi) ──────────────────────────────────────────────
-function computeRSIEngine(candles, period = ENG.RSI_PERIOD) {
+function computeRSIEngine(candles, period) {
+  period = period || ENG.RSI_PERIOD;
   if (candles.length < period + 1) return 50.0;
   const closes = candles.slice(-(period+1)).map(c => c.c);
   let gains = 0, losses = 0;
   for (let i = 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i-1];
-    if (diff > 0) gains += diff;
-    else losses += -diff;
+    if (diff > 0) gains += diff; else losses += -diff;
   }
   const avgG = gains / period, avgL = losses / period;
   if (avgL === 0) return 100;
-  const rs = avgG / avgL;
-  return 100 - (100 / (1 + rs));
+  return 100 - (100 / (1 + avgG / avgL));
 }
 
-// ── RT TOUCH CHECK (port of check_rt_touch) ──────────────────────────────
-function checkRTTouch(bar, push, brokenSR, atr) {
-  for (const level of brokenSR) {
-    const lv = level.level;
-    let dist, held;
-    if (push.is_up) {
-      dist = Math.abs(bar.l - lv);
-      held = bar.c > lv - atr * 0.3;
-    } else {
-      dist = Math.abs(bar.h - lv);
-      held = bar.c < lv + atr * 0.3;
+function computeZonesPD(candles) {
+  const minRun = 3, dropThr = 0.0005, riseThr = 0.0005, minZoneBars = 3, sharpMove = 0.0025;
+  const n = candles.length;
+  if (n < 2) return [];
+  const bm = new Array(n).fill('flat');
+  if (candles[0].c > candles[0].o) bm[0] = 'up';
+  else if (candles[0].c < candles[0].o) bm[0] = 'down';
+  for (let i = 1; i < n; i++) {
+    const chg = (candles[i].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
+    if (chg > 0.005) bm[i] = 'up';
+    else if (chg < -0.005) bm[i] = 'down';
+    else { if (candles[i].c < candles[i].o) bm[i] = 'down'; else if (candles[i].c > candles[i].o) bm[i] = 'up'; }
+  }
+  const bd = new Array(n).fill('range');
+  const sharp = new Set();
+  let i = 1;
+  while (i < n) {
+    const rd = bm[i]; if (rd === 'flat') { i++; continue; }
+    let re = i, ints = 0;
+    for (let j = i+1; j < n; j++) {
+      if (bm[j] === rd) { re = j; ints = 0; }
+      else if (bm[j] === 'flat' && ints < 1) ints++;
+      else break;
     }
-    if (dist <= atr * ENG.RT_TOUCH_TOL && held) return level;
+    let rs = i; if (i > 0 && bm[i-1] === rd && bd[i-1] === 'range') rs = i - 1;
+    const rl = re - rs + 1;
+    if (rl >= minRun) {
+      const sp = rs > 0 ? candles[rs-1].c : candles[0].o;
+      const ep = candles[re].c;
+      const tm = (ep - sp) / (sp || 1) * 100;
+      if ((rd === 'down' && tm < -dropThr*100) || (rd === 'up' && tm > riseThr*100)) {
+        for (let k = rs; k <= re; k++) bd[k] = rd;
+        i = re + 1; continue;
+      }
+    }
+    i++;
+  }
+  for (let i = 1; i < n-1; i++) {
+    if (bd[i] !== 'range' && bd[i+1] !== 'range') continue;
+    const d1 = bm[i], d2 = bm[i+1];
+    if (d1 !== d2 || d1 === 'flat') continue;
+    const tm = (candles[i+1].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
+    if ((d1 === 'up' && tm > sharpMove*100) || (d1 === 'down' && tm < -sharpMove*100)) {
+      bd[i] = d1; bd[i+1] = d1; sharp.add(i); sharp.add(i+1);
+    }
+  }
+  const raw = [];
+  let zs = 0;
+  for (let i = 1; i <= n; i++) {
+    if (i === n || bd[i] !== bd[i-1]) { raw.push({ start: zs, end: i-1, dir: bd[i-1], bars: i-zs }); zs = i; }
+  }
+  const merged = [];
+  for (const z of raw) {
+    if (merged.length && merged[merged.length-1].dir === z.dir) { merged[merged.length-1].end = z.end; merged[merged.length-1].bars += z.bars; }
+    else merged.push({...z});
+  }
+  const absorbed = [];
+  for (const z of merged) {
+    let hasS = false;
+    for (let k = z.start; k <= z.end; k++) if (sharp.has(k)) { hasS = true; break; }
+    if (z.bars >= minZoneBars || hasS) absorbed.push({...z});
+    else if (absorbed.length) { absorbed[absorbed.length-1].end = z.end; absorbed[absorbed.length-1].bars += z.bars; }
+    else absorbed.push({...z});
+  }
+  const MID_MIN = 0.15;
+  for (const z of absorbed) {
+    const zb = candles.slice(z.start, z.end+1);
+    z.slope = zb.length > 1 ? ((zb[zb.length-1].c - zb[0].o) / (zb[0].o || 1) * 100) : 0;
+    if (zb.length > 1) { const f = (zb[0].h+zb[0].l)/2; const l = (zb[zb.length-1].h+zb[zb.length-1].l)/2; z.slope_mid = (l-f)/(f||1)*100; }
+    else z.slope_mid = 0;
+    if (z.dir !== 'range' && Math.abs(z.slope_mid) < MID_MIN) z.dir = 'range';
+    if (z.dir !== 'range') {
+      const thr = z.dir === 'up' ? riseThr : dropThr;
+      const ratio = Math.abs(z.slope) / ((thr*100) || 0.05);
+      z.strength = ratio >= 5 ? 'Strong' : ratio >= 2 ? 'Moderate' : 'Weak';
+    } else {
+      if (zb.length < 2) z.strength = 'Weak';
+      else {
+        const r = zb.map(b => (b.h-b.l)/(b.l||1)*100);
+        const m = r.reduce((a,b)=>a+b,0)/r.length || 1;
+        const v = r.reduce((s,x)=>s+(x-m)**2,0)/r.length;
+        const cv = Math.sqrt(v) / m;
+        z.strength = cv < 0.25 ? 'Strong' : cv < 0.50 ? 'Moderate' : 'Weak';
+      }
+    }
+  }
+  const final = [];
+  for (const z of absorbed) {
+    if (final.length && final[final.length-1].dir === 'range' && z.dir === 'range') { final[final.length-1].end = z.end; final[final.length-1].bars += z.bars; }
+    else final.push({...z});
+  }
+  return final;
+}
+
+function findQualifyingPush(todayBars, atr) {
+  if (todayBars.length < 6) return null;
+  const zones = computeZonesPD(todayBars);
+  const n = todayBars.length;
+  const qual = [];
+  for (const z of zones) {
+    if (z.dir !== 'up' && z.dir !== 'down') continue;
+    if (z.bars < ENG.MIN_BARS) continue;
+    if (z.strength !== 'Strong') continue;
+    if ((n - 1 - z.end) < 2) continue;
+    const ts = todayBars[z.start].t.slice(11,16);
+    const te = todayBars[z.end].t.slice(11,16);
+    const net = Math.abs(todayBars[z.end].c - todayBars[z.start].o);
+    const mid = Math.abs(z.slope_mid || 0);
+    if (mid < ENG.MIN_SLOPE_PCT || net < atr * ENG.MIN_ATR_MULT) continue;
+    const isUp = z.dir === 'up';
+    const pb = todayBars.slice(z.start, z.end+1);
+    const sh = Math.max(...pb.map(b => b.h));
+    const sl = Math.min(...pb.map(b => b.l));
+    const ext = isUp ? sh : sl;
+    const hc = Math.max(...pb.map(b => b.c));
+    const lc = Math.min(...pb.map(b => b.c));
+    const pr = sh - sl;
+    qual.push({
+      dir: z.dir, is_up: isUp, start_idx: z.start, end_idx: z.end, bars: z.bars,
+      start_time: ts, end_time: te,
+      start_price: todayBars[z.start].o, end_price: todayBars[z.end].c,
+      extreme: +ext.toFixed(2), highest_close: +hc.toFixed(2), lowest_close: +lc.toFixed(2),
+      swing_high: +sh.toFixed(2), swing_low: +sl.toFixed(2),
+      push_range: +pr.toFixed(2), net_move: +pr.toFixed(2), move: +pr.toFixed(2),
+      slope_mid: +mid.toFixed(3), atr: +atr.toFixed(2),
+      push_id: `${z.dir}_${ts}_${Math.round(ext*10)/10}`,
+    });
+  }
+  return qual.length ? qual[qual.length-1] : null;
+}
+
+function checkRTTouch(bar, push, brokenSR, atr) {
+  for (const lvl of brokenSR) {
+    const lv = lvl.level;
+    let dist, held;
+    if (push.is_up) { dist = Math.abs(bar.l - lv); held = bar.c > lv - atr * 0.3; }
+    else { dist = Math.abs(bar.h - lv); held = bar.c < lv + atr * 0.3; }
+    if (dist <= atr * ENG.RT_TOUCH_TOL && held) return lvl;
   }
   return null;
 }
 
-// ── COUNTER SWING VETO (port of check_counter_push) ─────────────────────
-function checkCounterSwingVeto(push, bar, atr, dayBarsSoFar) {
-  // Returns null = vetoed, non-null = ok to fire counter (we return signal-like obj)
-  // Actually mirrors backtest.py: returns truthy if counter trade should fire
-  // Here we just validate the swing-extreme check
-  const counterIsUp = !push.is_up;   // counter to a down push = UP counter
+function checkCounterSwingVeto(push, bar, atr, dayBars) {
+  const counterIsUp = !push.is_up;
   const entry = bar.c;
-  const vetoTol = atr * 0.5;
-  const swings = [];
-  if (dayBarsSoFar.length < 7) return true;  // not enough bars to detect swings
+  const tol = atr * 0.5;
+  if (dayBars.length < 7) return true;
   if (counterIsUp) {
-    // UP counter: check against swing HIGHS
-    for (let j = 3; j < dayBarsSoFar.length - 3; j++) {
-      const thisH = dayBarsSoFar[j].h;
-      const leftMax = Math.max(...dayBarsSoFar.slice(j-3, j).map(b => b.h));
-      const rightMax = Math.max(...dayBarsSoFar.slice(j+1, j+4).map(b => b.h));
-      if (thisH > leftMax && thisH > rightMax) swings.push(thisH);
-    }
-    for (const swingH of swings) {
-      if (swingH - entry > 0 && swingH - entry < vetoTol) return false;  // VETO
+    for (let j = 3; j < dayBars.length - 3; j++) {
+      const tH = dayBars[j].h;
+      const lM = Math.max(...dayBars.slice(j-3, j).map(b => b.h));
+      const rM = Math.max(...dayBars.slice(j+1, j+4).map(b => b.h));
+      if (tH > lM && tH > rM && tH - entry > 0 && tH - entry < tol) return false;
     }
   } else {
-    // DOWN counter: check against swing LOWS
-    for (let j = 3; j < dayBarsSoFar.length - 3; j++) {
-      const thisL = dayBarsSoFar[j].l;
-      const leftMin = Math.min(...dayBarsSoFar.slice(j-3, j).map(b => b.l));
-      const rightMin = Math.min(...dayBarsSoFar.slice(j+1, j+4).map(b => b.l));
-      if (thisL < leftMin && thisL < rightMin) swings.push(thisL);
-    }
-    for (const swingL of swings) {
-      if (entry - swingL > 0 && entry - swingL < vetoTol) return false;
+    for (let j = 3; j < dayBars.length - 3; j++) {
+      const tL = dayBars[j].l;
+      const lM = Math.min(...dayBars.slice(j-3, j).map(b => b.l));
+      const rM = Math.min(...dayBars.slice(j+1, j+4).map(b => b.l));
+      if (tL < lM && tL < rM && entry - tL > 0 && entry - tL < tol) return false;
     }
   }
   return true;
 }
 
-// ── BODY % HELPER ───────────────────────────────────────────────────────
-function bodyPct(bar) {
-  const br = bar.h - bar.l;
-  if (br <= 0) return 0;
-  return Math.abs(bar.c - bar.o) / br;
-}
-
-// ── SIGNAL SCORING (full port of tier2_engine.py score_signal) ───────────
 function scoreSignal(push, h1Retrace, h1Bars, signalBar, srLevels, ema, contextScore, atr, sigType, rsi) {
-  const score = {};
-  // Push quality
+  const sc = {};
   const slope = push.slope_mid || 0;
   const netAtr = (push.net_move || push.move) / (push.atr || atr || 1);
   let pq;
@@ -1025,18 +845,16 @@ function scoreSignal(push, h1Retrace, h1Bars, signalBar, srLevels, ema, contextS
   else if (slope >= 0.60 && netAtr >= 4) pq = 14;
   else if (slope >= 0.50 && netAtr >= 3) pq = 10;
   else pq = 5;
-  score.push_quality = pq;
+  sc.push_quality = pq;
 
-  // Retrace quality
   let rq;
   if (sigType === 'RT' || sigType === 'RT+H1') rq = 18;
   else if (h1Retrace <= 0.30) rq = 20;
   else if (h1Retrace <= 0.40) rq = 18;
   else if (h1Retrace <= 0.60) rq = 10;
   else rq = 5;
-  score.retrace_quality = rq;
+  sc.retrace_quality = rq;
 
-  // EMA alignment
   let eq;
   if (ema == null) eq = 5;
   else if (push.is_up && signalBar.c > ema) eq = 10;
@@ -1044,252 +862,39 @@ function scoreSignal(push, h1Retrace, h1Bars, signalBar, srLevels, ema, contextS
   else if (push.is_up && signalBar.c < ema - atr * 0.5) eq = 0;
   else if (!push.is_up && signalBar.c > ema + atr * 0.5) eq = 0;
   else eq = 5;
-  score.ema_alignment = eq;
+  sc.ema_alignment = eq;
 
-  // S/R confluence
-  let srScore = 0;
+  let srs = 0;
   for (const lv of srLevels) {
-    const dist = Math.abs(lv.level - signalBar.c);
-    if (dist <= atr * 1.0 && lv.tier === 'T1') srScore = Math.max(srScore, 15);
-    else if (dist <= atr * 1.5 && (lv.tier === 'T1' || lv.tier === 'T2')) srScore = Math.max(srScore, 8);
+    const d = Math.abs(lv.level - signalBar.c);
+    if (d <= atr * 1.0 && lv.tier === 'T1') srs = Math.max(srs, 15);
+    else if (d <= atr * 1.5 && (lv.tier === 'T1' || lv.tier === 'T2')) srs = Math.max(srs, 8);
   }
-  // Obstacle penalty
-  const targetMove = (push.net_move || push.move) * ENG.TARGET_PCT;
-  let obstacles;
-  if (push.is_up) {
-    obstacles = srLevels.filter(l => signalBar.c < l.level && l.level < signalBar.c + targetMove && l.tier === 'T1');
-  } else {
-    obstacles = srLevels.filter(l => signalBar.c - targetMove < l.level && l.level < signalBar.c && l.tier === 'T1');
-  }
-  if (obstacles.length >= 3) srScore -= 10;
-  score.sr_confluence = srScore;
+  const tMove = (push.net_move || push.move) * ENG.TARGET_PCT;
+  const obs = srLevels.filter(l => l.tier === 'T1' && (push.is_up ? (signalBar.c < l.level && l.level < signalBar.c + tMove) : (signalBar.c - tMove < l.level && l.level < signalBar.c)));
+  if (obs.length >= 3) srs -= 10;
+  sc.sr_confluence = srs;
 
-  // Bar strength
   const bp = bodyPct(signalBar);
   const br = signalBar.h - signalBar.l || 0.001;
-  const closePos = push.is_up ? (signalBar.c - signalBar.l) / br : (signalBar.h - signalBar.c) / br;
+  const cp = push.is_up ? (signalBar.c - signalBar.l) / br : (signalBar.h - signalBar.c) / br;
   let bs;
-  if (bp >= 0.70 && closePos >= 0.70) bs = 15;
-  else if (bp >= 0.50 && closePos >= 0.60) bs = 11;
+  if (bp >= 0.70 && cp >= 0.70) bs = 15;
+  else if (bp >= 0.50 && cp >= 0.60) bs = 11;
   else if (bp >= 0.35) bs = 7;
   else bs = 3;
-  score.bar_strength = bs;
+  sc.bar_strength = bs;
 
-  // RSI
   let rs;
-  if (push.is_up) {
-    if (rsi > ENG.RSI_BULL) rs = 5;
-    else if (rsi < ENG.RSI_BEAR) rs = -5;
-    else rs = 0;
-  } else {
-    if (rsi < ENG.RSI_BEAR) rs = 5;
-    else if (rsi > ENG.RSI_BULL) rs = -5;
-    else rs = 0;
-  }
-  score.rsi = rs;
+  if (push.is_up) { if (rsi > ENG.RSI_BULL) rs = 5; else if (rsi < ENG.RSI_BEAR) rs = -5; else rs = 0; }
+  else { if (rsi < ENG.RSI_BEAR) rs = 5; else if (rsi > ENG.RSI_BULL) rs = -5; else rs = 0; }
+  sc.rsi = rs;
 
-  // Context
-  const cm = Math.max(-10, Math.min(10, Math.floor(contextScore / 5) * 5));
-  score.context = cm;
-
-  const total = Object.values(score).reduce((a, b) => a + b, 0);
-  return [total, score];
+  sc.context = Math.max(-10, Math.min(10, Math.floor(contextScore / 5) * 5));
+  const total = Object.values(sc).reduce((a,b) => a+b, 0);
+  return [total, sc];
 }
 
-// ── TIER 2 MONITOR (port of Tier2Monitor) ────────────────────────────────
-class Tier2Monitor {
-  constructor(push, srLevels, brokenSR, contextScore, dayOpen, dayBarsSoFar) {
-    this.push = push;
-    this.sr_levels = srLevels;
-    this.broken_sr = brokenSR;
-    this.context_score = contextScore;
-    this.day_open = dayOpen;
-    this.day_bars_so_far = dayBarsSoFar || [];   // grows as monitor processes bars
-    this.state = 'WAITING';
-    this.elapsed_candles = [];
-    this.bar_count = 0;
-    this.h1_retrace = null;
-    this.h1_bars = 0;
-    this.h1_locked = false;
-    this.h2_attempted = false;
-    this.exhaustion_skip = false;
-    this.atr = null;   // set on first bar
-  }
-
-  processBar(bar, atr, ema, rsi) {
-    this.atr = atr;
-    this.elapsed_candles.push(bar);
-    this.day_bars_so_far.push(bar);
-    this.bar_count++;
-
-    // Exhaustion filter (Rule 3): check on push-end bar (bar_count == 1)
-    if (RULE.EXHAUSTION_FILTER && this.bar_count === 1) {
-      const barRange = bar.h - bar.l;
-      if (barRange > atr * ENG.EXHAUSTION_RANGE_MULT) {
-        let pctInRange;
-        if (this.push.is_up) {
-          pctInRange = (bar.c - bar.l) / (barRange || 1);
-          if (pctInRange <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
-        } else {
-          pctInRange = (bar.h - bar.c) / (barRange || 1);
-          if (pctInRange <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
-        }
-      }
-    }
-
-    // Check max bars timeout
-    if (this.bar_count > ENG.MAX_BARS) return { action: 'DUMP', reason: 'max_bars' };
-
-    // Compute current retrace from push extreme
-    let curPrice = bar.c;
-    let retrace;
-    if (this.push.is_up) {
-      retrace = (this.push.extreme - curPrice) / (this.push.move || 1);
-    } else {
-      retrace = (curPrice - this.push.extreme) / (this.push.move || 1);
-    }
-
-    // Hard cancel if retrace > 80%
-    if (retrace > ENG.RETRACE_CANCEL) {
-      return { action: 'CANCEL', reason: 'retrace_exceeded', retrace, bar };
-    }
-
-    // Need at least 2 bars of counter for H1 to form
-    if (this.bar_count < 2) {
-      return { action: 'WAITING', reason: 'building_h1' };
-    }
-
-    // Check if bar is in push direction (resumption)
-    const isResumption = (this.push.is_up && bar.c > bar.o) || (!this.push.is_up && bar.c < bar.o);
-    if (!isResumption) {
-      return { action: 'WAITING', reason: 'counter_continuing' };
-    }
-
-    // Resumption detected. Compute h1_retrace (max retrace among counter bars BEFORE this one)
-    const counterBars = this.elapsed_candles.slice(0, -1);
-    if (this.push.is_up) {
-      const minLow = Math.min(...counterBars.map(b => b.l));
-      this.h1_retrace = (this.push.extreme - minLow) / (this.push.move || 1);
-    } else {
-      const maxHigh = Math.max(...counterBars.map(b => b.h));
-      this.h1_retrace = (maxHigh - this.push.extreme) / (this.push.move || 1);
-    }
-    this.h1_bars = counterBars.length;
-
-    const br = bar.h - bar.l || 0.001;
-    const bp = Math.abs(bar.c - bar.o) / br;
-
-    // ── H1 SIGNAL FIRING LOGIC ──────────────────────────────────────────
-    let signalData = null;
-
-    if (this.h1_retrace > ENG.RETRACE_H1_DEEP) {
-      // > 60%: need S/R held
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
-      if (rt) {
-        const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, 'RT+H1', rsi);
-        if (score >= 50) signalData = { score, bd, sigType: 'RT+H1', rt };
-      }
-      if (!signalData) return { action: 'WAITING', reason: 'deep_retrace_no_sr' };
-    } else if (this.h1_retrace > ENG.RETRACE_H1_HIGH) {
-      // 40-60%: need EMA + body
-      const needsEma = ema && ((this.push.is_up && bar.c > ema) || (!this.push.is_up && bar.c < ema));
-      const needsBody = bp >= 0.50;
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
-      if (needsEma && needsBody) {
-        const sigType = rt ? 'RT+H1' : 'H1';
-        const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, sigType, rsi);
-        if (score >= 50) signalData = { score, bd, sigType, rt };
-      }
-      if (!signalData) return { action: 'WAITING', reason: 'moderate_retrace_needs_confirm' };
-    } else {
-      // 20-40%: high-conviction
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
-      const sigType = rt ? 'RT+H1' : 'H1';
-      const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, sigType, rsi);
-      if (score >= 50) signalData = { score, bd, sigType, rt };
-      else return { action: 'WAITING', reason: 'low_score' };
-    }
-
-    // Build the signal
-    const sig = this._buildSignal(signalData.sigType, signalData.score, signalData.bd, signalData.rt, bar, atr);
-    if (!sig) return { action: 'WAITING', reason: 'signal_build_failed' };
-
-    return { action: 'SIGNAL', signal: sig };
-  }
-
-  _buildSignal(sigType, score, bd, rt, bar, atr) {
-    // Entry = bar close
-    const entry = bar.c;
-    const isUp = this.push.is_up;
-
-    // Stop: counter extreme + buffer
-    const counterBars = this.elapsed_candles.slice(0, -1);
-    const stopExtreme = isUp ? Math.min(...counterBars.map(b => b.l)) : Math.max(...counterBars.map(b => b.h));
-    let stop = isUp ? stopExtreme - atr * ENG.STOP_BUFFER : stopExtreme + atr * ENG.STOP_BUFFER;
-
-    // Rule 5: STOP_VALIDATION
-    if (RULE.STOP_VALIDATION) {
-      const lookback = this.elapsed_candles.slice(-ENG.STOP_VALIDATION_LOOKBACK);
-      const tol = atr * ENG.STOP_VALIDATION_TOL;
-      if (isUp) {
-        const nearLows = lookback.filter(b => Math.abs(b.l - stop) < tol || b.l < stop + tol).map(b => b.l);
-        if (nearLows.length >= 2) {
-          const newStop = Math.min(...nearLows) - tol;
-          stop = Math.min(stop, newStop);
-        }
-      } else {
-        const nearHighs = lookback.filter(b => Math.abs(b.h - stop) < tol || b.h > stop - tol).map(b => b.h);
-        if (nearHighs.length >= 2) {
-          const newStop = Math.max(...nearHighs) + tol;
-          stop = Math.max(stop, newStop);
-        }
-      }
-    }
-
-    // Target: entry + TARGET_PCT * push_move
-    let target = isUp ? entry + this.push.move * ENG.TARGET_PCT : entry - this.push.move * ENG.TARGET_PCT;
-
-    // Rule 4: TARGET_VS_RESIST
-    if (RULE.TARGET_VS_RESIST) {
-      let blockingLevel = null;
-      for (const lv of this.sr_levels) {
-        if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
-        if (isUp && entry < lv.level && lv.level < target) {
-          if (blockingLevel === null || lv.level < blockingLevel) blockingLevel = lv.level;
-        } else if (!isUp && target < lv.level && lv.level < entry) {
-          if (blockingLevel === null || lv.level > blockingLevel) blockingLevel = lv.level;
-        }
-      }
-      if (blockingLevel !== null) {
-        target = isUp ? blockingLevel - atr * 0.1 : blockingLevel + atr * 0.1;
-      }
-    }
-
-    // R:R filter
-    const risk = Math.abs(entry - stop);
-    const reward = Math.abs(target - entry);
-    if (risk === 0 || reward / risk < 1.0) return null;
-
-    return {
-      type: sigType,
-      dir: this.push.dir,
-      score, breakdown: bd,
-      entry_price: +entry.toFixed(2),
-      stop_price: +stop.toFixed(2),
-      target_price: +target.toFixed(2),
-      stop_dist: +risk.toFixed(2),
-      reward_dist: +reward.toFixed(2),
-      rr: +(reward/risk).toFixed(2),
-      retrace_pct: +this.h1_retrace.toFixed(3),
-      push_id: `${this.push.dir}_${this.push.start_time}_${this.push.extreme}`,
-      bar_time: bar.t,
-      rt_level: rt ? rt.level : null,
-      rt_tier: rt ? rt.tier : null,
-    };
-  }
-}
-
-// ── BROKEN SR HELPER (with Fix 1 + Fix 2 default OFF, only Fix 1 active) ─
 function computeBrokenSR(srLevels, push) {
   const upTop = RULE.BROKEN_BY_CLOSE ? push.highest_close : push.extreme;
   const downBtm = RULE.BROKEN_BY_CLOSE ? push.lowest_close : push.extreme;
@@ -1302,108 +907,480 @@ function computeBrokenSR(srLevels, push) {
   return broken;
 }
 
-// ── PLAIN-ENGLISH RATIONALE (no Brooks/Volman jargon) ───────────────────
-function buildRationale(sig, push, brokenSR) {
-  const parts = [];
-  const dir = push.is_up ? 'up' : 'down';
-  const pushMoveR = (push.move / sig.stop_dist).toFixed(1);
-  parts.push(`Push direction: ${dir} (${push.bars} bars, ${push.move.toFixed(2)} move, ${pushMoveR}R)`);
-  parts.push(`Pullback retrace: ${(sig.retrace_pct*100).toFixed(0)}% of push`);
-  if (sig.type === 'RT+H1') {
-    parts.push(`Pullback held at ₹${sig.rt_level.toFixed(2)} (${sig.rt_tier} broken-resistance retest)`);
+function checkPreSignalFilters(bar, ep, stop, target, ema, dayOpen, push, atr) {
+  const isUp = push.is_up;
+  const risk = Math.abs(ep - stop);
+  const reward = Math.abs(target - ep);
+  if (risk > 0 && reward / risk < 1.0) return `R:R=${(reward/risk).toFixed(2)} below 1:1`;
+  if (ema) {
+    const da = Math.abs(bar.c - ema) / atr;
+    if (da > 2.0) {
+      const ss = (isUp && bar.c > ema) || (!isUp && bar.c < ema);
+      if (ss) return `Stretched ${da.toFixed(1)}xATR`;
+    }
   }
-  if (sig.breakdown.rsi > 0) {
-    parts.push(`RSI confirms ${push.is_up ? 'bullish' : 'bearish'} momentum`);
-  } else if (sig.breakdown.rsi < 0) {
-    parts.push(`RSI shows weakness against trade direction`);
+  if (dayOpen && dayOpen > 0) {
+    const pct = (bar.c - dayOpen) / dayOpen * 100;
+    if ((isUp && pct > 4.0) || (!isUp && pct < -4.0)) return `Day move ${pct.toFixed(1)}% extended`;
   }
-  if (sig.breakdown.ema > 0) parts.push(`Price holding ${push.is_up ? 'above' : 'below'} EMA-20`);
-  parts.push(`Entry ₹${sig.entry_price} → Target ₹${sig.target_price} (R:R ${sig.rr})`);
-  parts.push(`Stop ₹${sig.stop_price} (${(sig.stop_dist/push.move*100).toFixed(0)}% of push size)`);
-  return parts.join(' • ');
+  return null;
 }
 
-// ── TIER 3: LIVE TRADE TRACKER (4 exit rules) ──────────────────────────
+function buildExplanation(push, monitor, bar, sigType, score, ema) {
+  const dirStr = push.is_up ? 'UP' : 'DOWN';
+  const actStr = push.is_up ? 'LONG' : 'SHORT';
+  const ret = monitor.h1_retrace || 0;
+  const retDesc = ret <= 0.30 ? 'shallow flag' : ret <= 0.40 ? 'high-conviction pullback' : ret <= 0.60 ? 'moderate pullback' : 'deep pullback held at S/R';
+  const parts = [];
+  parts.push(`${dirStr} push ${push.start_time}→${push.end_time} (₹${push.net_move.toFixed(1)} = ${(push.net_move/push.atr).toFixed(1)}× ATR)`);
+  parts.push(`${retDesc}, ${(ret*100).toFixed(0)}%`);
+  if (sigType && sigType.startsWith('RT')) parts.push('Pullback held at previously broken level');
+  if (ema) parts.push(`Price ${bar.c > ema ? 'above' : 'below'} EMA`);
+  parts.push(`${actStr} | Score ${score}`);
+  return parts.join(' | ');
+}
+
+class Tier2Monitor {
+  constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles) {
+    this.push = push;
+    this.sr_levels = srLevels;
+    this.broken_sr = brokenSR;
+    this.context_score = contextScore || 0;
+    this.atr = push.atr;
+    this.day_open = dayOpen;
+    this.rsi_candles = priorCandles || [];
+    this.bar_count = 0; this.counter_count = 0; this.total_counter = 0;
+    this.max_retrace = 0; this.h1_retrace = 0; this.h1_bars = 0;
+    this.h1_complete = false; this.h1_extreme = null; this.recent_h1_extreme = null;
+    this.leg_bars = 0; this.h2_counter = 0; this.h2_max_retrace = 0; this.h2_complete = false;
+    this.prev_close = push.end_price;
+    this.state = 'WATCHING';
+    this.doji_count_pre_signal = 0; this.profit_doji_count = 0;
+    this.entry_price = null;
+    this.elapsed_candles = [];
+    this.h2_attempted = false; this.exhaustion_skip = false;
+  }
+  _result(action, reason, signal) {
+    return { action, reason: reason || '', signal: signal || null, state: this.state, retrace: +this.max_retrace.toFixed(3), bar_num: this.bar_count };
+  }
+  processBar(bar, atrOv, emaOv, rsiOv) {
+    this.bar_count++;
+    this.elapsed_candles.push(bar);
+    const bm = barMove(bar, this.prev_close);
+    const same = bm === this.push.dir;
+    const ema = emaOv != null ? emaOv : (bar.ema != null ? bar.ema : null);
+    const doji = isDoji(bar);
+    const bp = bodyPct(bar);
+    const rsi = rsiOv != null ? rsiOv : computeRSIEngine([...this.rsi_candles, ...this.elapsed_candles]);
+
+    if (RULE.EXHAUSTION_FILTER && this.bar_count === 1) {
+      const br = bar.h - bar.l;
+      if (br > this.atr * ENG.EXHAUSTION_RANGE_MULT && br > 0) {
+        const cp = this.push.is_up ? (bar.c - bar.l) / br : (bar.h - bar.c) / br;
+        if (cp <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
+      }
+    }
+    if (this.bar_count > ENG.MAX_BARS) return this._result('DUMP', 'Timeout 12 bars');
+
+    if (this.entry_price != null) {
+      const ip = (this.push.is_up && bar.c > this.entry_price) || (!this.push.is_up && bar.c < this.entry_price);
+      if (doji && ip) {
+        this.profit_doji_count++;
+        if (this.profit_doji_count >= ENG.EXHAUSTION_BARS) return this._result('EXHAUSTION', 'Dojis at profit');
+      } else this.profit_doji_count = 0;
+    }
+
+    if (same) {
+      if (this.h1_complete && this.leg_bars < 2) {
+        this.leg_bars++; this.counter_count = 0; this.recent_h1_extreme = null;
+        this.h2_counter = 0; this.h2_max_retrace = 0;
+        this.state = this.leg_bars < 2 ? 'LEG_FORMING' : 'LEG_CONFIRMED';
+      } else if (this.h1_complete && this.leg_bars >= 2 && this.h2_counter >= 1) {
+        if (this.h2_max_retrace >= 0.30 && bp >= 0.25) {
+          this.h2_complete = true; this.h2_attempted = true;
+          if (RULE.EXHAUSTION_FILTER && this.exhaustion_skip) {
+            if (RULE.H2_ENDS_MONITOR) return this._result('DUMP', 'H2 blocked by exhaustion');
+            this.h2_counter = 0; this.h2_max_retrace = 0;
+          } else {
+            const [score, bd] = scoreSignal(this.push, this.h2_max_retrace, this.h2_counter, bar, this.sr_levels, ema, this.context_score, this.atr, 'B', rsi);
+            if (score >= 55) {
+              const sig = this._buildSignal(bar, score, bd, 'B', null, ema);
+              if (sig) { this.entry_price = bar.c; return this._result('SIGNAL', `H2 ${score}`, sig); }
+            }
+            if (RULE.H2_ENDS_MONITOR) return this._result('DUMP', 'H2 attempted');
+          }
+        }
+        this.h2_counter = 0; this.h2_max_retrace = 0;
+      } else if (!this.h1_complete && this.counter_count >= 1) {
+        if (this.max_retrace >= ENG.RETRACE_MIN && bp >= 0.25) {
+          const r = this._tryH1Signal(bar, ema, rsi, bp);
+          if (r) return r;
+        } else {
+          this.counter_count = 0; this.max_retrace = 0;
+          this.recent_h1_extreme = null; this.state = 'WATCHING';
+        }
+      }
+    } else {
+      if (doji) {
+        if (!this.h1_complete) this.doji_count_pre_signal++;
+      } else {
+        this.counter_count++; this.total_counter++;
+        const tr = computeRetrace(bar, this.push);
+        this.max_retrace = Math.max(this.max_retrace, tr);
+        if (!this.h1_complete) {
+          if (this.push.is_up) {
+            this.h1_extreme = this.h1_extreme == null ? bar.l : Math.min(this.h1_extreme, bar.l);
+            this.recent_h1_extreme = this.recent_h1_extreme == null ? bar.l : Math.min(this.recent_h1_extreme, bar.l);
+          } else {
+            this.h1_extreme = this.h1_extreme == null ? bar.h : Math.max(this.h1_extreme, bar.h);
+            this.recent_h1_extreme = this.recent_h1_extreme == null ? bar.h : Math.max(this.recent_h1_extreme, bar.h);
+          }
+        }
+      }
+      if (this.h1_complete && this.leg_bars >= 2) {
+        this.h2_counter++;
+        this.h2_max_retrace = Math.max(this.h2_max_retrace, computeRetrace(bar, this.push));
+      }
+      if (this.max_retrace > ENG.RETRACE_CANCEL) return this._result('CANCEL', `Retrace ${(this.max_retrace*100).toFixed(0)}%`);
+      if (this.max_retrace < ENG.RETRACE_MIN) this.state = 'WATCHING';
+      else if (this.max_retrace <= ENG.RETRACE_FLAG) this.state = 'FLAG_FORMING';
+      else if (this.max_retrace <= ENG.RETRACE_H1_HIGH) this.state = 'H1_FORMING';
+      else if (this.max_retrace <= ENG.RETRACE_H1_DEEP) this.state = 'H1_FORMING_MODERATE';
+      else this.state = 'H1_DEEP';
+      if (this.counter_count >= ENG.EARLY_DUMP_BARS && !this.h1_complete && this.leg_bars === 0) return this._result('DUMP', 'Early dump');
+    }
+    this.prev_close = bar.c;
+    return this._result('WAIT', this.state);
+  }
+  _completeH1() {
+    this.h1_complete = true;
+    this.h1_retrace = this.max_retrace;
+    this.h1_bars = this.counter_count;
+    this.state = 'H1_COMPLETE';
+    this.counter_count = 0;
+  }
+  _tryH1Signal(bar, ema, rsi, bp) {
+    this._completeH1();
+    let sd = null;
+    if (this.h1_retrace > ENG.RETRACE_H1_DEEP) {
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
+      if (rt) {
+        const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, 'RT', rsi);
+        if (s >= 50) sd = { score: s, bd: b, sigType: 'RT+H1', rt };
+      }
+      if (!sd) { this.state = 'H1_DEEP_NO_SR'; return null; }
+    } else if (this.h1_retrace > ENG.RETRACE_H1_HIGH) {
+      const ne = ema && ((this.push.is_up && bar.c > ema) || (!this.push.is_up && bar.c < ema));
+      const nb = bp >= 0.50;
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
+      if (ne && nb) {
+        const st = rt ? 'RT+H1' : 'H1';
+        const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, st, rsi);
+        if (s >= 50) sd = { score: s, bd: b, sigType: st, rt };
+      }
+      if (!sd) return null;
+    } else {
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
+      const st = rt ? 'RT+H1' : 'H1';
+      const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, st, rsi);
+      if (s >= 50) sd = { score: s, bd: b, sigType: st, rt };
+      else return null;
+    }
+    const sig = this._buildSignal(bar, sd.score, sd.bd, sd.sigType, sd.rt, ema);
+    if (sig) { this.entry_price = bar.c; return this._result('SIGNAL', `${sd.sigType} ${sd.score}`, sig); }
+    return null;
+  }
+  _buildSignal(bar, score, bd, sigType, rt, ema) {
+    const push = this.push, atr = this.atr, ep = bar.c, isUp = push.is_up;
+    const anchor = this.recent_h1_extreme != null ? this.recent_h1_extreme : (this.h1_extreme != null ? this.h1_extreme : ep);
+    let stop = isUp ? anchor - atr * ENG.STOP_BUFFER : anchor + atr * ENG.STOP_BUFFER;
+    if (rt) { const lv = rt.level; stop = isUp ? lv - atr * ENG.STOP_BUFFER : lv + atr * ENG.STOP_BUFFER; }
+    let target = isUp ? ep + push.net_move * ENG.TARGET_PCT : ep - push.net_move * ENG.TARGET_PCT;
+    if (RULE.TARGET_VS_RESIST) {
+      let blk = null;
+      for (const lv of this.sr_levels) {
+        if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+        if (isUp && ep < lv.level && lv.level < target) { if (blk == null || lv.level < blk) blk = lv.level; }
+        else if (!isUp && target < lv.level && lv.level < ep) { if (blk == null || lv.level > blk) blk = lv.level; }
+      }
+      if (blk != null) { const buf = atr * 0.1; target = isUp ? blk - buf : blk + buf; }
+    }
+    if (RULE.STOP_VALIDATION && this.elapsed_candles.length >= 2) {
+      const lk = this.elapsed_candles.slice(-ENG.STOP_VALIDATION_LOOKBACK);
+      const tol = atr * ENG.STOP_VALIDATION_TOL;
+      if (isUp) {
+        const nl = lk.filter(b => Math.abs(b.l - stop) < tol || b.l < stop + tol).map(b => b.l);
+        if (nl.length >= 2) stop = Math.min(stop, Math.min(...nl) - tol);
+      } else {
+        const nh = lk.filter(b => Math.abs(b.h - stop) < tol || b.h > stop - tol).map(b => b.h);
+        if (nh.length >= 2) stop = Math.max(stop, Math.max(...nh) + tol);
+      }
+    }
+    const rej = checkPreSignalFilters(bar, ep, stop, target, ema, this.day_open, push, atr);
+    if (rej) return null;
+    return {
+      type: sigType, dir: push.dir, push_id: push.push_id,
+      push_start: push.start_time, push_end: push.end_time,
+      push_extreme: push.extreme, push_move: push.net_move,
+      h1_retrace: +this.h1_retrace.toFixed(3),
+      entry_time: bar.t.slice(11,16),
+      entry_price: +ep.toFixed(2), stop_price: +stop.toFixed(2), target_price: +target.toFixed(2),
+      stop_dist: +Math.abs(ep - stop).toFixed(2),
+      rr: +(Math.abs(target - ep) / Math.abs(ep - stop)).toFixed(2),
+      retrace_pct: +this.h1_retrace.toFixed(3),
+      score, breakdown: bd,
+      rt_level: rt ? rt.level : null, rt_tier: rt ? rt.tier : null,
+      bar_count: this.bar_count, bar_time: bar.t,
+      explanation: buildExplanation(push, this, bar, sigType, score, ema),
+    };
+  }
+}
+
+function buildRationale(sig, push, brokenSR) {
+  return sig.explanation || buildExplanation(push, { h1_retrace: sig.retrace_pct || 0 }, { c: sig.entry_price }, sig.type, sig.score, null);
+}
+
 class Tier3Tracker {
   constructor(alert, fillPrice, fillTime) {
-    this.alert = alert;
-    this.fill_price = fillPrice;
-    this.fill_time = fillTime;
-    this.bars_since_fill = 0;
-    this.mfe = 0;       // max favorable excursion (in R)
-    this.mae = 0;       // max adverse excursion (in R)
-    this.exit_override = false;   // once MFE > 0.7R, never trigger early exit
-    this.outcome = null;
-    this.exit_reason = null;
-    this.exit_price = null;
-    this.exit_time = null;
+    this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;
+    this.bars_since_fill = 0; this.mfe = 0; this.mae = 0; this.exit_override = false;
+    this.outcome = null; this.exit_reason = null; this.exit_price = null; this.exit_time = null;
   }
-
-  // Per-bar update
   processBar(bar) {
     if (this.outcome) return { status: 'closed', ...this.summary() };
     this.bars_since_fill++;
     const isUp = this.alert.dir === 'up';
     const R = Math.abs(this.alert.entry_price - this.alert.stop_price);
-    const moveFromEntry = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
-    const moveR = moveFromEntry / R;
-    if (moveR > this.mfe) this.mfe = moveR;
-    if (moveR < this.mae) this.mae = moveR;
-
-    // Rule 4: don't-exit override
+    const m = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
+    const mR = m / R;
+    if (mR > this.mfe) this.mfe = mR;
+    if (mR < this.mae) this.mae = mR;
     if (this.mfe > 0.7) this.exit_override = true;
-
-    // Target hit
     if (isUp && bar.h >= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
     if (!isUp && bar.l <= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
-    // Stop hit
     if (isUp && bar.l <= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
     if (!isUp && bar.h >= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
-
     if (!this.exit_override) {
-      // Rule 1: Bar 2 reversal
-      if (this.bars_since_fill === 2 && moveR <= -0.5 && this.mfe > 0) {
-        return this._close('EARLY_EXIT', bar.c, 'bar2_reversal', bar.t);
-      }
-      // Rule 2: Pattern break (S/R level violated)
-      // [Simplified: check against the rt_level if RT+H1]
+      if (this.bars_since_fill === 2 && mR <= -0.5 && this.mfe > 0) return this._close('EARLY_EXIT', bar.c, 'bar2_reversal', bar.t);
       if (this.alert.type === 'RT+H1' && this.alert.rt_level) {
         const lv = this.alert.rt_level;
         if (isUp && bar.c < lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
         if (!isUp && bar.c > lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
       }
-      // Rule 3: time stagnation (6 bars, MFE never +0.5R, MAE touched -0.5R)
-      if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) {
-        return this._close('EARLY_EXIT', bar.c, 'time_stagnation', bar.t);
-      }
+      if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) return this._close('EARLY_EXIT', bar.c, 'time_stagnation', bar.t);
     }
-
     return { status: 'open', mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2), bars_since_fill: this.bars_since_fill };
   }
-
   _close(outcome, price, reason, time) {
-    this.outcome = outcome;
-    this.exit_price = +price.toFixed(2);
-    this.exit_reason = reason;
-    this.exit_time = time;
+    this.outcome = outcome; this.exit_price = +price.toFixed(2); this.exit_reason = reason; this.exit_time = time;
     return { status: 'closed', ...this.summary() };
   }
-
   summary() {
-    return {
-      outcome: this.outcome,
-      exit_price: this.exit_price,
-      exit_reason: this.exit_reason,
-      exit_time: this.exit_time,
-      mfe: +this.mfe.toFixed(2),
-      mae: +this.mae.toFixed(2),
-      bars_held: this.bars_since_fill,
-    };
+    return { outcome: this.outcome, exit_price: this.exit_price, exit_reason: this.exit_reason, exit_time: this.exit_time, mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2), bars_held: this.bars_since_fill };
   }
 }
 
+// ── STREAMING PUSH DETECTOR (full port of streaming_push_detector.py) ──
+const SPD = {
+  INSIG_PCT_THRESHOLD: 0.05,
+  INSIG_RANGE_ATR_MULT: 0.30,
+  INSIG_BODY_THRESHOLD: 0.30,
+  DIR_THRESHOLD_PCT: 0.005,
+};
+
+function classifyBar(bar, prevClose, atr) {
+  if (prevClose <= 0) {
+    const bd = bar.c > bar.o ? 'up' : bar.c < bar.o ? 'down' : 'flat';
+    return { direction: bd, absChg: 0 };
+  }
+  const chg = (bar.c - prevClose) / prevClose * 100;
+  if (chg > SPD.DIR_THRESHOLD_PCT) return { direction: 'up', absChg: Math.abs(chg) };
+  if (chg < -SPD.DIR_THRESHOLD_PCT) return { direction: 'down', absChg: Math.abs(chg) };
+  if (bar.c > bar.o) return { direction: 'up', absChg: Math.abs(chg) };
+  if (bar.c < bar.o) return { direction: 'down', absChg: Math.abs(chg) };
+  return { direction: 'flat', absChg: Math.abs(chg) };
+}
+
+function isInsignificant(bar, absChgPct, atr) {
+  if (atr <= 0) atr = 0.001;
+  const range = bar.h - bar.l;
+  const body = Math.abs(bar.c - bar.o);
+  const bp = body / (range || 0.001);
+  return absChgPct < SPD.INSIG_PCT_THRESHOLD && range < SPD.INSIG_RANGE_ATR_MULT * atr && bp < SPD.INSIG_BODY_THRESHOLD;
+}
+
+function isDojiSPD(bar) {
+  const r = bar.h - bar.l;
+  if (r <= 0) return true;
+  return Math.abs(bar.c - bar.o) / r < SPD.INSIG_BODY_THRESHOLD;
+}
+
+class StreamingPushDetector {
+  constructor(atr, minBars) {
+    this.atr = atr;
+    this.minBars = minBars || 3;
+    this.reset();
+  }
+  reset() {
+    this.state = 'IDLE';
+    this.candles = [];
+    this.barClasses = [];
+    this.barSignificant = [];
+    this.pushDir = null;
+    this.pushStartIdx = null;
+    this.lastPushIdx = null;
+    this.heldIndices = [];
+    this.idleStreakDir = null;
+    this.idleStreakBars = [];
+  }
+  processBar(bar) {
+    const idx = this.candles.length;
+    const prevClose = this.candles.length ? this.candles[this.candles.length-1].c : 0;
+    const cls = classifyBar(bar, prevClose, this.atr);
+    const insig = isInsignificant(bar, cls.absChg, this.atr);
+    const barClass = insig ? 'insig' : cls.direction;
+    const sig = !insig;
+    this.candles.push(bar);
+    this.barClasses.push(barClass);
+    this.barSignificant.push(sig);
+    if (this.state === 'IDLE') return this._handleIdle(idx, barClass, sig, cls.direction);
+    if (this.state === 'IN_PUSH') return this._handleInPush(idx, barClass, sig, cls.direction, bar);
+    if (this.state === 'HOLD_1') return this._handleHold1(idx, barClass, sig, cls.direction, bar);
+    if (this.state === 'HOLD_2') return this._handleHold2(idx, barClass, sig, cls.direction, bar);
+    return null;
+  }
+  _handleIdle(idx, barClass, sig, dir) {
+    if (!sig || dir === 'flat') { this.idleStreakDir = null; this.idleStreakBars = []; return null; }
+    if (dir !== this.idleStreakDir) { this.idleStreakDir = dir; this.idleStreakBars = [idx]; }
+    else this.idleStreakBars.push(idx);
+    if (this.idleStreakBars.length >= this.minBars) {
+      this.state = 'IN_PUSH';
+      this.pushDir = dir;
+      this.pushStartIdx = this.idleStreakBars[0];
+      this.lastPushIdx = idx;
+      this.heldIndices = [];
+      this.idleStreakDir = null;
+      this.idleStreakBars = [];
+    }
+    return null;
+  }
+  _handleInPush(idx, barClass, sig, dir, bar) {
+    if (sig && dir === this.pushDir) { this.lastPushIdx = idx; return null; }
+    if (!sig) { this.state = 'HOLD_1'; this.heldIndices = [idx]; return null; }
+    return this._endPush(idx, idx, []);
+  }
+  _handleHold1(idx, barClass, sig, dir, bar) {
+    if (sig && dir === this.pushDir) { this.lastPushIdx = idx; this.heldIndices = []; this.state = 'IN_PUSH'; return null; }
+    if (sig && dir !== this.pushDir) return this._endPush(idx, idx, this.heldIndices);
+    const heldBar = this.candles[this.heldIndices[0]];
+    if (isDojiSPD(heldBar) && isDojiSPD(bar)) { this.heldIndices.push(idx); this.state = 'HOLD_2'; return null; }
+    return this._endPush(idx, idx, this.heldIndices);
+  }
+  _handleHold2(idx, barClass, sig, dir, bar) {
+    if (sig && dir === this.pushDir) { this.lastPushIdx = idx; this.heldIndices = []; this.state = 'IN_PUSH'; return null; }
+    return this._endPush(idx, idx, this.heldIndices);
+  }
+  _endPush(curIdx, counterStartsAt, retroCounters) {
+    const allCounters = [...retroCounters];
+    if (!allCounters.includes(counterStartsAt)) allCounters.push(counterStartsAt);
+    const pushDict = {
+      start_idx: this.pushStartIdx,
+      end_idx: this.lastPushIdx,
+      dir: this.pushDir,
+      bars: this.lastPushIdx - this.pushStartIdx + 1,
+      counter_indices: allCounters,
+      candles: [...this.candles],
+      detected_at_idx: curIdx,
+    };
+    this.state = 'IDLE';
+    this.pushDir = null;
+    this.pushStartIdx = null;
+    this.lastPushIdx = null;
+    this.heldIndices = [];
+    // Seed new idle streak from significant counters in opposite direction
+    let nsd = null, nsb = [];
+    for (const ci of allCounters) {
+      if (ci >= this.barSignificant.length || !this.barSignificant[ci]) continue;
+      const c = this.barClasses[ci];
+      if (c === 'up' || c === 'down') {
+        if (nsd === null || nsd === c) { nsd = c; nsb.push(ci); }
+        else { nsd = c; nsb = [ci]; }
+      }
+    }
+    this.idleStreakDir = nsd;
+    this.idleStreakBars = nsb;
+    return pushDict;
+  }
+}
+
+function eventToQualifyingPush(event, atr, minAtrMult, minSlopePct, minBars) {
+  const candles = event.candles;
+  const startIdx = event.start_idx;
+  const endIdx = event.end_idx;
+  const isUp = event.dir === 'up';
+  const bars = endIdx - startIdx + 1;
+  if (bars < (minBars || 3)) return null;
+  const pushBars = candles.slice(startIdx, endIdx + 1);
+  const startOpen = pushBars[0].o;
+  const endClose = pushBars[pushBars.length - 1].c;
+  const swingHigh = Math.max(...pushBars.map(b => b.h));
+  const swingLow = Math.min(...pushBars.map(b => b.l));
+  const extreme = isUp ? swingHigh : swingLow;
+  const pushRange = swingHigh - swingLow;
+  const netMove = pushRange;
+  const slopeOcPct = (endClose - startOpen) / (startOpen || 1) * 100;
+  const midF = (pushBars[0].h + pushBars[0].l) / 2;
+  const midL = (pushBars[pushBars.length-1].h + pushBars[pushBars.length-1].l) / 2;
+  const slopeMidPct = (midL - midF) / (midF || 1) * 100;
+  if (Math.abs(slopeMidPct) < (minSlopePct || 0.30)) return null;
+  if (netMove < atr * (minAtrMult || 2.0)) return null;
+  const MID_MIN = 0.15;
+  if (Math.abs(slopeMidPct) < MID_MIN) return null;
+  const slopeRatio = Math.abs(slopeOcPct) / 0.05;
+  let strength;
+  if (slopeRatio >= 5) strength = 'Strong';
+  else if (slopeRatio >= 2) strength = 'Moderate';
+  else strength = 'Weak';
+  if (strength !== 'Strong') return null;
+  const highestClose = Math.max(...pushBars.map(b => b.c));
+  const lowestClose = Math.min(...pushBars.map(b => b.c));
+  return {
+    dir: event.dir, is_up: isUp,
+    start_idx: startIdx, end_idx: endIdx, bars,
+    start_time: pushBars[0].t.slice(11,16),
+    end_time: pushBars[pushBars.length-1].t.slice(11,16),
+    start_price: +startOpen.toFixed(2),
+    end_price: +endClose.toFixed(2),
+    extreme: +extreme.toFixed(2),
+    highest_close: +highestClose.toFixed(2),
+    lowest_close: +lowestClose.toFixed(2),
+    swing_high: +swingHigh.toFixed(2),
+    swing_low: +swingLow.toFixed(2),
+    push_range: +pushRange.toFixed(2),
+    net_move: +pushRange.toFixed(2),
+    move: +pushRange.toFixed(2),
+    slope: +slopeOcPct.toFixed(3),
+    slope_mid: +Math.abs(slopeMidPct).toFixed(3),
+    strength,
+    atr: +atr.toFixed(2),
+    push_id: `${event.dir}_${pushBars[0].t.slice(11,16)}_${Math.round(extreme*10)/10}`,
+    detected_at_idx: event.detected_at_idx,
+    counter_indices_at_end: event.counter_indices,
+  };
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    ENG, RULE, computeZonesPD, findQualifyingPush,
+    StreamingPushDetector, eventToQualifyingPush,
+    computeRSIEngine, checkRTTouch, checkCounterSwingVeto, scoreSignal,
+    Tier2Monitor, computeBrokenSR, buildRationale, Tier3Tracker,
+    barMove, bodyPct, isDoji, computeRetrace,
+  };
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // END NEW ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1460,15 +1437,25 @@ async function runTier1v7() {
       const priorBars = candles.filter(b => b.t.slice(0,10) !== today);
       const atr = priorBars.length > 14 ? computeATR(priorBars.slice(-75)) : computeATR(candles);
 
-      // Use zone-based push finder (matches Python find_qualifying_push)
-      const qp = findQualifyingPush(todayBars, atr);
-      if (!qp) { await sleep(80); continue; }
+      // Run streaming detector on today's bars (re-runs from scratch each cycle)
+      const detector = new StreamingPushDetector(atr, ENG.MIN_BARS);
+      let lastQP = null;
+      let lastEvent = null;
+      for (let bi = 0; bi < todayBars.length; bi++) {
+        const ev = detector.processBar(todayBars[bi]);
+        if (ev) {
+          const qp = eventToQualifyingPush(ev, atr, ENG.MIN_ATR_MULT, ENG.MIN_SLOPE_PCT, ENG.MIN_BARS);
+          if (qp) { lastQP = qp; lastEvent = ev; }
+        }
+      }
+      if (!lastQP) { await sleep(80); continue; }
+      const qp = lastQP;
 
       // Check if this push was already fired and blocked
       const pushId = qp.push_id;
       if (STATE.blocked_pushes.has(pushId)) { await sleep(80); continue; }
 
-      // Check push is recent (within last 3 bars of current data)
+      // Check push is recent (within last few bars)
       const barsSincePush = todayBars.length - 1 - qp.end_idx;
       if (barsSincePush > ENG.PUSH_EXPIRY_BARS + 2) { await sleep(80); continue; }
 
@@ -1498,8 +1485,10 @@ async function runTier1v7() {
         context_score: contextScore,
         day_bars: todayBars,
         atr,
+        counter_indices: lastEvent ? lastEvent.counter_indices : [],   // for Tier 2 prefill
+        push_end_idx: qp.end_idx,
         last_bar_t: lastBarT,
-        monitor: null,         // created on first Tier 2 call
+        monitor: null,
         added_at: new Date().toISOString(),
       };
       console.log(`[T1v7] + ${symbol} (${qp.dir} push, ${qp.bars}b, ${qp.move.toFixed(2)} move, ${(qp.move/atr).toFixed(1)}xATR)`);
@@ -1556,10 +1545,21 @@ async function runTier2v7() {
       if (!entry.monitor) {
         entry.monitor = new Tier2Monitor(
           entry.push, entry.sr_levels, entry.broken_sr,
-          entry.context_score, todayBars[0].o, entry.day_bars
+          entry.context_score, todayBars[0].o, []
         );
-        // Prefill: feed the counter bars that were already part of the push event
-        // We can't access detector internals here, so we just start fresh from new bars
+        // Prefill counter bars from push event
+        if (entry.counter_indices) {
+          for (const cidx of entry.counter_indices) {
+            if (cidx < todayBars.length) {
+              entry.monitor.processBar(todayBars[cidx]);
+            }
+          }
+        }
+        // Mark last_bar_t to the last counter index we prefed
+        if (entry.counter_indices && entry.counter_indices.length) {
+          const lastCi = entry.counter_indices[entry.counter_indices.length-1];
+          if (lastCi < todayBars.length) entry.last_bar_t = todayBars[lastCi].t;
+        }
       }
 
       // Feed each new bar through monitor

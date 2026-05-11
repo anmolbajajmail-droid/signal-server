@@ -942,6 +942,93 @@ function buildExplanation(push, monitor, bar, sigType, score, ema) {
   return parts.join(' | ');
 }
 
+// Detailed multi-section rationale for home page alerts
+function buildDetailedRationale(sig, push, brokenSR, isCounter) {
+  const lines = [];
+  const isUp = sig.dir === 'up';
+  const pushDir = push.is_up ? 'UP' : 'DOWN';
+  const pushBars = push.bars || ((push.end_idx || 0) - (push.start_idx || 0) + 1);
+  const atrMult = push.net_move && push.atr ? (push.net_move / push.atr).toFixed(1) : '?';
+
+  // SECTION 1: What the engine saw
+  lines.push(`📊 PUSH DETECTED`);
+  lines.push(`• ${pushDir} ${pushBars}-bar push from ${push.start_time} → ${push.end_time}`);
+  lines.push(`• Price moved ₹${push.start_price?.toFixed(2)} → ₹${push.extreme?.toFixed(2)} (₹${push.net_move?.toFixed(2)} = ${atrMult}× ATR)`);
+  if (push.slope_mid) lines.push(`• Slope ${push.slope_mid.toFixed(2)}%/bar, strength: ${push.strength || 'Strong'}`);
+
+  // SECTION 2: Key levels broken (if any)
+  if (brokenSR && brokenSR.length > 0) {
+    lines.push('');
+    lines.push(`🎯 LEVELS BROKEN BY PUSH`);
+    brokenSR.slice(0, 3).forEach(lv => {
+      lines.push(`• ${lv.tier} ${lv.type === 'res' ? 'resistance' : 'support'} @ ₹${lv.level} (${lv.priorDayTouches || 0} prior-day touches)`);
+    });
+  }
+
+  // SECTION 3: What happened after push
+  lines.push('');
+  if (isCounter) {
+    lines.push(`🔄 COUNTER TRADE LOGIC`);
+    lines.push(`• Push retracement exceeded 80% (push failed/reversed)`);
+    lines.push(`• Trading AGAINST original ${pushDir} direction — now ${isUp ? 'LONG' : 'SHORT'}`);
+    lines.push(`• Counter swing veto passed (no recent swing extreme within 0.5× ATR blocking entry)`);
+    lines.push(`• Note: counter trades are higher-risk — push direction reversed entirely`);
+  } else {
+    lines.push(`🔄 PULLBACK PATTERN`);
+    const retPct = sig.retrace_pct ? (sig.retrace_pct * 100).toFixed(0) : '?';
+    const ret = sig.retrace_pct || 0;
+    const retDesc = ret <= 0.30 ? 'Shallow flag pullback — strong continuation' :
+                    ret <= 0.40 ? 'High-conviction pullback' :
+                    ret <= 0.60 ? 'Moderate pullback — needs confirmation' :
+                    'Deep pullback held at support/resistance';
+    lines.push(`• ${retDesc}`);
+    lines.push(`• Retrace ${retPct}% from extreme (counter bars only)`);
+    if (sig.type === 'RT+H1' && sig.rt_level) {
+      lines.push(`• Bonus: Pullback tested broken level @ ₹${sig.rt_level} and held — adds confluence`);
+    }
+    if (sig.type === 'B') {
+      lines.push(`• H2 (second-leg) resumption — push attempted to resume after 1st pullback`);
+    }
+  }
+
+  // SECTION 4: Trade thesis
+  lines.push('');
+  lines.push(`💡 TRADE THESIS`);
+  if (isCounter) {
+    lines.push(`• Original ${pushDir} momentum exhausted/reversed; ride the new direction`);
+    lines.push(`• Stop ₹${sig.stop_price} = beyond recent swing extreme + 0.5× ATR`);
+    lines.push(`• Target ₹${sig.target_price} = 1.5× risk (R:R 1.5)`);
+  } else {
+    lines.push(`• ${pushDir} momentum holding through pullback — expecting continuation`);
+    lines.push(`• Stop ₹${sig.stop_price} = beyond pullback extreme + 1× ATR buffer`);
+    const rr = sig.rr || (Math.abs(sig.target_price - sig.entry_price) / Math.abs(sig.entry_price - sig.stop_price)).toFixed(2);
+    lines.push(`• Target ₹${sig.target_price} = 50% of push extension (R:R ${rr})`);
+  }
+
+  // SECTION 5: Score breakdown
+  if (sig.breakdown) {
+    lines.push('');
+    lines.push(`📈 SCORE: ${sig.score}${sig.final_score && sig.final_score !== sig.score ? ' → ' + sig.final_score : ''} (${sig.conviction || 'MODERATE'})`);
+    const bd = sig.breakdown;
+    const parts = [];
+    if (bd.push_quality != null) parts.push(`Push: ${bd.push_quality}`);
+    if (bd.retrace_quality != null) parts.push(`Retrace: ${bd.retrace_quality}`);
+    if (bd.ema_alignment != null) parts.push(`EMA: ${bd.ema_alignment}`);
+    if (bd.sr_confluence != null) parts.push(`S/R: ${bd.sr_confluence}`);
+    if (bd.bar_strength != null) parts.push(`Bar: ${bd.bar_strength}`);
+    if (bd.rsi != null) parts.push(`RSI: ${bd.rsi}`);
+    if (bd.context != null) parts.push(`Context: ${bd.context}`);
+    if (parts.length) lines.push(`• ${parts.join(' | ')}`);
+    if (sig.context && sig.context.detail) lines.push(`• Context detail: ${sig.context.label || ''}`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildRationale(sig, push, brokenSR) {
+  return buildDetailedRationale(sig, push, brokenSR, sig.type === 'COUNTER');
+}
+
 class Tier2Monitor {
   constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles) {
     this.push = push;
@@ -1758,7 +1845,7 @@ async function runTier2v7() {
             const alert = {
               alert_id: `${symbol}_${entry.push_id}_C_${Date.now()}`,
               symbol, ...counterSig,
-              rationale: `Counter trade: original ${entry.push.dir.toUpperCase()} push reversed >80%. Trading against original direction. Entry ₹${counterSig.entry_price} → Target ₹${counterSig.target_price} (R:R 1.5). Score ${counterScore}→${finalRes.final_score}.`,
+              rationale: buildRationale(counterSig, entry.push, entry.broken_sr),
               push: entry.push,
               fired_at: new Date().toISOString(),
               bar_time: bar.t,

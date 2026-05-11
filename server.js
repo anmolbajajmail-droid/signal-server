@@ -1225,10 +1225,6 @@ class Tier2Monitor {
   }
 }
 
-function buildRationale(sig, push, brokenSR) {
-  return sig.explanation || buildExplanation(push, { h1_retrace: sig.retrace_pct || 0 }, { c: sig.entry_price }, sig.type, sig.score, null);
-}
-
 class Tier3Tracker {
   constructor(alert, fillPrice, fillTime, shares) {
     this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;

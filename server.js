@@ -413,7 +413,7 @@ async function fetchKite5Min(symbol) {
   const token = KITE.instrumentTokens[symbol];
   if (token && kiteReady()) {
     const now     = new Date();
-    const from    = new Date(now); from.setDate(from.getDate() - 3);
+    const from    = new Date(now); from.setDate(from.getDate() - 5);
     const fromStr = from.toISOString().split('T')[0];
     const toStr   = now.toISOString().split('T')[0];
     try {
@@ -480,405 +480,109 @@ function computeATR(candles, period = 14) {
   return recent.reduce((a, b) => a + b, 0) / recent.length;
 }
 
-function computeMicroZones(candles) {
-  const n = candles.length;
-  if (n < 4) return [];
-  const bm = new Array(n).fill('flat');
-  if (candles[0].c > candles[0].o) bm[0] = 'up';
-  else if (candles[0].c < candles[0].o) bm[0] = 'down';
-  for (let i = 1; i < n; i++) {
-    const chg = (candles[i].c - candles[i-1].c) / candles[i-1].c * 100;
-    if (chg > 0.005) bm[i] = 'up';
-    else if (chg < -0.005) bm[i] = 'down';
-    else if (candles[i].c < candles[i].o) bm[i] = 'down';
-    else if (candles[i].c > candles[i].o) bm[i] = 'up';
-  }
-  const bd = new Array(n).fill('range');
-  let i = 1;
-  while (i < n) {
-    let rd = bm[i]; if (rd === 'flat') { i++; continue; }
-    let re = i, ints = 0;
-    for (let j = i+1; j < n; j++) {
-      if (bm[j] === rd) { re = j; ints = 0; }
-      else if (bm[j] === 'flat' && ints < 1) ints++;
-      else break;
-    }
-    let rs = i; if (i > 0 && bm[i-1] === rd && bd[i-1] === 'range') rs = i-1;
-    const rl = re - rs + 1;
-    if (rl >= 3) {
-      const sp = rs > 0 ? candles[rs-1].c : candles[0].o;
-      const tm = (candles[re].c - sp) / sp * 100;
-      if ((rd === 'down' && tm < -0.15) || (rd === 'up' && tm > 0.15)) {
-        for (let k = rs; k <= re; k++) bd[k] = rd; i = re + 1; continue;
-      }
-    }
-    i++;
-  }
-  // Two-bar sharp override
-  for (let i = 1; i < n-1; i++) {
-    if (bm[i] !== bm[i+1] || bm[i] === 'flat') continue;
-    const tm = (candles[i+1].c - candles[i-1].c) / candles[i-1].c * 100;
-    if ((bm[i] === 'up' && tm > 0.25) || (bm[i] === 'down' && tm < -0.25)) {
-      bd[i] = bm[i]; bd[i+1] = bm[i];
-    }
-  }
-  // Build zones
-  const raw = []; let zs = 0;
-  for (let i = 1; i <= n; i++) {
-    if (i === n || bd[i] !== bd[i-1]) {
-      raw.push({ start: zs, end: i-1, dir: bd[i-1], bars: i-zs }); zs = i;
-    }
-  }
-  // Merge and absorb tiny zones
-  const mg = [];
-  raw.forEach(z => {
-    const p = mg[mg.length-1];
-    if (p && p.dir === z.dir) { p.end = z.end; p.bars += z.bars; }
-    else mg.push({...z});
-  });
-  const ab = [];
-  mg.forEach(z => {
-    if (z.bars >= 4) ab.push({...z});
-    else { const p = ab[ab.length-1]; if (p) { p.end = z.end; p.bars += z.bars; } else ab.push({...z}); }
-  });
-  const atr = computeATR(candles);
-  return ab.map(z => {
-    if (z.dir === 'range') return z;
-    const nm = Math.abs(candles[z.end].c - candles[z.start].c);
-    return nm < atr * 0.5 ? {...z, dir:'range'} : z;
-  });
-}
-
+// computeMicroZones removed (replaced by computeZonesPD in new engine)
 function computeSR(candles) {
   const n = candles.length;
-  if (n < 20) return { supports: [], resistances: [] };
-  const atr = computeATR(candles);
+  if (n < 20) return { supports: [], resistances: [], atr: 1 };
+  const atr      = computeATR(candles);
+  const cur      = candles[n-1].c;
   const touchTol = atr * 0.5;
-  const curPrice = candles[n-1].c;
-  const priceTol = curPrice * 0.06;
-  const avgVol   = candles.reduce((s, b) => s + b.v, 0) / n || 1;
-  const minCD    = atr * 0.3;
+  const minClose = atr * 0.15;
+  const avgVol   = candles.reduce((s,b) => s+b.v, 0) / n || 1;
+  const today    = candles[n-1].t.slice(0, 10);
 
-  const gaps = new Set(); let pC = null, pD = null;
-  candles.forEach((b, i) => {
-    const d = b.t.slice(0, 10);
-    if (pD && d !== pD && pC && Math.abs(b.o - pC) / pC > 0.003) gaps.add(i);
-    pC = b.c; pD = d;
-  });
+  // Grid scan: ±9% of current price in steps of 0.25×ATR
+  const step = atr * 0.25;
+  const lo   = cur * 0.91;
+  const hi   = cur * 1.09;
+  const grid = [];
+  for (let lev = lo; lev <= hi; lev += step) grid.push(+lev.toFixed(2));
 
-  const pLB = 4; const sH = [], sL = [];
-  for (let i = pLB; i < n - pLB; i++) {
-    if (gaps.has(i)) continue;
-    let pH = true, pLo = true;
-    for (let j = i-pLB; j <= i+pLB; j++) {
-      if (j === i) continue;
-      if (candles[j].h >= candles[i].h) pH = false;
-      if (candles[j].l <= candles[i].l) pLo = false;
+  const results = [];
+
+  grid.forEach(level => {
+    const rr = [], rc = [], sr2 = [], sc = [];
+
+    for (let i = 1; i < n; i++) {
+      const b    = candles[i];
+      const prev = candles[i-1];
+      const isToday = b.t.slice(0,10) === today;
+      const vm   = b.v > avgVol * 1.5 ? 1.3 : 1.0;
+      const br   = b.h - b.l || atr;
+      const date = b.t.slice(0,10);
+
+      // Resistance interactions (approach from below)
+      if (prev.c < level) {
+        if (Math.abs(b.h - level) <= touchTol && b.c < level - minClose) {
+          // Sharp rejection
+          rr.push({ q: Math.min((level-b.c)/br, 1)*vm, today:isToday, date, sharp:true });
+        } else if (Math.abs(b.h - level) <= touchTol && b.c < level) {
+          // Mild cluster
+          rc.push({ q: (1-(level-b.c)/touchTol)*vm*0.6, today:isToday, date, sharp:false });
+        }
+      }
+
+      // Support interactions (approach from above)
+      if (prev.c > level) {
+        if (Math.abs(b.l - level) <= touchTol && b.c > level + minClose) {
+          // Sharp rejection
+          sr2.push({ q: Math.min((b.c-level)/br, 1)*vm, today:isToday, date, sharp:true });
+        } else if (Math.abs(b.l - level) <= touchTol && b.c > level) {
+          // Mild cluster
+          sc.push({ q: (1-(b.c-level)/touchTol)*vm*0.6, today:isToday, date, sharp:false });
+        }
+      }
+
+      // Consolidation: bar opened AND closed near level (price AT level)
+      if (Math.abs(b.c - level) <= touchTol*0.5 && Math.abs(b.o - level) <= touchTol*0.5) {
+        rr.push({ q: 0.3*vm, today:isToday, date, sharp:false });
+        sr2.push({ q: 0.3*vm, today:isToday, date, sharp:false });
+      }
     }
-    if (pH) sH.push(candles[i].h);
-    if (pLo) sL.push(candles[i].l);
-  }
 
-  const snap = p => { const s = Math.max(atr * 0.5, 0.5); return Math.round(p / s) * s; };
-  const cands = new Set();
-  [...sH, ...sL].forEach(x => cands.add(snap(x)));
-  candles.forEach((b, i) => { if (gaps.has(i)) return; cands.add(snap(b.h)); cands.add(snap(b.l)); });
-
-  const tDay = candles[n-1].t.slice(0, 10);
-  const rej = [];
-  cands.forEach(level => {
-    if (Math.abs(level - curPrice) > priceTol) return;
-    const rR = [], rS = [];
-    candles.forEach((b, i) => {
-      if (gaps.has(i) || i === 0) return;
-      const vm = b.v > avgVol * 1.5 ? 1.3 : 1;
-      const br = b.h - b.l || 1;
-      const isT = b.t.slice(0, 10) === tDay;
-      const pb = candles[i-1];
-      if (pb.c < level && Math.abs(b.h - level) <= touchTol && b.c < level - minCD)
-        rR.push({ q: Math.min((level - b.c) / br, 1) * vm, t: isT });
-      if (pb.c > level && Math.abs(b.l - level) <= touchTol && b.c > level + minCD)
-        rS.push({ q: Math.min((b.c - level) / br, 1) * vm, t: isT });
-    });
-    const scoreR = (rs, tp) => {
-      if (!rs.length) return;
-      const pr = rs.filter(r => !r.t), td = rs.filter(r => r.t);
-      const np = pr.length, nt = td.length;
-      let sp = np>=3?60:np===2?45:np===1?25:nt>=3?15:nt>=2?8:0;
-      if (!sp) return;
-      const aq = rs.reduce((s, r) => s + r.q, 0) / rs.length;
-      rej.push({ level, type: tp, score: (sp + aq*40)/100, priorDayTouches: np });
+    const scoreSide = (rej, cls, tp) => {
+      const allR = [...rej, ...cls];
+      if (!allR.length) return;
+      const priorDates = new Set(allR.filter(r => !r.today).map(r => r.date));
+      const todayHits  = allR.filter(r => r.today);
+      const pc = priorDates.size;
+      let base = pc>=3 ? 60 : pc===2 ? 45 : pc===1 ? 25
+               : todayHits.length>=3 ? 15 : todayHits.length>=2 ? 8 : 0;
+      if (!base) return;
+      const avgQ    = allR.reduce((s,r) => s+r.q, 0) / allR.length;
+      const sharpRatio = rej.length / allR.length;
+      const score   = (base + avgQ*40) / 100 * (0.65 + 0.35*sharpRatio);
+      results.push({
+        level, type: tp,
+        score:           +score.toFixed(3),
+        priorDayTouches: pc,
+        totalTouches:    allR.length,
+        sharpRejections: rej.length,
+        mildClusters:    cls.length,
+        tier: pc>=2 ? 'T1' : pc>=1 ? 'T2' : 'T3',
+      });
     };
-    scoreR(rR, 'res'); scoreR(rS, 'sup');
+
+    scoreSide(rr, rc, 'res');
+    scoreSide(sr2, sc, 'sup');
   });
 
-  rej.sort((a, b) => b.score - a.score);
-  const ded = [];
-  rej.forEach(l => {
-    if (!ded.find(d => d.type === l.type && Math.abs(d.level - l.level) <= touchTol * 2))
-      ded.push(l);
+  // Deduplicate: 0.75×ATR minimum distance between same-type levels
+  results.sort((a,b) => b.score - a.score);
+  const deduped = [];
+  results.forEach(r => {
+    if (!deduped.find(d => d.type===r.type && Math.abs(d.level-r.level) <= atr*0.75))
+      deduped.push(r);
   });
+
   return {
-    supports:    ded.filter(l => l.type === 'sup').slice(0, 6),
-    resistances: ded.filter(l => l.type === 'res').slice(0, 6),
+    supports:    deduped.filter(l => l.type==='sup').slice(0, 8),
+    resistances: deduped.filter(l => l.type==='res').slice(0, 8),
     atr,
   };
 }
 
-// ─── H2 PULLBACK SCORING ──────────────────────────────────────────────────────
-function findH2Signals(candles, zones, sr, atr, minScore = 60) {
-  const n = candles.length;
-  const atrV = atr;
-  const allSR = [...(sr.supports || []), ...(sr.resistances || [])];
-  const signals = [];
-  const lastPB = { bull: null, bear: null };
-
-  function gpbc(dir, pbStart, cm) {
-    const pv = lastPB[dir];
-    if (pv && (pbStart - pv.bar) <= 60 && cm <= atrV * 2) return pv.count + 1;
-    return 1;
-  }
-  function mcm(fb, tb, iu) {
-    let ext = candles[fb].c;
-    for (let k = fb; k <= Math.min(tb, n-1); k++) {
-      ext = iu ? Math.min(ext, candles[k].l) : Math.max(ext, candles[k].h);
-    }
-    return Math.abs(ext - candles[fb].c);
-  }
-
-  for (let zi = 0; zi < zones.length; zi++) {
-    const pz = zones[zi];
-    if (pz.dir === 'range' || pz.bars < 3) continue;
-    const iu = pz.dir === 'up';
-    const ps = pz.start, pe = pz.end;
-    if (pe + 3 >= n) continue;
-    // CROSS-DAY FIX: push must start from TODAY (prevents VBL-type false signals)
-    // Yesterday push + today gap-down looks like H1 pullback to the engine
-    if (candles[ps].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
-
-    // Merge consecutive same-dir zones
-    let me = pe, zi2 = zi + 1;
-    while (zi2 < zones.length) {
-      const nz = zones[zi2];
-      if (nz.dir !== pz.dir) break;
-      const nm = Math.abs(candles[nz.end].c - candles[nz.start].c);
-      const pm = Math.abs(candles[me].c - candles[ps].c);
-      if (nm > pm * 0.3) break;
-      me = nz.end; zi2++;
-    }
-
-    const pushMove = Math.abs(candles[me].c - candles[ps].c);
-    if (pushMove < atrV * 0.5) continue;
-    const pushExtreme = iu
-      ? Math.max(...candles.slice(ps, me+1).map(b => b.h))
-      : Math.min(...candles.slice(ps, me+1).map(b => b.l));
-    const pushVol  = candles.slice(ps, me+1).reduce((s, b) => s + b.v, 0) / (me - ps + 1);
-    const volPre   = candles.slice(Math.max(0, ps-20), ps).map(b => b.v);
-    const avgVolPre = volPre.length ? volPre.reduce((a, b) => a+b, 0) / volPre.length : pushVol;
-    let p1 = pushMove >= atrV*1.5 ? 15 : pushMove >= atrV ? 10 : pushMove >= atrV*0.5 ? 5 : 0;
-    if (pushVol > avgVolPre * 1.2) p1 = Math.min(p1 + 3, 15);
-
-    // Find pullback zone
-    let pbz = null;
-    for (let zj = zi2; zj < Math.min(zi2+5, zones.length); zj++) {
-      const cz = zones[zj];
-      const isC = cz.dir === 'range' || (iu && cz.dir === 'down') || (!iu && cz.dir === 'up');
-      if (isC && cz.bars >= 3) { pbz = cz; break; }
-    }
-    if (!pbz) continue;
-
-    const pbs = pbz.start, pbe = pbz.end, pbb = pbz.bars;
-    if (pbe + 1 >= n) continue;
-    if (candles[pbe].t.slice(11, 16) >= '14:30') continue;
-
-    const pbExtreme = iu
-      ? Math.min(...candles.slice(pbs, pbe+1).map(b => b.l))
-      : Math.max(...candles.slice(pbs, pbe+1).map(b => b.h));
-    const retracePct = pushMove > 0 ? Math.abs(pushExtreme - pbExtreme) / pushMove : 0;
-    if (retracePct > 0.80) continue;
-
-    const p2 = retracePct>=0.30&&retracePct<=0.50 ? 20
-              : retracePct<=0.70 ? 12
-              : retracePct<0.30 ? 8
-              : retracePct<=0.80 ? 4 : 0;
-
-    const pbAvgVol = candles.slice(pbs, pbe+1).reduce((s, b) => s + b.v, 0) / pbb;
-    const rat = pbAvgVol / (pushVol || 1);
-    const p3 = rat < 0.40 ? 18 : rat < 0.55 ? 12 : rat < 0.70 ? 6 : 0;
-
-    let ov = 0, oc = 0;
-    for (let ti = pbs+1; ti <= pbe; ti++) {
-      const pv2 = candles[ti-1], cv = candles[ti], pr = pv2.h - pv2.l;
-      if (pr <= 0) continue;
-      ov += Math.max(0, Math.min(cv.h, pv2.h) - Math.max(cv.l, pv2.l)) / pr; oc++;
-    }
-    const ao = oc > 0 ? ov / oc : 0;
-    let p4 = ao >= 0.65 ? 7 : ao >= 0.50 ? 4 : 2;
-    if (candles.slice(pbs, pbe+1).every(b => iu ? b.c > (pbExtreme - atrV*0.5) : b.c < (pbExtreme + atrV*0.5)))
-      p4 = Math.min(p4 + 1, 8);
-
-    let p5 = 10;
-    const psp = candles[ps].c;
-    if (candles.slice(pbs, pbe+1).some(b => iu ? b.c < psp : b.c > psp)) p5 = 0;
-    allSR.forEach(lv => {
-      if ((lv.priorDayTouches || 0) < 1) return;
-      const lb = candles.slice(Math.max(0, ps-20), ps+1).some(b => iu ? b.c > lv.level : b.c < lv.level);
-      if (!lb) return;
-      if (candles.slice(pbs, pbe+1).some(b =>
-        Math.abs(b.l - lv.level) < atrV*0.5 || Math.abs(b.h - lv.level) < atrV*0.5))
-        p5 = Math.min(p5 + 3, 10);
-    });
-
-    const cm   = mcm(me, pbs, iu);
-    const dire = iu ? 'bull' : 'bear';
-    const pbc  = gpbc(dire, pbs, cm);
-    const p6   = pbc === 2 ? 10 : pbc === 1 ? 5 : pbc === 3 ? 3 : 0;
-
-    let p7 = 0, rbi = -1;
-    for (let ri = pbe+1; ri <= Math.min(pbe+5, n-2); ri++) {
-      const rb = candles[ri];
-      if (!((iu && rb.c > rb.o) || (!iu && rb.c < rb.o))) continue;
-      rbi = ri;
-      const rr = rb.h - rb.l || 0.001, rbb = Math.abs(rb.c - rb.o);
-      const rcp = iu ? (rb.c - rb.l) / rr : (rb.h - rb.c) / rr;
-      const rvr = rb.v / (avgVolPre || rb.v);
-      if (rbb/rr > 0.60) p7 += 5; else if (rbb/rr > 0.40) p7 += 2;
-      if (rcp > 0.70) p7 += 3;
-      if (rvr >= 1.0) p7 += 4;
-      if ((iu && rb.h > pbExtreme + atrV*0.1) || (!iu && rb.l < pbExtreme - atrV*0.1)) p7 += 3;
-      p7 = Math.min(p7, 15); break;
-    }
-    if (rbi === -1 || candles[rbi].t.slice(11, 16) >= '14:30') continue;
-    // FIX 1: Resumption bar must be from TODAY (candle array has 3 days of history)
-    if (candles[rbi].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
-    // NOTE: Fix 3 (40-min expiry) is applied in Tier 2 only, NOT here
-    // Tier 1 finds all valid today signals; Tier 2 filters by recency
-
-    lastPB[dire] = { bar: pbe, count: pbc };
-    const score = p1 + p2 + p3 + p4 + p5 + p6 + p7;
-    if (score < minScore || retracePct > 0.80 || pbc !== 2) continue;
-
-    const ep  = candles[rbi].c;
-    const stop   = iu ? pbExtreme - atrV*0.5 : pbExtreme + atrV*0.5;
-    // Target: 0.5% price floor prevents tiny targets on high-priced stocks
-    const targetMove = Math.max(atrV * 1.5, ep * 0.005);
-    const target = iu ? ep + targetMove : ep - targetMove;
-    const stopDist = Math.abs(ep - stop);
-
-    signals.push({
-      type: 'H2', dir: dire, score,
-      p1, p2, p3, p4, p5, p6, p7,
-      resumptionBar: rbi,
-      entryTime: candles[rbi].t,
-      entryPrice: +ep.toFixed(2),
-      stopPrice:  +stop.toFixed(2),
-      targetPrice: +target.toFixed(2),
-      stopDist:   +stopDist.toFixed(2),
-      atr: +atrV.toFixed(2),
-      pushExtreme: +pushExtreme.toFixed(2),
-      retracePct:  +retracePct.toFixed(3),
-    });
-  }
-  return signals;
-}
-
-// ─── BREAKOUT SCORE (for RT detection) ───────────────────────────────────────
-function computeBreakoutScore(candles, i, sr, atr) {
-  const n = candles.length;
-  if (i < 6 || i >= n-1) return null; // Fixed: was n-3
-  const bar = candles[i];
-  const isBull = bar.c > bar.o, isBear = bar.c < bar.o;
-  if (!isBull && !isBear) return null;
-  const body = Math.abs(bar.c - bar.o), br = bar.h - bar.l || 1, brat = body / br;
-
-  // F1
-  const sim = [];
-  for (let j = Math.max(0, i-25); j < i; j++)
-    if ((isBull && candles[j].c > candles[j].o) || (isBear && candles[j].c < candles[j].o))
-      sim.push(Math.abs(candles[j].c - candles[j].o));
-  const ab = sim.length ? sim.slice(-10).reduce((s,v) => s+v, 0) / Math.min(sim.length, 10) : body;
-  const f1 = Math.round(Math.min(brat*0.4 + Math.min((body/(ab||body))/2.5, 0.6), 1) * 10);
-
-  // F2
-  const p4c = candles.slice(Math.max(0,i-4), i), p10c = candles.slice(Math.max(0,i-10), i);
-  const b4  = isBull ? Math.max(...p4c.map(x=>x.h),0) : Math.min(...p4c.map(x=>x.l), 99999);
-  const b10 = isBull ? Math.max(...p10c.map(x=>x.h),0) : Math.min(...p10c.map(x=>x.l), 99999);
-  const f2  = (isBull?bar.h>b10:bar.l<b10) ? 6 : (isBull?bar.h>b4:bar.l<b4) ? 4 : 0;
-
-  // F3 — S/R break quality
-  let f3 = 0;
-  const prevC = candles[i-1].c;
-  const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
-  let src = 0;
-  allSR.forEach(lv => {
-    const cr = isBull ? (prevC < lv.level && bar.c > lv.level) : (prevC > lv.level && bar.c < lv.level);
-    if (!cr) return;
-    const prior = lv.priorDayTouches || 0;
-    const cap   = prior >= 3 ? 12 : prior >= 2 ? 9 : prior >= 1 ? 6 : 3;
-    const cl    = Math.min(Math.abs(bar.c - lv.level) / atr, 1);
-    src = Math.max(src, Math.min((lv.score || 0.3)*9 + cl*3, cap));
-  });
-  f3 += Math.round(src);
-  f3 = Math.min(f3, 14);
-
-  // F4 15-min slope
-  let f4 = 0;
-  const m15 = [];
-  for (let j = 3; j <= i; j += 3) {
-    const sl = candles.slice(j-3, j);
-    if (sl.length < 3) break;
-    m15.push(sl[sl.length-1].c);
-  }
-  if (m15.length >= 3) {
-    const lb = Math.min(m15.length, 12);
-    const sn = (m15[m15.length-1] - m15[m15.length-1-lb+1]) / lb / (atr * 3);
-    const al = isBull ? sn : -sn;
-    f4 = al>0.15?12:al>0.08?9:al>0.03?6:al>=-0.06?4:al>=-0.08?3:0;
-  } else if (i >= 12) {
-    const lb = Math.min(36, i);
-    const sn = (candles[i-1].c - candles[i-lb].c) / lb / atr;
-    const al = isBull ? sn : -sn;
-    f4 = al>0.15?12:al>0.08?9:al>0.03?6:al>=-0.06?4:al>=-0.08?3:0;
-  }
-
-  // F5 volume
-  const rv = candles.slice(Math.max(0,i-20), i);
-  const av = rv.length ? rv.reduce((s,c) => s+c.v, 0) / rv.length : bar.v;
-  const f5 = Math.round(Math.min(Math.max(bar.v/(av||bar.v)-0.5, 0)/1.5, 1) * 18);
-
-  // F6 candle quality
-  let f6 = 0;
-  if (brat > 0.70) f6 += 5; else if (brat > 0.55) f6 += 3;
-  const cp = isBull ? (bar.c - bar.l)/br : (bar.h - bar.c)/br;
-  if (cp > 0.75) f6 += 3; else if (cp > 0.55) f6 += 1;
-  f6 = Math.min(f6, 8);
-
-  // F7 tension
-  let f7 = 0;
-  const tb = candles.slice(Math.max(0,i-8), i);
-  if (tb.length >= 4) {
-    let to = 0, oc = 0;
-    for (let ti = 1; ti < tb.length; ti++) {
-      const pv = tb[ti-1], cv = tb[ti], pr = pv.h - pv.l;
-      if (pr <= 0) continue;
-      to += Math.max(0, Math.min(cv.h,pv.h) - Math.max(cv.l,pv.l)) / pr; oc++;
-    }
-    f7 += Math.round(Math.min((oc>0?to/oc:0)/0.9, 1) * 7);
-    const bH = Math.max(...tb.map(b=>b.h)), bL = Math.min(...tb.map(b=>b.l));
-    if (isBull && bar.c > bH*0.998) f7 += 3;
-    else if (!isBull && bar.c < bL*1.002) f7 += 3;
-    else if (isBull && bar.h > bH) f7 += 1;
-    else if (!isBull && bar.l < bL) f7 += 1;
-  }
-  f7 = Math.min(f7, 10);
-
-  return {
-    score: Math.min(f1+f2+f3+f4+f5+f6+f7, 100),
-    isBull, f1, f2, f3, f4, f5, f6, f7,
-  };
-}
-
-// ─── RT RETEST SCORING ────────────────────────────────────────────────────────
+// findH2Signals, computeBreakoutScore — removed (replaced by Tier2Monitor)
 function computeRSI(candles, idx, period=14){
   if(idx < period+1) return null;
   const slice = candles.slice(Math.max(0,idx-period*2), idx+1);
@@ -893,95 +597,7 @@ function computeRSI(candles, idx, period=14){
   return Math.round(100 - 100/(1+ag/al));
 }
 
-function findRTSignals(candles, sr, atr, minScore = 60, minF3 = 14) {
-  const n = candles.length;
-  const allSR = [...(sr.supports||[]), ...(sr.resistances||[])];
-  const signals = [];
-
-  for (let i = 6; i < n - 1; i++) { // Fixed: was n-3, now n-1
-    const tStr = candles[i].t.slice(11, 16);
-    if (tStr >= '14:00') continue;  // Block 14:xx entries
-    // FIX 1b: Signal bar must be from TODAY
-    if (candles[i].t.slice(0, 10) !== candles[n-1].t.slice(0, 10)) continue;
-    // NOTE: Fix 3b (40-min expiry) applied in Tier 2 only
-
-    const bs = computeBreakoutScore(candles, i, sr, atr);
-    if (!bs || bs.score < minScore || (bs.f3 || 0) < minF3) continue;
-    if (i + 2 >= n) continue;
-
-    const isBull = bs.isBull;
-    const n1 = candles[i+1];
-
-    // Path 1 gate: if BOTH N+1 and N+2 confirm with volume → Path 1, skip RT
-    if (i+2 < n) {
-      const b1 = candles[i+1], b2 = candles[i+2], sv = candles[i].v;
-      const ft1 = isBull ? b1.c > b1.o : b1.c < b1.o;
-      const ft2 = isBull ? b2.c > b2.o : b2.c < b2.o;
-      if (ft1 && ft2 && b1.v >= sv*0.55 && b2.v >= sv*0.55) continue;
-    }
-
-    // N+1 must be wrong direction
-    if (isBull ? n1.c >= n1.o : n1.c <= n1.o) continue;
-
-    // Find broken S/R level
-    let broken = null;
-    allSR.forEach(lv => {
-      if ((lv.priorDayTouches || 0) < 1) return;
-      const prev = candles[i-1];
-      const cr = isBull
-        ? (candles[i].c > lv.level && prev.c < lv.level)
-        : (candles[i].c < lv.level && prev.c > lv.level);
-      if (!cr) return;
-      if (!broken || Math.abs(lv.level - candles[i].c) < Math.abs(broken.level - candles[i].c))
-        broken = lv;
-    });
-    if (!broken) continue;
-
-    const srLevel = broken.level;
-    const n1Held  = isBull ? n1.c > srLevel - atr*0.1 : n1.c < srLevel + atr*0.1;
-    if (!n1Held) continue;
-
-    const entry  = n1.c;
-    const stop   = isBull ? srLevel - atr*0.5 : srLevel + atr*0.5;
-    const target = isBull ? entry + atr*1.5 : entry - atr*1.5;
-    const stopDist = Math.abs(entry - stop);
-
-    // Stop floor filter — skip if stop < 0.5×ATR from entry
-    if (stopDist < atr * 0.5) continue;
-
-    const prior = broken.priorDayTouches || 0;
-    const tier  = prior >= 3 ? 'T1' : prior >= 2 ? 'T2' : 'T3';
-    if (tier === 'T3') continue;
-
-    // RSI filter: validated Oct-Dec 2025 — 59% WR for bull RSI 50-75
-    // Block overbought bull RT (>75) and oversold bear RT (<25)
-    const rsiVal = computeRSI(candles, i);
-    if(rsiVal !== null){
-      if(isBull && rsiVal > 75) continue;   // overbought — exhaustion risk
-      if(!isBull && rsiVal < 25) continue;  // oversold — exhaustion risk
-    }
-
-    signals.push({
-      type: 'RT', dir: isBull ? 'bull' : 'bear',
-      score: bs.score, f3: bs.f3, rsi: rsiVal, f4: bs.f4, f5: bs.f5,
-      signalBar: i, entryBar: i+1,
-      entryTime: n1.t,
-      entryPrice: +entry.toFixed(2),
-      stopPrice:  +stop.toFixed(2),
-      targetPrice: +target.toFixed(2),
-      stopDist:   +stopDist.toFixed(2),
-      srLevel:    +srLevel.toFixed(2),
-      tier, atr: +atr.toFixed(2),
-    });
-    i += 1; // Skip next bar to avoid duplicate signals
-  }
-  return signals;
-}
-
-// ─── TIER 1 PRE-FILTER ────────────────────────────────────────────────────────
-// Runs every 20 minutes during market hours
-// Identifies H2 candidates and RT candidates separately
-
+// findRTSignals removed
 function isMarketHours() {
   const now = new Date();
   const day = now.getDay(); // 0=Sun, 6=Sat
@@ -993,356 +609,1220 @@ function isMarketHours() {
   const hm    = ist.getHours() * 100 + ist.getMinutes();
   return hm >= 915 && hm <= 1430;
 }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function runTier1() {
-  if (CACHE.tier1Running) return;
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW ENGINE v7 — Port of Python tier2_engine + streaming_push_detector
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── CONSTANTS (from tier2_engine.py) ────────────────────────────────────────
+const ENG = {
+  MIN_SLOPE_PCT: 0.30, MIN_ATR_MULT: 2.0, MIN_BARS: 3,
+  RETRACE_CANCEL: 0.80, RETRACE_MIN: 0.20, RETRACE_FLAG: 0.30,
+  RETRACE_H1_HIGH: 0.40, RETRACE_H1_DEEP: 0.60,
+  MAX_BARS: 12, EARLY_DUMP_BARS: 5,
+  STOP_BUFFER: 1.0, TARGET_PCT: 0.50,
+  DOJI_BODY: 0.30, EXHAUSTION_BARS: 3,
+  RSI_PERIOD: 9, RSI_BULL: 60, RSI_BEAR: 40,
+  RT_TOUCH_TOL: 0.75,
+  EXHAUSTION_RANGE_MULT: 1.5, EXHAUSTION_CLOSE_PCT: 0.40,
+  STOP_VALIDATION_LOOKBACK: 5, STOP_VALIDATION_TOL: 0.30,
+  PUSH_EXPIRY_BARS: 2,
+};
+
+// ── RULE FLAGS (all 5 locked + Fix 1 locked) ──────────────────────────────
+const RULE = {
+  H2_ENDS_MONITOR: true,
+  H1_CONFIRMATION: false,
+  EXHAUSTION_FILTER: true,
+  TARGET_VS_RESIST: true,
+  STOP_VALIDATION: true,
+  BROKEN_BY_CLOSE: true,   // Fix 1
+};
+
+// ── ZONE DETECTION (port of pattern_detector_zones.py compute_zones_pd) ───
+function computeZonesPD(candles, minRun=3, dropThr=0.0005, riseThr=0.0005, minZoneBars=3, sharpMove=0.0025) {
+  const n = candles.length;
+  if (n < 2) return [];
+  const barMove = new Array(n).fill('flat');
+  if (candles[0].c > candles[0].o) barMove[0] = 'up';
+  else if (candles[0].c < candles[0].o) barMove[0] = 'down';
+  for (let i = 1; i < n; i++) {
+    const change = (candles[i].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
+    if (change > 0.005) barMove[i] = 'up';
+    else if (change < -0.005) barMove[i] = 'down';
+    else {
+      if (candles[i].c < candles[i].o) barMove[i] = 'down';
+      else if (candles[i].c > candles[i].o) barMove[i] = 'up';
+    }
+  }
+  const barDir = new Array(n).fill('range');
+  const sharpBars = new Set();
+  let i = 1;
+  while (i < n) {
+    const runDir = barMove[i];
+    if (runDir === 'flat') { i++; continue; }
+    let runEnd = i, interruptions = 0;
+    for (let j = i+1; j < n; j++) {
+      if (barMove[j] === runDir) { runEnd = j; interruptions = 0; }
+      else if (barMove[j] === 'flat' && interruptions < 1) interruptions++;
+      else break;
+    }
+    let runStart = i;
+    if (i > 0 && barMove[i-1] === runDir && barDir[i-1] === 'range') runStart = i - 1;
+    const runLen = runEnd - runStart + 1;
+    if (runLen >= minRun) {
+      const startPrice = runStart > 0 ? candles[runStart-1].c : candles[0].o;
+      const endPrice = candles[runEnd].c;
+      const totalMove = (endPrice - startPrice) / (startPrice || 1) * 100;
+      const qualifies = (runDir === 'down' && totalMove < -dropThr*100) ||
+                        (runDir === 'up' && totalMove > riseThr*100);
+      if (qualifies) {
+        for (let k = runStart; k <= runEnd; k++) barDir[k] = runDir;
+        i = runEnd + 1; continue;
+      }
+    }
+    i++;
+  }
+  // 2-bar sharp override
+  for (let i = 1; i < n-1; i++) {
+    if (barDir[i] !== 'range' && barDir[i+1] !== 'range') continue;
+    const d1 = barMove[i], d2 = barMove[i+1];
+    if (d1 !== d2 || d1 === 'flat') continue;
+    const totalMove = (candles[i+1].c - candles[i-1].c) / (candles[i-1].c || 1) * 100;
+    const qualifies = (d1 === 'up' && totalMove > sharpMove*100) ||
+                      (d1 === 'down' && totalMove < -sharpMove*100);
+    if (qualifies) { barDir[i] = d1; barDir[i+1] = d1; sharpBars.add(i); sharpBars.add(i+1); }
+  }
+  // Build zones
+  const rawZones = [];
+  let zStart = 0;
+  for (let i = 1; i <= n; i++) {
+    if (i === n || barDir[i] !== barDir[i-1]) {
+      rawZones.push({ start: zStart, end: i-1, dir: barDir[i-1], bars: i-zStart });
+      zStart = i;
+    }
+  }
+  // Merge adjacent same-dir
+  const merged = [];
+  for (const z of rawZones) {
+    if (merged.length && merged[merged.length-1].dir === z.dir) {
+      merged[merged.length-1].end = z.end;
+      merged[merged.length-1].bars += z.bars;
+    } else merged.push({...z});
+  }
+  // Absorb tiny
+  const absorbed = [];
+  for (const z of merged) {
+    let hasSharp = false;
+    for (let k = z.start; k <= z.end; k++) if (sharpBars.has(k)) { hasSharp = true; break; }
+    if (z.bars >= minZoneBars || hasSharp) absorbed.push({...z});
+    else if (absorbed.length) {
+      absorbed[absorbed.length-1].end = z.end;
+      absorbed[absorbed.length-1].bars += z.bars;
+    } else absorbed.push({...z});
+  }
+  // Slope + strength
+  const MID_SLOPE_MIN = 0.15;
+  for (const z of absorbed) {
+    const zBars = candles.slice(z.start, z.end+1);
+    z.slope = zBars.length > 1 ? ((zBars[zBars.length-1].c - zBars[0].o) / (zBars[0].o || 1) * 100) : 0;
+    if (zBars.length > 1) {
+      const midF = (zBars[0].h + zBars[0].l) / 2;
+      const midL = (zBars[zBars.length-1].h + zBars[zBars.length-1].l) / 2;
+      z.slope_mid = (midL - midF) / (midF || 1) * 100;
+    } else z.slope_mid = 0;
+    if (z.dir !== 'range' && Math.abs(z.slope_mid) < MID_SLOPE_MIN) z.dir = 'range';
+    if (z.dir !== 'range') {
+      const thr = z.dir === 'up' ? riseThr : dropThr;
+      const ratio = Math.abs(z.slope) / ((thr*100) || 0.05);
+      z.strength = ratio >= 5 ? 'Strong' : ratio >= 2 ? 'Moderate' : 'Weak';
+    } else {
+      if (zBars.length < 2) z.strength = 'Weak';
+      else {
+        const ranges = zBars.map(b => (b.h-b.l)/(b.l||1)*100);
+        const mean = ranges.reduce((a,b)=>a+b,0)/ranges.length || 1;
+        const variance = ranges.reduce((s,r)=>s+(r-mean)**2,0)/ranges.length;
+        const cv = Math.sqrt(variance) / mean;
+        z.strength = cv < 0.25 ? 'Strong' : cv < 0.50 ? 'Moderate' : 'Weak';
+      }
+    }
+  }
+  // Merge adjacent ranges
+  const final = [];
+  for (const z of absorbed) {
+    if (final.length && final[final.length-1].dir === 'range' && z.dir === 'range') {
+      final[final.length-1].end = z.end;
+      final[final.length-1].bars += z.bars;
+    } else final.push({...z});
+  }
+  return final;
+}
+
+// ── STREAMING PUSH DETECTOR (port of streaming_push_detector.py) ──────────
+// Event-driven push detector. Bar-by-bar process. Emits event when push qualifies.
+class StreamingPushDetector {
+  constructor(atr, minBars = 3) {
+    this.atr = atr;
+    this.minBars = minBars;
+    this.candles = [];                  // all bars fed so far
+    this.pushDir = null;                // 'up' | 'down' | null
+    this.pushStartIdx = -1;
+    this.lastPushIdx = -1;
+    this.counterIndices = [];           // indices forming counter since last push bar
+    this.lastEmittedEnd = -1;           // to avoid duplicate emits
+  }
+
+  _barDir(i) {
+    if (i === 0) {
+      const b = this.candles[0];
+      return b.c > b.o ? 'up' : b.c < b.o ? 'down' : 'flat';
+    }
+    const prev = this.candles[i-1], cur = this.candles[i];
+    const chg = (cur.c - prev.c) / (prev.c || 1) * 100;
+    if (chg > 0.005) return 'up';
+    if (chg < -0.005) return 'down';
+    if (cur.c < cur.o) return 'down';
+    if (cur.c > cur.o) return 'up';
+    return 'flat';
+  }
+
+  processBar(bar) {
+    this.candles.push(bar);
+    const i = this.candles.length - 1;
+    const dir = this._barDir(i);
+
+    // Initialize push on first directional bar
+    if (this.pushDir === null) {
+      if (dir === 'up' || dir === 'down') {
+        this.pushDir = dir;
+        this.pushStartIdx = i;
+        this.lastPushIdx = i;
+        this.counterIndices = [];
+      }
+      return null;
+    }
+
+    // Push continues
+    if (dir === this.pushDir) {
+      this.lastPushIdx = i;
+      this.counterIndices = [];
+      return null;
+    }
+
+    // Counter or flat
+    this.counterIndices.push(i);
+
+    // After 2+ counter bars, the push has ended — emit event
+    // Trigger condition: push has >= minBars and we now have >= 2 counter bars
+    const pushBars = this.lastPushIdx - this.pushStartIdx + 1;
+    if (this.counterIndices.length >= 2 && pushBars >= this.minBars && this.lastPushIdx > this.lastEmittedEnd) {
+      const event = {
+        dir: this.pushDir,
+        is_up: this.pushDir === 'up',
+        start_idx: this.pushStartIdx,
+        end_idx: this.lastPushIdx,
+        counter_indices: [...this.counterIndices],
+        bars: pushBars,
+      };
+      this.lastEmittedEnd = this.lastPushIdx;
+      // Check if counter has become a new push in opposite direction
+      const counterDirCount = this.counterIndices.filter(ci => this._barDir(ci) !== this.pushDir).length;
+      if (counterDirCount >= this.minBars) {
+        // The "counter" was actually a new push opposite direction
+        this.pushDir = this.pushDir === 'up' ? 'down' : 'up';
+        this.pushStartIdx = this.counterIndices[0];
+        this.lastPushIdx = i;
+        this.counterIndices = [];
+      } else {
+        // Reset for new push detection
+        this.pushDir = (dir === 'up' || dir === 'down') ? dir : null;
+        this.pushStartIdx = (dir === 'up' || dir === 'down') ? i : -1;
+        this.lastPushIdx = (dir === 'up' || dir === 'down') ? i : -1;
+        this.counterIndices = [];
+      }
+      return event;
+    }
+
+    return null;
+  }
+}
+
+function eventToQualifyingPush(event, candles, atr, minAtrMult, minSlopePct, minBars) {
+  // Legacy stub - kept for backwards compat
+  const pushBars = candles.slice(event.start_idx, event.end_idx + 1);
+  if (pushBars.length < minBars) return null;
+  const isUp = event.is_up;
+  const swingHigh = Math.max(...pushBars.map(b => b.h));
+  const swingLow = Math.min(...pushBars.map(b => b.l));
+  const extreme = isUp ? swingHigh : swingLow;
+  const startOpen = pushBars[0].o;
+  const endClose = pushBars[pushBars.length-1].c;
+  const netMove = swingHigh - swingLow;
+  if (netMove < atr * minAtrMult) return null;
+  // slope_mid is TOTAL slope across zone, not per-bar
+  const midF = (pushBars[0].h + pushBars[0].l) / 2;
+  const midL = (pushBars[pushBars.length-1].h + pushBars[pushBars.length-1].l) / 2;
+  const slopeMid = (midL - midF) / (midF || 1) * 100;  // TOTAL %, not per bar
+  if (Math.abs(slopeMid) < minSlopePct) return null;
+  const highestClose = Math.max(...pushBars.map(b => b.c));
+  const lowestClose = Math.min(...pushBars.map(b => b.c));
+  return {
+    dir: event.dir, is_up: isUp,
+    start_idx: event.start_idx, end_idx: event.end_idx,
+    bars: pushBars.length,
+    start_time: pushBars[0].t, end_time: pushBars[pushBars.length-1].t,
+    start_price: +startOpen.toFixed(2),
+    end_price: +endClose.toFixed(2),
+    extreme: +extreme.toFixed(2),
+    highest_close: +highestClose.toFixed(2),
+    lowest_close: +lowestClose.toFixed(2),
+    swing_high: +swingHigh.toFixed(2),
+    swing_low: +swingLow.toFixed(2),
+    push_range: +netMove.toFixed(2),
+    net_move: +netMove.toFixed(2),       // industry-standard: extremes
+    move: +netMove.toFixed(2),
+    slope_mid: +slopeMid.toFixed(3),
+    atr: +atr.toFixed(2),
+    push_id: `${event.dir}_${pushBars[0].t.slice(11,16)}_${Math.round(extreme*10)/10}`,
+    counter_indices: event.counter_indices,
+  };
+}
+
+// ── ZONE-BASED PUSH FINDER (port of Python find_qualifying_push) ────────
+// This is what Python actually uses — zone-based, requires Strong strength
+function findQualifyingPush(todayBars, atr) {
+  if (todayBars.length < 6) return null;
+  const zones = computeZonesPD(todayBars);
+  const n = todayBars.length;
+  const qualifying = [];
+  for (const z of zones) {
+    if (z.dir !== 'up' && z.dir !== 'down') continue;
+    if (z.bars < ENG.MIN_BARS) continue;
+    if (z.strength !== 'Strong') continue;
+    if ((n - 1 - z.end) < 2) continue;   // need at least 2 counter bars after push
+    const ts = todayBars[z.start].t.slice(11, 16);
+    const te = todayBars[z.end].t.slice(11, 16);
+    const net = Math.abs(todayBars[z.end].c - todayBars[z.start].o);
+    const mid = Math.abs(z.slope_mid || 0);
+    if (mid < ENG.MIN_SLOPE_PCT || net < atr * ENG.MIN_ATR_MULT) continue;
+    const isUp = z.dir === 'up';
+    const pb = todayBars.slice(z.start, z.end+1);
+    const swingHigh = Math.max(...pb.map(b => b.h));
+    const swingLow = Math.min(...pb.map(b => b.l));
+    const extreme = isUp ? swingHigh : swingLow;
+    const highestClose = Math.max(...pb.map(b => b.c));
+    const lowestClose = Math.min(...pb.map(b => b.c));
+    const pushRange = swingHigh - swingLow;
+    qualifying.push({
+      dir: z.dir, is_up: isUp,
+      start_idx: z.start, end_idx: z.end,
+      bars: z.bars, start_time: ts, end_time: te,
+      start_price: todayBars[z.start].o,
+      end_price: todayBars[z.end].c,
+      extreme: +extreme.toFixed(2),
+      highest_close: +highestClose.toFixed(2),
+      lowest_close: +lowestClose.toFixed(2),
+      swing_high: +swingHigh.toFixed(2),
+      swing_low: +swingLow.toFixed(2),
+      push_range: +pushRange.toFixed(2),
+      net_move: +pushRange.toFixed(2),
+      move: +pushRange.toFixed(2),
+      slope_mid: +mid.toFixed(3),
+      atr: +atr.toFixed(2),
+      push_id: `${z.dir}_${ts}_${Math.round(extreme*10)/10}`,
+    });
+  }
+  return qualifying.length ? qualifying[qualifying.length - 1] : null;   // most recent
+}
+
+// ── RSI (port of compute_rsi) ──────────────────────────────────────────────
+function computeRSIEngine(candles, period = ENG.RSI_PERIOD) {
+  if (candles.length < period + 1) return 50.0;
+  const closes = candles.slice(-(period+1)).map(c => c.c);
+  let gains = 0, losses = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i-1];
+    if (diff > 0) gains += diff;
+    else losses += -diff;
+  }
+  const avgG = gains / period, avgL = losses / period;
+  if (avgL === 0) return 100;
+  const rs = avgG / avgL;
+  return 100 - (100 / (1 + rs));
+}
+
+// ── RT TOUCH CHECK (port of check_rt_touch) ──────────────────────────────
+function checkRTTouch(bar, push, brokenSR, atr) {
+  for (const level of brokenSR) {
+    const lv = level.level;
+    let dist, held;
+    if (push.is_up) {
+      dist = Math.abs(bar.l - lv);
+      held = bar.c > lv - atr * 0.3;
+    } else {
+      dist = Math.abs(bar.h - lv);
+      held = bar.c < lv + atr * 0.3;
+    }
+    if (dist <= atr * ENG.RT_TOUCH_TOL && held) return level;
+  }
+  return null;
+}
+
+// ── COUNTER SWING VETO (port of check_counter_push) ─────────────────────
+function checkCounterSwingVeto(push, bar, atr, dayBarsSoFar) {
+  // Returns null = vetoed, non-null = ok to fire counter (we return signal-like obj)
+  // Actually mirrors backtest.py: returns truthy if counter trade should fire
+  // Here we just validate the swing-extreme check
+  const counterIsUp = !push.is_up;   // counter to a down push = UP counter
+  const entry = bar.c;
+  const vetoTol = atr * 0.5;
+  const swings = [];
+  if (dayBarsSoFar.length < 7) return true;  // not enough bars to detect swings
+  if (counterIsUp) {
+    // UP counter: check against swing HIGHS
+    for (let j = 3; j < dayBarsSoFar.length - 3; j++) {
+      const thisH = dayBarsSoFar[j].h;
+      const leftMax = Math.max(...dayBarsSoFar.slice(j-3, j).map(b => b.h));
+      const rightMax = Math.max(...dayBarsSoFar.slice(j+1, j+4).map(b => b.h));
+      if (thisH > leftMax && thisH > rightMax) swings.push(thisH);
+    }
+    for (const swingH of swings) {
+      if (swingH - entry > 0 && swingH - entry < vetoTol) return false;  // VETO
+    }
+  } else {
+    // DOWN counter: check against swing LOWS
+    for (let j = 3; j < dayBarsSoFar.length - 3; j++) {
+      const thisL = dayBarsSoFar[j].l;
+      const leftMin = Math.min(...dayBarsSoFar.slice(j-3, j).map(b => b.l));
+      const rightMin = Math.min(...dayBarsSoFar.slice(j+1, j+4).map(b => b.l));
+      if (thisL < leftMin && thisL < rightMin) swings.push(thisL);
+    }
+    for (const swingL of swings) {
+      if (entry - swingL > 0 && entry - swingL < vetoTol) return false;
+    }
+  }
+  return true;
+}
+
+// ── BODY % HELPER ───────────────────────────────────────────────────────
+function bodyPct(bar) {
+  const br = bar.h - bar.l;
+  if (br <= 0) return 0;
+  return Math.abs(bar.c - bar.o) / br;
+}
+
+// ── SIGNAL SCORING (full port of tier2_engine.py score_signal) ───────────
+function scoreSignal(push, h1Retrace, h1Bars, signalBar, srLevels, ema, contextScore, atr, sigType, rsi) {
+  const score = {};
+  // Push quality
+  const slope = push.slope_mid || 0;
+  const netAtr = (push.net_move || push.move) / (push.atr || atr || 1);
+  let pq;
+  if (slope >= 1.0 && netAtr >= 6) pq = 20;
+  else if (slope >= 0.75 && netAtr >= 5) pq = 17;
+  else if (slope >= 0.60 && netAtr >= 4) pq = 14;
+  else if (slope >= 0.50 && netAtr >= 3) pq = 10;
+  else pq = 5;
+  score.push_quality = pq;
+
+  // Retrace quality
+  let rq;
+  if (sigType === 'RT' || sigType === 'RT+H1') rq = 18;
+  else if (h1Retrace <= 0.30) rq = 20;
+  else if (h1Retrace <= 0.40) rq = 18;
+  else if (h1Retrace <= 0.60) rq = 10;
+  else rq = 5;
+  score.retrace_quality = rq;
+
+  // EMA alignment
+  let eq;
+  if (ema == null) eq = 5;
+  else if (push.is_up && signalBar.c > ema) eq = 10;
+  else if (!push.is_up && signalBar.c < ema) eq = 10;
+  else if (push.is_up && signalBar.c < ema - atr * 0.5) eq = 0;
+  else if (!push.is_up && signalBar.c > ema + atr * 0.5) eq = 0;
+  else eq = 5;
+  score.ema_alignment = eq;
+
+  // S/R confluence
+  let srScore = 0;
+  for (const lv of srLevels) {
+    const dist = Math.abs(lv.level - signalBar.c);
+    if (dist <= atr * 1.0 && lv.tier === 'T1') srScore = Math.max(srScore, 15);
+    else if (dist <= atr * 1.5 && (lv.tier === 'T1' || lv.tier === 'T2')) srScore = Math.max(srScore, 8);
+  }
+  // Obstacle penalty
+  const targetMove = (push.net_move || push.move) * ENG.TARGET_PCT;
+  let obstacles;
+  if (push.is_up) {
+    obstacles = srLevels.filter(l => signalBar.c < l.level && l.level < signalBar.c + targetMove && l.tier === 'T1');
+  } else {
+    obstacles = srLevels.filter(l => signalBar.c - targetMove < l.level && l.level < signalBar.c && l.tier === 'T1');
+  }
+  if (obstacles.length >= 3) srScore -= 10;
+  score.sr_confluence = srScore;
+
+  // Bar strength
+  const bp = bodyPct(signalBar);
+  const br = signalBar.h - signalBar.l || 0.001;
+  const closePos = push.is_up ? (signalBar.c - signalBar.l) / br : (signalBar.h - signalBar.c) / br;
+  let bs;
+  if (bp >= 0.70 && closePos >= 0.70) bs = 15;
+  else if (bp >= 0.50 && closePos >= 0.60) bs = 11;
+  else if (bp >= 0.35) bs = 7;
+  else bs = 3;
+  score.bar_strength = bs;
+
+  // RSI
+  let rs;
+  if (push.is_up) {
+    if (rsi > ENG.RSI_BULL) rs = 5;
+    else if (rsi < ENG.RSI_BEAR) rs = -5;
+    else rs = 0;
+  } else {
+    if (rsi < ENG.RSI_BEAR) rs = 5;
+    else if (rsi > ENG.RSI_BULL) rs = -5;
+    else rs = 0;
+  }
+  score.rsi = rs;
+
+  // Context
+  const cm = Math.max(-10, Math.min(10, Math.floor(contextScore / 5) * 5));
+  score.context = cm;
+
+  const total = Object.values(score).reduce((a, b) => a + b, 0);
+  return [total, score];
+}
+
+// ── TIER 2 MONITOR (port of Tier2Monitor) ────────────────────────────────
+class Tier2Monitor {
+  constructor(push, srLevels, brokenSR, contextScore, dayOpen, dayBarsSoFar) {
+    this.push = push;
+    this.sr_levels = srLevels;
+    this.broken_sr = brokenSR;
+    this.context_score = contextScore;
+    this.day_open = dayOpen;
+    this.day_bars_so_far = dayBarsSoFar || [];   // grows as monitor processes bars
+    this.state = 'WAITING';
+    this.elapsed_candles = [];
+    this.bar_count = 0;
+    this.h1_retrace = null;
+    this.h1_bars = 0;
+    this.h1_locked = false;
+    this.h2_attempted = false;
+    this.exhaustion_skip = false;
+    this.atr = null;   // set on first bar
+  }
+
+  processBar(bar, atr, ema, rsi) {
+    this.atr = atr;
+    this.elapsed_candles.push(bar);
+    this.day_bars_so_far.push(bar);
+    this.bar_count++;
+
+    // Exhaustion filter (Rule 3): check on push-end bar (bar_count == 1)
+    if (RULE.EXHAUSTION_FILTER && this.bar_count === 1) {
+      const barRange = bar.h - bar.l;
+      if (barRange > atr * ENG.EXHAUSTION_RANGE_MULT) {
+        let pctInRange;
+        if (this.push.is_up) {
+          pctInRange = (bar.c - bar.l) / (barRange || 1);
+          if (pctInRange <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
+        } else {
+          pctInRange = (bar.h - bar.c) / (barRange || 1);
+          if (pctInRange <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
+        }
+      }
+    }
+
+    // Check max bars timeout
+    if (this.bar_count > ENG.MAX_BARS) return { action: 'DUMP', reason: 'max_bars' };
+
+    // Compute current retrace from push extreme
+    let curPrice = bar.c;
+    let retrace;
+    if (this.push.is_up) {
+      retrace = (this.push.extreme - curPrice) / (this.push.move || 1);
+    } else {
+      retrace = (curPrice - this.push.extreme) / (this.push.move || 1);
+    }
+
+    // Hard cancel if retrace > 80%
+    if (retrace > ENG.RETRACE_CANCEL) {
+      return { action: 'CANCEL', reason: 'retrace_exceeded', retrace, bar };
+    }
+
+    // Need at least 2 bars of counter for H1 to form
+    if (this.bar_count < 2) {
+      return { action: 'WAITING', reason: 'building_h1' };
+    }
+
+    // Check if bar is in push direction (resumption)
+    const isResumption = (this.push.is_up && bar.c > bar.o) || (!this.push.is_up && bar.c < bar.o);
+    if (!isResumption) {
+      return { action: 'WAITING', reason: 'counter_continuing' };
+    }
+
+    // Resumption detected. Compute h1_retrace (max retrace among counter bars BEFORE this one)
+    const counterBars = this.elapsed_candles.slice(0, -1);
+    if (this.push.is_up) {
+      const minLow = Math.min(...counterBars.map(b => b.l));
+      this.h1_retrace = (this.push.extreme - minLow) / (this.push.move || 1);
+    } else {
+      const maxHigh = Math.max(...counterBars.map(b => b.h));
+      this.h1_retrace = (maxHigh - this.push.extreme) / (this.push.move || 1);
+    }
+    this.h1_bars = counterBars.length;
+
+    const br = bar.h - bar.l || 0.001;
+    const bp = Math.abs(bar.c - bar.o) / br;
+
+    // ── H1 SIGNAL FIRING LOGIC ──────────────────────────────────────────
+    let signalData = null;
+
+    if (this.h1_retrace > ENG.RETRACE_H1_DEEP) {
+      // > 60%: need S/R held
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
+      if (rt) {
+        const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, 'RT+H1', rsi);
+        if (score >= 50) signalData = { score, bd, sigType: 'RT+H1', rt };
+      }
+      if (!signalData) return { action: 'WAITING', reason: 'deep_retrace_no_sr' };
+    } else if (this.h1_retrace > ENG.RETRACE_H1_HIGH) {
+      // 40-60%: need EMA + body
+      const needsEma = ema && ((this.push.is_up && bar.c > ema) || (!this.push.is_up && bar.c < ema));
+      const needsBody = bp >= 0.50;
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
+      if (needsEma && needsBody) {
+        const sigType = rt ? 'RT+H1' : 'H1';
+        const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, sigType, rsi);
+        if (score >= 50) signalData = { score, bd, sigType, rt };
+      }
+      if (!signalData) return { action: 'WAITING', reason: 'moderate_retrace_needs_confirm' };
+    } else {
+      // 20-40%: high-conviction
+      const rt = checkRTTouch(bar, this.push, this.broken_sr, atr);
+      const sigType = rt ? 'RT+H1' : 'H1';
+      const [score, bd] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, atr, sigType, rsi);
+      if (score >= 50) signalData = { score, bd, sigType, rt };
+      else return { action: 'WAITING', reason: 'low_score' };
+    }
+
+    // Build the signal
+    const sig = this._buildSignal(signalData.sigType, signalData.score, signalData.bd, signalData.rt, bar, atr);
+    if (!sig) return { action: 'WAITING', reason: 'signal_build_failed' };
+
+    return { action: 'SIGNAL', signal: sig };
+  }
+
+  _buildSignal(sigType, score, bd, rt, bar, atr) {
+    // Entry = bar close
+    const entry = bar.c;
+    const isUp = this.push.is_up;
+
+    // Stop: counter extreme + buffer
+    const counterBars = this.elapsed_candles.slice(0, -1);
+    const stopExtreme = isUp ? Math.min(...counterBars.map(b => b.l)) : Math.max(...counterBars.map(b => b.h));
+    let stop = isUp ? stopExtreme - atr * ENG.STOP_BUFFER : stopExtreme + atr * ENG.STOP_BUFFER;
+
+    // Rule 5: STOP_VALIDATION
+    if (RULE.STOP_VALIDATION) {
+      const lookback = this.elapsed_candles.slice(-ENG.STOP_VALIDATION_LOOKBACK);
+      const tol = atr * ENG.STOP_VALIDATION_TOL;
+      if (isUp) {
+        const nearLows = lookback.filter(b => Math.abs(b.l - stop) < tol || b.l < stop + tol).map(b => b.l);
+        if (nearLows.length >= 2) {
+          const newStop = Math.min(...nearLows) - tol;
+          stop = Math.min(stop, newStop);
+        }
+      } else {
+        const nearHighs = lookback.filter(b => Math.abs(b.h - stop) < tol || b.h > stop - tol).map(b => b.h);
+        if (nearHighs.length >= 2) {
+          const newStop = Math.max(...nearHighs) + tol;
+          stop = Math.max(stop, newStop);
+        }
+      }
+    }
+
+    // Target: entry + TARGET_PCT * push_move
+    let target = isUp ? entry + this.push.move * ENG.TARGET_PCT : entry - this.push.move * ENG.TARGET_PCT;
+
+    // Rule 4: TARGET_VS_RESIST
+    if (RULE.TARGET_VS_RESIST) {
+      let blockingLevel = null;
+      for (const lv of this.sr_levels) {
+        if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+        if (isUp && entry < lv.level && lv.level < target) {
+          if (blockingLevel === null || lv.level < blockingLevel) blockingLevel = lv.level;
+        } else if (!isUp && target < lv.level && lv.level < entry) {
+          if (blockingLevel === null || lv.level > blockingLevel) blockingLevel = lv.level;
+        }
+      }
+      if (blockingLevel !== null) {
+        target = isUp ? blockingLevel - atr * 0.1 : blockingLevel + atr * 0.1;
+      }
+    }
+
+    // R:R filter
+    const risk = Math.abs(entry - stop);
+    const reward = Math.abs(target - entry);
+    if (risk === 0 || reward / risk < 1.0) return null;
+
+    return {
+      type: sigType,
+      dir: this.push.dir,
+      score, breakdown: bd,
+      entry_price: +entry.toFixed(2),
+      stop_price: +stop.toFixed(2),
+      target_price: +target.toFixed(2),
+      stop_dist: +risk.toFixed(2),
+      reward_dist: +reward.toFixed(2),
+      rr: +(reward/risk).toFixed(2),
+      retrace_pct: +this.h1_retrace.toFixed(3),
+      push_id: `${this.push.dir}_${this.push.start_time}_${this.push.extreme}`,
+      bar_time: bar.t,
+      rt_level: rt ? rt.level : null,
+      rt_tier: rt ? rt.tier : null,
+    };
+  }
+}
+
+// ── BROKEN SR HELPER (with Fix 1 + Fix 2 default OFF, only Fix 1 active) ─
+function computeBrokenSR(srLevels, push) {
+  const upTop = RULE.BROKEN_BY_CLOSE ? push.highest_close : push.extreme;
+  const downBtm = RULE.BROKEN_BY_CLOSE ? push.lowest_close : push.extreme;
+  const broken = [];
+  for (const lv of srLevels) {
+    if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+    if (push.is_up && push.start_price < lv.level && lv.level <= upTop) broken.push(lv);
+    else if (!push.is_up && downBtm <= lv.level && lv.level < push.start_price) broken.push(lv);
+  }
+  return broken;
+}
+
+// ── PLAIN-ENGLISH RATIONALE (no Brooks/Volman jargon) ───────────────────
+function buildRationale(sig, push, brokenSR) {
+  const parts = [];
+  const dir = push.is_up ? 'up' : 'down';
+  const pushMoveR = (push.move / sig.stop_dist).toFixed(1);
+  parts.push(`Push direction: ${dir} (${push.bars} bars, ${push.move.toFixed(2)} move, ${pushMoveR}R)`);
+  parts.push(`Pullback retrace: ${(sig.retrace_pct*100).toFixed(0)}% of push`);
+  if (sig.type === 'RT+H1') {
+    parts.push(`Pullback held at ₹${sig.rt_level.toFixed(2)} (${sig.rt_tier} broken-resistance retest)`);
+  }
+  if (sig.breakdown.rsi > 0) {
+    parts.push(`RSI confirms ${push.is_up ? 'bullish' : 'bearish'} momentum`);
+  } else if (sig.breakdown.rsi < 0) {
+    parts.push(`RSI shows weakness against trade direction`);
+  }
+  if (sig.breakdown.ema > 0) parts.push(`Price holding ${push.is_up ? 'above' : 'below'} EMA-20`);
+  parts.push(`Entry ₹${sig.entry_price} → Target ₹${sig.target_price} (R:R ${sig.rr})`);
+  parts.push(`Stop ₹${sig.stop_price} (${(sig.stop_dist/push.move*100).toFixed(0)}% of push size)`);
+  return parts.join(' • ');
+}
+
+// ── TIER 3: LIVE TRADE TRACKER (4 exit rules) ──────────────────────────
+class Tier3Tracker {
+  constructor(alert, fillPrice, fillTime) {
+    this.alert = alert;
+    this.fill_price = fillPrice;
+    this.fill_time = fillTime;
+    this.bars_since_fill = 0;
+    this.mfe = 0;       // max favorable excursion (in R)
+    this.mae = 0;       // max adverse excursion (in R)
+    this.exit_override = false;   // once MFE > 0.7R, never trigger early exit
+    this.outcome = null;
+    this.exit_reason = null;
+    this.exit_price = null;
+    this.exit_time = null;
+  }
+
+  // Per-bar update
+  processBar(bar) {
+    if (this.outcome) return { status: 'closed', ...this.summary() };
+    this.bars_since_fill++;
+    const isUp = this.alert.dir === 'up';
+    const R = Math.abs(this.alert.entry_price - this.alert.stop_price);
+    const moveFromEntry = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
+    const moveR = moveFromEntry / R;
+    if (moveR > this.mfe) this.mfe = moveR;
+    if (moveR < this.mae) this.mae = moveR;
+
+    // Rule 4: don't-exit override
+    if (this.mfe > 0.7) this.exit_override = true;
+
+    // Target hit
+    if (isUp && bar.h >= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
+    if (!isUp && bar.l <= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
+    // Stop hit
+    if (isUp && bar.l <= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
+    if (!isUp && bar.h >= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
+
+    if (!this.exit_override) {
+      // Rule 1: Bar 2 reversal
+      if (this.bars_since_fill === 2 && moveR <= -0.5 && this.mfe > 0) {
+        return this._close('EARLY_EXIT', bar.c, 'bar2_reversal', bar.t);
+      }
+      // Rule 2: Pattern break (S/R level violated)
+      // [Simplified: check against the rt_level if RT+H1]
+      if (this.alert.type === 'RT+H1' && this.alert.rt_level) {
+        const lv = this.alert.rt_level;
+        if (isUp && bar.c < lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
+        if (!isUp && bar.c > lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
+      }
+      // Rule 3: time stagnation (6 bars, MFE never +0.5R, MAE touched -0.5R)
+      if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) {
+        return this._close('EARLY_EXIT', bar.c, 'time_stagnation', bar.t);
+      }
+    }
+
+    return { status: 'open', mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2), bars_since_fill: this.bars_since_fill };
+  }
+
+  _close(outcome, price, reason, time) {
+    this.outcome = outcome;
+    this.exit_price = +price.toFixed(2);
+    this.exit_reason = reason;
+    this.exit_time = time;
+    return { status: 'closed', ...this.summary() };
+  }
+
+  summary() {
+    return {
+      outcome: this.outcome,
+      exit_price: this.exit_price,
+      exit_reason: this.exit_reason,
+      exit_time: this.exit_time,
+      mfe: +this.mfe.toFixed(2),
+      mae: +this.mae.toFixed(2),
+      bars_held: this.bars_since_fill,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END NEW ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORCHESTRATOR v7 — Tier 1 / Tier 2 / Tier 3 cycles
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── ACTIVE STATE ────────────────────────────────────────────────────────────
+const STATE = {
+  watchlist: {},      // sym -> { push, detector_state, monitor, fetched_at }
+  alerts: [],         // open alerts NOT yet taken
+  live_trades: {},    // alert_id -> { alert, fill_price, fill_time, tracker, last_bar_t }
+  history: [],        // closed live trades
+  blocked_pushes: new Set(),  // push_ids that already fired (don't refire same)
+  tier1_running: false,
+  tier1_progress: { scanned: 0, total: 0, status: 'idle' },
+  tier1_at: null,
+  tier2_running: false,
+  tier2_at: null,
+  tier3_at: null,
+};
+
+// ── STOCK UNIVERSE (use NSE_UNIVERSE constant from existing server.js) ──
+// NSE_UNIVERSE is already defined in server.js around line ~200
+
+// ── TIER 1: every 10 min, scan all stocks, find qualifying pushes ──────
+async function runTier1v7() {
+  if (STATE.tier1_running) return;
   if (!isMarketHours()) {
-    console.log(`[${new Date().toISOString()}] Tier1 skipped — outside market hours`);
+    console.log(`[T1v7 ${new Date().toISOString()}] Skipped — outside market hours`);
     return;
   }
-  // Note: screener uses Yahoo Finance for 5-min data — no Kite token needed
-  // Kite is only needed for real-time price quotes (/prices endpoint)
-  // So Tier 1 runs regardless of Kite auth status
-
-  CACHE.tier1Running = true;
-  CACHE.tier1Progress = { scanned: 0, total: NSE_UNIVERSE.length, status: 'running' };
-  console.log(`[${new Date().toISOString()}] Tier1 started — ${NSE_UNIVERSE.length} stocks (pattern pre-filter)`);
-
-  const h2Candidates = [];
-  const rtCandidates = [];
+  STATE.tier1_running = true;
+  STATE.tier1_progress = { scanned: 0, total: NSE_UNIVERSE.length, status: 'running' };
+  console.log(`[T1v7 ${new Date().toISOString()}] Starting scan of ${NSE_UNIVERSE.length} stocks`);
 
   for (let i = 0; i < NSE_UNIVERSE.length; i++) {
     const symbol = NSE_UNIVERSE[i];
-    CACHE.tier1Progress.scanned = i + 1;
+    STATE.tier1_progress.scanned = i + 1;
+
+    // Skip if already on Tier 2 watchlist (monitor active)
+    if (STATE.watchlist[symbol] && STATE.watchlist[symbol].monitor) continue;
 
     try {
       const candles = await fetchKite5Min(symbol);
-      if (!candles || candles.length < 30) { await sleep(100); continue; }
+      if (!candles || candles.length < 30) { await sleep(80); continue; }
 
-      const atr   = computeATR(candles);
-      const sr    = computeSR(candles);
-      const zones = computeMicroZones(candles);
+      // Only use today's bars from 9:45 onwards for push detection
+      const today = candles[candles.length-1].t.slice(0, 10);
+      const todayBars = candles.filter(b => b.t.slice(0,10) === today && b.t.slice(11,16) >= '09:45');
+      if (todayBars.length < 5) { await sleep(80); continue; }
 
-      // ── H2 PRE-FILTER ──
-      // Does this stock have a push+pullback structure that could yield H2?
-      const h2Sigs = findH2Signals(candles, zones, sr, atr, 55); // Lower threshold for pre-filter
-      if (h2Sigs.length > 0) {
-        const best = h2Sigs.reduce((a, b) => a.score > b.score ? a : b);
-        h2Candidates.push({
-          sym: symbol,
-          sector: SECTORS[symbol] || 'Other',
-          price: candles[candles.length-1].c,
-          h2Score: best.score,
-          h2Signal: best,
-          atr,
-          candles: candles.slice(-120), // Keep last 120 bars for Tier 2 re-scoring
-          sr,
-          zones,
-          fetchedAt: new Date().toISOString(),
-        });
+      // Compute ATR from prior bars (no look-ahead)
+      const priorBars = candles.filter(b => b.t.slice(0,10) !== today);
+      const atr = priorBars.length > 14 ? computeATR(priorBars.slice(-75)) : computeATR(candles);
+
+      // Use zone-based push finder (matches Python find_qualifying_push)
+      const qp = findQualifyingPush(todayBars, atr);
+      if (!qp) { await sleep(80); continue; }
+
+      // Check if this push was already fired and blocked
+      const pushId = qp.push_id;
+      if (STATE.blocked_pushes.has(pushId)) { await sleep(80); continue; }
+
+      // Check push is recent (within last 3 bars of current data)
+      const barsSincePush = todayBars.length - 1 - qp.end_idx;
+      if (barsSincePush > ENG.PUSH_EXPIRY_BARS + 2) { await sleep(80); continue; }
+
+      // Compute SR (using historical bars for context)
+      const srRes = computeSR(candles);
+      const srLevels = [...(srRes.supports || []), ...(srRes.resistances || [])];
+
+      // Compute broken_sr with Fix 1
+      const brokenSR = computeBrokenSR(srLevels, qp);
+
+      // Context score (simple version — daily trend from EMA)
+      let contextScore = 0;
+      if (candles.length > 20) {
+        const ema = candles[candles.length-1].ema || candles[candles.length-1].c;
+        const price = candles[candles.length-1].c;
+        if (price > ema * 1.01) contextScore = 10;
+        else if (price < ema * 0.99) contextScore = -10;
       }
 
-      // ── RT PRE-FILTER ──
-      // Recent strong S/R break (F3≥14) with incomplete follow-through?
-      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
-      if (rtSigs.length > 0) {
-        const best = rtSigs.reduce((a, b) => a.score > b.score ? a : b);
-        rtCandidates.push({
-          sym: symbol,
-          sector: SECTORS[symbol] || 'Other',
-          price: candles[candles.length-1].c,
-          rtScore: best.score,
-          rtSignal: best,
-          atr,
-          candles: candles.slice(-120),
-          sr,
-          fetchedAt: new Date().toISOString(),
-        });
-      }
+      // Add to watchlist
+      const lastBarT = todayBars[todayBars.length-1].t;
+      STATE.watchlist[symbol] = {
+        push: qp,
+        push_id: pushId,
+        sr_levels: srLevels,
+        broken_sr: brokenSR,
+        context_score: contextScore,
+        day_bars: todayBars,
+        atr,
+        last_bar_t: lastBarT,
+        monitor: null,         // created on first Tier 2 call
+        added_at: new Date().toISOString(),
+      };
+      console.log(`[T1v7] + ${symbol} (${qp.dir} push, ${qp.bars}b, ${qp.move.toFixed(2)} move, ${(qp.move/atr).toFixed(1)}xATR)`);
 
-    } catch(e) {
-      console.warn(`[Tier1] ${symbol} error:`, e.message);
+    } catch (e) {
+      console.warn(`[T1v7] ${symbol} error:`, e.message);
     }
 
-    await sleep(100); // 100ms between stocks — 3.1 req/s, within Kite limit
+    await sleep(80);
   }
 
-  // Sort by score, keep top candidates
-  h2Candidates.sort((a, b) => b.h2Score - a.h2Score);
-  rtCandidates.sort((a, b) => b.rtScore - a.rtScore);
-
-  CACHE.tier1H2  = h2Candidates.slice(0, 30);
-  CACHE.tier1RT  = rtCandidates.slice(0, 30);
-  CACHE.tier1At  = new Date().toISOString();
-  CACHE.tier1Running = false;
-  CACHE.tier1Progress.status = 'done';
-
-  console.log(`[${new Date().toISOString()}] Tier1 done — H2: ${h2Candidates.length} candidates, RT: ${rtCandidates.length} candidates`);
+  STATE.tier1_running = false;
+  STATE.tier1_progress.status = 'done';
+  STATE.tier1_at = new Date().toISOString();
+  const watchCount = Object.keys(STATE.watchlist).length;
+  console.log(`[T1v7 ${new Date().toISOString()}] Done — ${watchCount} stocks on watchlist`);
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ── TIER 2: every 5 min, run monitor on each watchlist stock ───────────
+async function runTier2v7() {
+  if (STATE.tier2_running) return;
+  if (!isMarketHours()) return;
+  if (!Object.keys(STATE.watchlist).length) return;
 
-// ─── TIER 2 — ON-DEMAND FULL SCORING ─────────────────────────────────────────
-async function runTier2() {
-  const allCandidates = [
-    ...CACHE.tier1H2.map(s => ({ ...s, primaryType: 'H2' })),
-    ...CACHE.tier1RT.map(s => ({ ...s, primaryType: 'RT' })),
-  ];
+  STATE.tier2_running = true;
+  console.log(`[T2v7 ${new Date().toISOString()}] Processing ${Object.keys(STATE.watchlist).length} watchlist stocks`);
 
-  if (!allCandidates.length) return [];
-
-  console.log(`[${new Date().toISOString()}] Tier2 live refresh — ${allCandidates.length} candidates`);
-
-  const results = [];
-  const seen = new Set();
-
-  for (const candidate of allCandidates) {
-    if (seen.has(candidate.sym)) continue;
-    seen.add(candidate.sym);
+  for (const symbol of Object.keys(STATE.watchlist)) {
+    const entry = STATE.watchlist[symbol];
 
     try {
-      // Fetch fresh candles for this candidate
-      const freshCandles = await fetchKite5Min(candidate.sym);
-      const candles = freshCandles || candidate.candles;
-      if (!candles || candles.length < 20) continue;
+      const candles = await fetchKite5Min(symbol);
+      if (!candles || candles.length < 30) continue;
 
-      const atr   = computeATR(candles);
-      const sr    = freshCandles ? computeSR(candles) : candidate.sr;
-      const zones = computeMicroZones(candles);
+      const today = candles[candles.length-1].t.slice(0, 10);
+      const todayBars = candles.filter(b => b.t.slice(0,10) === today && b.t.slice(11,16) >= '09:45');
+      if (todayBars.length < 5) continue;
 
-      // Run full H2 scoring
-      const h2Sigs = findH2Signals(candles, zones, sr, atr, 60);
-      // Run full RT scoring (with all filters)
-      const rtSigs = findRTSignals(candles, sr, atr, 60, 14);
+      // Find bars AFTER the last bar we processed
+      const lastProcessedIdx = todayBars.findIndex(b => b.t === entry.last_bar_t);
+      const newBars = lastProcessedIdx >= 0 ? todayBars.slice(lastProcessedIdx + 1) : todayBars.slice(-3);
 
-      const allSigs = [...h2Sigs, ...rtSigs];
-      if (!allSigs.length) continue;
+      if (newBars.length === 0) continue;
 
-      // FIX 2: Most recent signal first, score as tiebreak
-      allSigs.sort((a, b) => {
-        const ta = a.entryTime ? new Date(a.entryTime).getTime() : 0;
-        const tb = b.entryTime ? new Date(b.entryTime).getTime() : 0;
-        if (tb !== ta) return tb - ta;
-        return b.score - a.score;
-      });
-      const best = allSigs[0];
-
-      // FIX 3: Apply 40-min expiry HERE in Tier 2 (not in Tier 1)
-      // Tier 1 caches today's signals; Tier 2 checks they are still fresh
-      if (best && best.entryTime) {
-        const freshCandle  = candles[candles.length - 1];
-        const lastCandleMs = new Date(freshCandle.t).getTime();
-        const sigMs        = new Date(best.entryTime).getTime();
-        const minsOld      = (lastCandleMs - sigMs) / 60000;
-        if (minsOld > 40) {
-          console.log('[Tier2] ' + candidate.sym + ' skipped — signal ' + minsOld.toFixed(0) + 'min old (>40min expiry)');
-          continue;
-        }
+      // 14:30 cutoff — no new alerts after this time
+      const lastBarTime = newBars[newBars.length-1].t.slice(11, 16);
+      if (lastBarTime >= '14:30') {
+        console.log(`[T2v7] ${symbol} past 14:30 cutoff, dropping from watchlist`);
+        delete STATE.watchlist[symbol];
+        continue;
       }
 
-      // 1-hour context from 5-min candles
-      const hourlyBars    = synthesiseHourlyBars(candles);
-      const hourlyContext = computeHourlyContext(hourlyBars);
+      // Initialize monitor if not yet
+      if (!entry.monitor) {
+        entry.monitor = new Tier2Monitor(
+          entry.push, entry.sr_levels, entry.broken_sr,
+          entry.context_score, todayBars[0].o, entry.day_bars
+        );
+        // Prefill: feed the counter bars that were already part of the push event
+        // We can't access detector internals here, so we just start fresh from new bars
+      }
 
-      results.push({
-        sym: candidate.sym,
-        ticker: candidate.sym,   // alias — Claude prompt uses ticker field
-        sector: candidate.sector,
-        hourlyTrend: hourlyContext ? hourlyContext.trend : null,
-        hourlyEmaSlope: hourlyContext ? hourlyContext.emaSlope : null,
-        price: candles[candles.length-1].c,
-        type: best.type,
-        dir: best.dir,
-        score: best.score,
-        entryPrice: best.entryPrice,
-        stopPrice: best.stopPrice,
-        targetPrice: best.targetPrice,
-        stopDist: best.stopDist,
-        atr: best.atr,
-        pushExtreme: best.pushExtreme || null,
-        entryZoneLow:  best.entryPrice && best.atr ? +(best.entryPrice - best.atr*0.5).toFixed(2) : null,
-        entryZoneHigh: best.entryPrice && best.atr ? +(best.entryPrice + best.atr*0.5).toFixed(2) : null,
-        entryTime: best.entryTime,
-        tier: best.tier || null,
-        f3: best.f3 || null,
-        // Include all signals for Claude context
-        allSignals: allSigs.map(s => ({
-          type: s.type, dir: s.dir, score: s.score,
-          entry: s.entryPrice, stop: s.stopPrice, target: s.targetPrice,
-        })),
-        liveAt: new Date().toISOString(),
-      });
+      // Feed each new bar through monitor
+      for (const bar of newBars) {
+        // Compute fresh atr/ema/rsi at this point
+        const idxInCandles = candles.findIndex(c => c.t === bar.t);
+        const histBars = candles.slice(0, idxInCandles + 1);
+        const liveAtr = computeATR(histBars.slice(-30));
+        const liveEma = histBars[histBars.length-1].ema || histBars[histBars.length-1].c;
+        const liveRsi = computeRSIEngine(histBars);
 
-      await sleep(100);
-    } catch(e) {
-      console.warn(`[Tier2] ${candidate.sym} error:`, e.message);
+        const result = entry.monitor.processBar(bar, liveAtr, liveEma, liveRsi);
+
+        if (result.action === 'SIGNAL') {
+          // Fire alert
+          const sig = result.signal;
+          // Exhaustion B-skip check (already in monitor)
+          if (entry.monitor.exhaustion_skip && sig.type === 'B') {
+            console.log(`[T2v7] ${symbol} B-signal skipped (exhaustion)`);
+            STATE.blocked_pushes.add(entry.push_id);
+            delete STATE.watchlist[symbol];
+            break;
+          }
+          const alert = {
+            alert_id: `${symbol}_${entry.push_id}_${Date.now()}`,
+            symbol,
+            ...sig,
+            rationale: buildRationale(sig, entry.push, entry.broken_sr),
+            push: entry.push,
+            fired_at: new Date().toISOString(),
+            bar_time: bar.t,
+            atr: liveAtr,
+            status: 'pending',  // awaiting user click
+          };
+          STATE.alerts.push(alert);
+          STATE.blocked_pushes.add(entry.push_id);
+          console.log(`[T2v7 ALERT] ${symbol} ${sig.type} ${sig.dir} score=${sig.score} entry=${sig.entry_price} stop=${sig.stop_price} target=${sig.target_price}`);
+          delete STATE.watchlist[symbol];
+          break;
+        } else if (result.action === 'CANCEL') {
+          // Check counter trade
+          const veto = checkCounterSwingVeto(entry.push, bar, entry.monitor.atr, entry.day_bars);
+          if (veto) {
+            // Build counter signal (simplified — opposite direction, similar structure)
+            const isUp = !entry.push.is_up;
+            const entry_price = bar.c;
+            const swingLook = entry.day_bars.slice(-6);
+            const stopExt = isUp ? Math.min(...swingLook.map(b => b.l)) : Math.max(...swingLook.map(b => b.h));
+            const stop = isUp ? stopExt - entry.monitor.atr * 0.5 : stopExt + entry.monitor.atr * 0.5;
+            const target = isUp ? entry_price + Math.abs(entry_price - stop) * 1.5 : entry_price - Math.abs(entry_price - stop) * 1.5;
+            const counterSig = {
+              type: 'COUNTER',
+              dir: isUp ? 'up' : 'down',
+              score: 60,
+              entry_price: +entry_price.toFixed(2),
+              stop_price: +stop.toFixed(2),
+              target_price: +target.toFixed(2),
+              stop_dist: +Math.abs(entry_price - stop).toFixed(2),
+              rr: 1.5,
+              bar_time: bar.t,
+              push_id: entry.push_id + '_C',
+              rt_level: null,
+              breakdown: { counter: 1 },
+              retrace_pct: null,
+            };
+            const alert = {
+              alert_id: `${symbol}_${entry.push_id}_C_${Date.now()}`,
+              symbol, ...counterSig,
+              rationale: `Counter trade: original push direction ${entry.push.dir} reversed >80%. Trading against the original push direction. Entry ₹${counterSig.entry_price} → Target ₹${counterSig.target_price} (R:R 1.5)`,
+              push: entry.push,
+              fired_at: new Date().toISOString(),
+              bar_time: bar.t,
+              atr: entry.monitor.atr,
+              status: 'pending',
+            };
+            STATE.alerts.push(alert);
+            console.log(`[T2v7 COUNTER] ${symbol} score=60 entry=${counterSig.entry_price}`);
+          }
+          STATE.blocked_pushes.add(entry.push_id);
+          delete STATE.watchlist[symbol];
+          break;
+        } else if (result.action === 'DUMP' || result.action === 'EXHAUSTION') {
+          STATE.blocked_pushes.add(entry.push_id);
+          delete STATE.watchlist[symbol];
+          break;
+        }
+        // WAITING — continue to next bar
+        entry.last_bar_t = bar.t;
+      }
+
+    } catch (e) {
+      console.warn(`[T2v7] ${symbol} error:`, e.message);
     }
   }
 
-  results.sort((a, b) => b.score - a.score);
-  CACHE.tier2   = results;
-  CACHE.tier2At = new Date().toISOString();
-  return results;
+  STATE.tier2_running = false;
+  STATE.tier2_at = new Date().toISOString();
 }
 
-// ─── START TIER 1 ─────────────────────────────────────────────────────────────
-// Run on startup (will skip if outside market hours or Kite not ready)
-setTimeout(runTier1, 5000); // 5s delay on startup to let Kite auth load
-setInterval(() => {
-  if (isMarketHours() && !CACHE.tier1Running) runTier1();
-}, 10 * 60 * 1000); // Every 10 minutes (was 20)
-
-// ── AUTO TIER 2 — every 3 min, stores results for app polling ─────────────────
-async function runAutoTier2() {
+// ── TIER 3: every 1 min when there are live trades, track each ─────────
+async function runTier3v7() {
   if (!isMarketHours()) return;
-  if (CACHE.tier2Running) return;                              // don't overlap with manual Generate
-  if (!CACHE.tier1H2.length && !CACHE.tier1RT.length) return; // no candidates yet
-  try {
-    const results = await runTier2();
-    CACHE.autoAlerts   = results || [];
-    CACHE.autoAlertsAt = new Date().toISOString();
-    if (results && results.length > 0) {
-      console.log('[AutoT2] ' + results.length + ' fresh signal(s) found — cached for app');
+  const liveIds = Object.keys(STATE.live_trades).filter(id => !STATE.live_trades[id].closed);
+  if (!liveIds.length) return;
+
+  for (const id of liveIds) {
+    const lt = STATE.live_trades[id];
+    try {
+      const candles = await fetchKite5Min(lt.alert.symbol);
+      if (!candles || !candles.length) continue;
+
+      const today = candles[candles.length-1].t.slice(0, 10);
+      const todayBars = candles.filter(b => b.t.slice(0,10) === today);
+
+      // Process bars after fill_time
+      const fillIdx = todayBars.findIndex(b => b.t === lt.fill_time);
+      const sinceFill = fillIdx >= 0 ? todayBars.slice(fillIdx + 1) : todayBars.slice(-1);
+      const lastSeenIdx = lt.last_bar_t ? sinceFill.findIndex(b => b.t === lt.last_bar_t) : -1;
+      const newBars = lastSeenIdx >= 0 ? sinceFill.slice(lastSeenIdx + 1) : sinceFill;
+
+      for (const bar of newBars) {
+        const r = lt.tracker.processBar(bar);
+        lt.last_bar_t = bar.t;
+        lt.last_status = r;
+        if (r.status === 'closed') {
+          lt.closed = true;
+          STATE.history.push({...lt.alert, ...r, fill_price: lt.fill_price, fill_time: lt.fill_time});
+          console.log(`[T3v7] CLOSED ${lt.alert.symbol} ${r.outcome} ${r.exit_reason} @ ${r.exit_price}`);
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn(`[T3v7] ${id} error:`, e.message);
     }
-  } catch(e) {
-    console.warn('[AutoT2] Error:', e.message);
   }
+  STATE.tier3_at = new Date().toISOString();
 }
-setInterval(() => {
-  if (isMarketHours() && !CACHE.tier2Running) runAutoTier2();
-}, 3 * 60 * 1000); // Every 3 minutes
 
-// ─── ROUTES ──────────────────────────────────────────────────────────────────
+// ── SCHEDULERS ────────────────────────────────────────────────────────
+setTimeout(runTier1v7, 8000);                              // 8s after startup
+setInterval(runTier1v7, 10 * 60 * 1000);                   // every 10 min
+setInterval(runTier2v7, 5 * 60 * 1000);                    // every 5 min
+setInterval(runTier3v7, 60 * 1000);                        // every 1 min
 
-app.get('/', (req, res) => res.json({
-  name: 'Signal Server v6.2 — H2+RT Pattern Engine | Yahoo screener | Kite prices',
-  kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
-  universe: NSE_UNIVERSE.length,
-  tier1: {
-    h2Candidates: CACHE.tier1H2.length,
-    rtCandidates: CACHE.tier1RT.length,
-    at: CACHE.tier1At,
-    running: CACHE.tier1Running,
-  },
-  tier2: { cached: CACHE.tier2.length, at: CACHE.tier2At },
-  marketHours: isMarketHours(),
-}));
+// ── ENDPOINTS ────────────────────────────────────────────────────────
+app.get('/v8/alerts', (req, res) => {
+  res.json({
+    alerts: STATE.alerts,
+    tier1_at: STATE.tier1_at,
+    tier2_at: STATE.tier2_at,
+    watchlist_count: Object.keys(STATE.watchlist).length,
+    blocked_count: STATE.blocked_pushes.size,
+  });
+});
+
+app.get('/v8/watchlist', (req, res) => {
+  const wl = Object.entries(STATE.watchlist).map(([sym, e]) => ({
+    symbol: sym,
+    push_dir: e.push.dir,
+    push_bars: e.push.bars,
+    push_move: e.push.move,
+    push_extreme: e.push.extreme,
+    added_at: e.added_at,
+  }));
+  res.json({ watchlist: wl, count: wl.length, scanned: STATE.tier1_progress });
+});
+
+app.post('/v8/track', (req, res) => {
+  const { alert_id, fill_price, fill_time } = req.body || {};
+  if (!alert_id || !fill_price) return res.status(400).json({ error: 'alert_id and fill_price required' });
+  const alert = STATE.alerts.find(a => a.alert_id === alert_id);
+  if (!alert) return res.status(404).json({ error: 'alert not found' });
+  alert.status = 'taken';
+  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString());
+  STATE.live_trades[alert_id] = {
+    alert, fill_price: +fill_price, fill_time: fill_time || new Date().toISOString(),
+    tracker, last_bar_t: null, closed: false, last_status: { status: 'open' },
+  };
+  console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price}`);
+  res.json({ ok: true, alert_id, fill_price, fill_time });
+});
+
+app.post('/v8/dismiss', (req, res) => {
+  const { alert_id } = req.body || {};
+  if (!alert_id) return res.status(400).json({ error: 'alert_id required' });
+  STATE.alerts = STATE.alerts.filter(a => a.alert_id !== alert_id);
+  res.json({ ok: true });
+});
+
+app.get('/v8/live-trades', (req, res) => {
+  const lt = Object.entries(STATE.live_trades).map(([id, t]) => ({
+    alert_id: id,
+    symbol: t.alert.symbol,
+    type: t.alert.type,
+    dir: t.alert.dir,
+    fill_price: t.fill_price,
+    fill_time: t.fill_time,
+    entry_price: t.alert.entry_price,
+    stop_price: t.alert.stop_price,
+    target_price: t.alert.target_price,
+    closed: t.closed,
+    status: t.last_status,
+  }));
+  res.json({ live: lt.filter(l => !l.closed), closed: lt.filter(l => l.closed), history_count: STATE.history.length });
+});
+
+app.get('/v8/history', (req, res) => {
+  res.json({ history: STATE.history });
+});
+
+app.get('/v8/status', (req, res) => {
+  res.json({
+    market_open: isMarketHours(),
+    kite_ready: kiteReady(),
+    tier1: { at: STATE.tier1_at, running: STATE.tier1_running, progress: STATE.tier1_progress },
+    tier2: { at: STATE.tier2_at, running: STATE.tier2_running },
+    tier3: { at: STATE.tier3_at },
+    watchlist_count: Object.keys(STATE.watchlist).length,
+    alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
+    live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
+    blocked_pushes: STATE.blocked_pushes.size,
+  });
+});
+
+// Manual trigger for testing
+app.post('/v8/run-tier1', async (req, res) => {
+  runTier1v7();
+  res.json({ ok: true, message: 'Tier 1 started in background' });
+});
+app.post('/v8/run-tier2', async (req, res) => {
+  runTier2v7();
+  res.json({ ok: true, message: 'Tier 2 started in background' });
+});
+
+// EOD reset (call manually after market close to clear blocked pushes for next day)
+app.post('/v8/reset-day', (req, res) => {
+  STATE.blocked_pushes.clear();
+  STATE.alerts = [];
+  STATE.watchlist = {};
+  // Keep live_trades and history
+  res.json({ ok: true });
+});
+
 
 app.get('/health', (req, res) => res.json({
   ok: true,
   uptime: Math.round(process.uptime()) + 's',
   time: new Date().toISOString(),
-  screenerReady: !!CACHE.tier1At,
-  h2Candidates: CACHE.tier1H2.length,
-  rtCandidates: CACHE.tier1RT.length,
   kiteReady: kiteReady(),
+  marketHours: isMarketHours(),
+  engine: 'v7.0 — new Tier2Monitor + 5 rules + Fix 1',
+  alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
+  live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
+}));
+
+app.get('/', (req, res) => res.json({
+  name: 'Signal Server v7.0 — New Engine (Tier2Monitor + 5 rules + Fix 1)',
+  kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
+  universe: NSE_UNIVERSE.length,
+  endpoints: ['/v8/alerts', '/v8/watchlist', '/v8/live-trades', '/v8/history', '/v8/status', '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]', '/health', '/prices', '/candles/:symbol', '/kite/login'],
   marketHours: isMarketHours(),
 }));
 
-app.get('/status', (req, res) => res.json({
-  universe: NSE_UNIVERSE.length,
-  tier1: {
-    h2Candidates: CACHE.tier1H2.length,
-    rtCandidates: CACHE.tier1RT.length,
-    at: CACHE.tier1At,
-    running: CACHE.tier1Running,
-    progress: CACHE.tier1Progress,
-    marketHours: isMarketHours(),
-  },
-  tier2: { cached: CACHE.tier2.length, at: CACHE.tier2At },
-  kite: {
-    ready: kiteReady(),
-    authenticatedAt: KITE.authenticatedAt,
-    instrumentTokensLoaded: Object.keys(KITE.instrumentTokens).length,
-    instrumentsFetchedAt: KITE.instrumentsFetchedAt,
-    dataSource: Object.keys(KITE.instrumentTokens).length > 0 ? 'Kite API' : 'Yahoo Finance (pre-login fallback)',
-  },
-}));
-
-// ── 1-HOUR CONTEXT: synthesised from 5-min candles ────────────────────────
-function synthesiseHourlyBars(candles5m) {
-  if(!candles5m || candles5m.length < 12) return [];
-  const hourMap = {};
-  for(const c of candles5m){
-    const timeStr = c.t.slice(11,16);
-    const [h,m] = timeStr.split(':').map(Number);
-    const minsFromOpen = (h-9)*60 + (m-15);
-    const hourKey = Math.floor(minsFromOpen/60);
-    if(hourKey < 0) continue;
-    if(!hourMap[hourKey]){
-      hourMap[hourKey] = {o:c.o,h:c.h,l:c.l,c:c.c,v:c.v,t:c.t,bars:1};
-    } else {
-      const hb = hourMap[hourKey];
-      hb.h = Math.max(hb.h,c.h); hb.l = Math.min(hb.l,c.l);
-      hb.c = c.c; hb.v += c.v; hb.bars++;
-    }
-  }
-  return Object.keys(hourMap).sort((a,b)=>+a-+b).map(k=>hourMap[k]);
-}
-
-function computeHourlyContext(hourlyBars) {
-  if(!hourlyBars || hourlyBars.length < 2) return null;
-  const n = hourlyBars.length;
-  const k = 2/(Math.min(21,n)+1);
-  let ema = hourlyBars[0].c;
-  for(let i=1;i<n;i++) ema = hourlyBars[i].c*k + ema*(1-k);
-  const last5 = hourlyBars.slice(-5);
-  const higherCloses = last5.filter((b,i)=>i>0&&b.c>last5[i-1].c).length;
-  const lowerCloses  = last5.filter((b,i)=>i>0&&b.c<last5[i-1].c).length;
-  const emaSlope = n>=3?(hourlyBars[n-1].c-hourlyBars[n-3].c)/hourlyBars[n-3].c*100:0;
-  let trend = 'sideways';
-  if(emaSlope>0.15||higherCloses>=3) trend='up';
-  else if(emaSlope<-0.15||lowerCloses>=3) trend='down';
-  return {trend, emaSlope:+emaSlope.toFixed(3), ema:+ema.toFixed(2)};
-}
-
-app.get('/generate', async (req, res) => {
-  if (!kiteReady()) {
-    return res.json({
-      error: 'Kite not authenticated. Open trading app and login with Zerodha first.',
-      kiteLoginUrl: `${SERVER_URL}/kite/login`,
-    });
-  }
-  if (!CACHE.tier1At && !CACHE.tier1Running) {
-    return res.json({ error: 'Tier1 has not run yet. Wait for market hours or check /status.' });
-  }
-  if (CACHE.tier1Running) {
-    return res.json({ error: 'Tier1 scan running. Try again in 1-2 min.', progress: CACHE.tier1Progress });
-  }
-
-  const live = await runTier2();
-  const top  = live.slice(0, 12); // Top 12 for Claude
-
-  // Build compact prompt-ready string for Claude
-  const stocksSummary = top.map(s => {
-    const zoneLow  = s.entryPrice && s.atr ? +(s.entryPrice - s.atr*0.5).toFixed(2) : null;
-    const zoneHigh = s.entryPrice && s.atr ? +(s.entryPrice + s.atr*0.5).toFixed(2) : null;
-    const htCtx = s.hourlyTrend
-      ? ' 1H='+s.hourlyTrend.toUpperCase()+'(slope'+(s.hourlyEmaSlope>0?'+':'')+s.hourlyEmaSlope+'%)'
-      : '';
-    const htAlign = s.hourlyTrend && (
-      (s.dir==='bull'&&s.hourlyTrend==='up')||(s.dir==='bear'&&s.hourlyTrend==='down')
-    ) ? ' ALIGNED' : (s.hourlyTrend&&s.hourlyTrend!=='sideways') ? ' COUNTER-TREND' : '';
-    return `${s.ticker||s.sym} [${s.sector}] ${s.type} ${s.dir.toUpperCase()} sc=${s.score} ` +
-      `entry=${s.entryPrice} stop=${s.stopPrice} target=${s.targetPrice} ` +
-      `ATR=${s.atr} zone=${zoneLow}-${zoneHigh}` +
-      `${s.pushExtreme ? ` pushExtreme=${s.pushExtreme}` : ''}` +
-      `${s.tier ? ` tier=${s.tier}` : ''}${s.f3 ? ` F3=${s.f3}` : ''}`+ htCtx + htAlign;
-  }).join('\n');
-
-  res.json({
-    scanned: NSE_UNIVERSE.length,
-    h2Candidates: CACHE.tier1H2.length,
-    rtCandidates: CACHE.tier1RT.length,
-    tier2Refreshed: live.length,
-    tier1At: CACHE.tier1At,
-    tier2At: CACHE.tier2At,
-    stocksSummary, // For Claude prompt
-    stocks: top,   // Full data for app display
-  });
-});
-
-// ─── PRICES — Kite first, Yahoo fallback (unchanged from v5.2) ────────────────
 const YF_HDR = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -1453,29 +1933,6 @@ app.get('/symbols', (req, res) => res.json({
   withTokens: Object.keys(INSTRUMENT_TOKENS).length,
 }));
 
-
-// ─── MANUAL TIER 1 TRIGGER ───────────────────────────────────────────────────
-// Allows user to force a Tier 1 rescan without waiting for 20-min interval
-// Returns immediately — scan runs in background
-app.get('/scan', (req, res) => {
-  if (CACHE.tier1Running) {
-    return res.json({
-      ok: false,
-      message: 'Tier 1 scan already running.',
-      progress: CACHE.tier1Progress,
-    });
-  }
-  // Trigger scan in background — don't await, return immediately
-  runTier1().catch(e => console.error('[Manual scan] Error:', e.message));
-  res.json({
-    ok: true,
-    message: 'Tier 1 scan started. Check /status for progress. Takes ~60 seconds.',
-    universe: NSE_UNIVERSE.length,
-    startedAt: new Date().toISOString(),
-  });
-});
-
-// ─── /candles/:symbol — fetch recent 5-min candles for live trade tracking ────
 // Used by Live Position Tracker to give Claude candle-level context
 app.get('/candles/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
@@ -1497,15 +1954,6 @@ app.get('/candles/:symbol', async (req, res) => {
   }
 });
 
-// ── AUTO ALERTS ENDPOINT — app polls every 30 sec to detect new signals ─────
-app.get('/auto-alerts', (req, res) => {
-  res.json({
-    alerts:    CACHE.autoAlerts    || [],
-    updatedAt: CACHE.autoAlertsAt  || null,
-    count:     (CACHE.autoAlerts   || []).length,
-  });
-});
-
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`Signal server v6.4-fixed on port ${PORT} — H2+RT | Kite data (live tokens) | Yahoo fallback | 20-min scan`)
+  console.log('Signal server v7.0 on port ' + PORT + ' — new engine (Tier2Monitor + 5 rules + Fix 1)')
 );

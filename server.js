@@ -614,6 +614,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // NEW ENGINE v7.1 — Full port of Python tier2_engine.py
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1141,12 +1143,19 @@ function buildRationale(sig, push, brokenSR) {
 }
 
 class Tier3Tracker {
-  constructor(alert, fillPrice, fillTime) {
+  constructor(alert, fillPrice, fillTime, shares) {
     this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;
+    this.shares = shares || 1;
     this.bars_since_fill = 0; this.mfe = 0; this.mae = 0; this.exit_override = false;
     this.outcome = null; this.exit_reason = null; this.exit_price = null; this.exit_time = null;
+    this.last_price = fillPrice;
+  }
+  _pnl(price) {
+    const isUp = this.alert.dir === 'up';
+    return (isUp ? (price - this.fill_price) : (this.fill_price - price)) * this.shares;
   }
   processBar(bar) {
+    this.last_price = bar.c;
     if (this.outcome) return { status: 'closed', ...this.summary() };
     this.bars_since_fill++;
     const isUp = this.alert.dir === 'up';
@@ -1169,18 +1178,109 @@ class Tier3Tracker {
       }
       if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) return this._close('EARLY_EXIT', bar.c, 'time_stagnation', bar.t);
     }
-    return { status: 'open', mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2), bars_since_fill: this.bars_since_fill };
+    return {
+      status: 'open',
+      mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2),
+      bars_since_fill: this.bars_since_fill,
+      current_price: +bar.c.toFixed(2),
+      pnl: +this._pnl(bar.c).toFixed(2),
+      pnl_pct: +((this._pnl(bar.c) / (this.fill_price * this.shares)) * 100).toFixed(2),
+    };
   }
   _close(outcome, price, reason, time) {
     this.outcome = outcome; this.exit_price = +price.toFixed(2); this.exit_reason = reason; this.exit_time = time;
     return { status: 'closed', ...this.summary() };
   }
   summary() {
-    return { outcome: this.outcome, exit_price: this.exit_price, exit_reason: this.exit_reason, exit_time: this.exit_time, mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2), bars_held: this.bars_since_fill };
+    return {
+      outcome: this.outcome, exit_price: this.exit_price, exit_reason: this.exit_reason, exit_time: this.exit_time,
+      mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2),
+      bars_held: this.bars_since_fill,
+      pnl: this.exit_price != null ? +this._pnl(this.exit_price).toFixed(2) : 0,
+      pnl_pct: this.exit_price != null ? +((this._pnl(this.exit_price) / (this.fill_price * this.shares)) * 100).toFixed(2) : 0,
+      shares: this.shares,
+    };
   }
 }
 
-// ── STREAMING PUSH DETECTOR (full port of streaming_push_detector.py) ──
+// ── CONTEXT ENGINE (port of context_engine.py) ──────────────────────────
+const CTX = {
+  GAP_THRESHOLD: 0.5, GAP_PTS: 5,
+  TODAY_WEIGHT: [1.0, 0.7, 0.4],
+  YESTERDAY_WEIGHT: 0.3,
+  STRENGTH_WEIGHT: { Strong: 1.0, Moderate: 0.6, Weak: 0.2 },
+  LABEL_THRESHOLDS: [[10, 'Strong bullish'], [4, 'Mild bullish'], [-3, 'Mixed'], [-9, 'Mild bearish'], [-99, 'Strong bearish']],
+  SIGNAL_MODIFIER: {
+    'up_Strong bullish': 10, 'up_Mild bullish': 5, 'up_Mixed': 0, 'up_Mild bearish': -5, 'up_Strong bearish': -10,
+    'down_Strong bearish': 10, 'down_Mild bearish': 5, 'down_Mixed': 0, 'down_Mild bullish': -5, 'down_Strong bullish': -10,
+  },
+};
+
+function computeContext(allCandles, currentBarIdx, todayDate, signalDir) {
+  const upto = allCandles.slice(0, currentBarIdx + 1);
+  const todayBars = upto.filter(c => c.t.slice(0,10) === todayDate && c.t.slice(11,16) >= '09:45');
+  const targetTotal = 150;
+  const remaining = targetTotal - todayBars.length;
+  let prevBars = [];
+  if (remaining > 0) {
+    const beforeToday = upto.filter(c => c.t.slice(0,10) < todayDate);
+    prevBars = beforeToday.length >= remaining ? beforeToday.slice(-remaining) : beforeToday;
+  }
+  // Gap
+  let gapPts = 0, gapPct = 0;
+  if (todayBars.length && prevBars.length) {
+    const todayOpenBar = upto.find(c => c.t.slice(0,10) === todayDate);
+    if (todayOpenBar) {
+      const todayOpen = todayOpenBar.o;
+      const prevClose = prevBars[prevBars.length-1].c;
+      gapPct = (todayOpen - prevClose) / (prevClose || 1) * 100;
+      if (gapPct > CTX.GAP_THRESHOLD) gapPts = CTX.GAP_PTS;
+      else if (gapPct < -CTX.GAP_THRESHOLD) gapPts = -CTX.GAP_PTS;
+    }
+  }
+  // Today zones
+  let todayPts = 0;
+  if (todayBars.length >= 3) {
+    const tz = computeZonesPD(todayBars);
+    const dz = tz.filter(z => z.dir === 'up' || z.dir === 'down');
+    const rev = [...dz].reverse();
+    rev.forEach((z, rank) => {
+      const wIdx = Math.min(rank, CTX.TODAY_WEIGHT.length - 1);
+      const rW = CTX.TODAY_WEIGHT[wIdx];
+      const sW = CTX.STRENGTH_WEIGHT[z.strength || 'Weak'] || 0.2;
+      const slope = Math.abs(z.slope_mid || 0);
+      const szW = Math.min(slope / 1.0, 1.5);
+      todayPts += rW * sW * szW * (z.dir === 'up' ? 10 : -10);
+    });
+  }
+  // Yesterday zones
+  let ydyPts = 0;
+  if (prevBars.length >= 3) {
+    const pz = computeZonesPD(prevBars);
+    const dz = pz.filter(z => z.dir === 'up' || z.dir === 'down');
+    for (const z of dz) {
+      const sW = CTX.STRENGTH_WEIGHT[z.strength || 'Weak'] || 0.2;
+      const slope = Math.abs(z.slope_mid || 0);
+      const szW = Math.min(slope / 1.0, 1.5);
+      ydyPts += CTX.YESTERDAY_WEIGHT * sW * szW * (z.dir === 'up' ? 10 : -10);
+    }
+  }
+  const raw = todayPts + gapPts + ydyPts;
+  const score = Math.round(raw);
+  let label = 'Strong bearish';
+  for (const [thr, lbl] of CTX.LABEL_THRESHOLDS) {
+    if (score >= thr) { label = lbl; break; }
+  }
+  const sigMod = CTX.SIGNAL_MODIFIER[`${signalDir || 'up'}_${label}`] || 0;
+  return { score, label, gap_pts: gapPts, gap_pct: +gapPct.toFixed(2), today_pts: +todayPts.toFixed(1), yesterday_pts: +ydyPts.toFixed(1), signal_mod: sigMod };
+}
+
+function applyContext(baseScore, context) {
+  let final = baseScore + context.signal_mod;
+  final = Math.max(0, Math.min(100, final));
+  const conviction = final >= 70 ? 'HIGH' : final >= 50 ? 'MODERATE' : 'LOW';
+  return { base_score: baseScore, signal_mod: context.signal_mod, final_score: final, conviction, alarm: final >= 50, context_label: context.label };
+}
 const SPD = {
   INSIG_PCT_THRESHOLD: 0.05,
   INSIG_RANGE_ATR_MULT: 0.30,
@@ -1376,10 +1476,13 @@ if (typeof module !== 'undefined' && module.exports) {
     computeRSIEngine, checkRTTouch, checkCounterSwingVeto, scoreSignal,
     Tier2Monitor, computeBrokenSR, buildRationale, Tier3Tracker,
     barMove, bodyPct, isDoji, computeRetrace,
+    computeContext, applyContext,
   };
 }
 // ═══════════════════════════════════════════════════════════════════════════
 // END NEW ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1466,14 +1569,10 @@ async function runTier1v7() {
       // Compute broken_sr with Fix 1
       const brokenSR = computeBrokenSR(srLevels, qp);
 
-      // Context score (simple version — daily trend from EMA)
-      let contextScore = 0;
-      if (candles.length > 20) {
-        const ema = candles[candles.length-1].ema || candles[candles.length-1].c;
-        const price = candles[candles.length-1].c;
-        if (price > ema * 1.01) contextScore = 10;
-        else if (price < ema * 0.99) contextScore = -10;
-      }
+      // Context score (proper port of context_engine.py)
+      const curBarIdx = candles.length - 1;
+      const ctx = computeContext(candles, curBarIdx, today, qp.dir);
+      const contextScore = ctx.score;
 
       // Add to watchlist
       const lastBarT = todayBars[todayBars.length-1].t;
@@ -1583,6 +1682,21 @@ async function runTier2v7() {
             delete STATE.watchlist[symbol];
             break;
           }
+          // Apply context modifier — get final_score and alarm flag
+          const curIdx = candles.findIndex(c => c.t === bar.t);
+          const ctxAtSig = computeContext(candles, curIdx >= 0 ? curIdx : candles.length-1, today, sig.dir);
+          const finalRes = applyContext(sig.score, ctxAtSig);
+          sig.final_score = finalRes.final_score;
+          sig.alarm = finalRes.alarm;
+          sig.conviction = finalRes.conviction;
+          sig.context = ctxAtSig;
+          // Only push if alarm passes (matches Python alarm filter)
+          if (!sig.alarm) {
+            console.log(`[T2v7] ${symbol} ${sig.type} score=${sig.score} final=${finalRes.final_score} below alarm threshold — skipped`);
+            STATE.blocked_pushes.add(entry.push_id);
+            delete STATE.watchlist[symbol];
+            break;
+          }
           const alert = {
             alert_id: `${symbol}_${entry.push_id}_${Date.now()}`,
             symbol,
@@ -1592,28 +1706,31 @@ async function runTier2v7() {
             fired_at: new Date().toISOString(),
             bar_time: bar.t,
             atr: liveAtr,
-            status: 'pending',  // awaiting user click
+            status: 'pending',
           };
           STATE.alerts.push(alert);
           STATE.blocked_pushes.add(entry.push_id);
-          console.log(`[T2v7 ALERT] ${symbol} ${sig.type} ${sig.dir} score=${sig.score} entry=${sig.entry_price} stop=${sig.stop_price} target=${sig.target_price}`);
+          console.log(`[T2v7 ALERT] ${symbol} ${sig.type} ${sig.dir} score=${sig.score}→${finalRes.final_score} entry=${sig.entry_price} stop=${sig.stop_price} target=${sig.target_price}`);
           delete STATE.watchlist[symbol];
           break;
         } else if (result.action === 'CANCEL') {
           // Check counter trade
           const veto = checkCounterSwingVeto(entry.push, bar, entry.monitor.atr, entry.day_bars);
           if (veto) {
-            // Build counter signal (simplified — opposite direction, similar structure)
             const isUp = !entry.push.is_up;
             const entry_price = bar.c;
             const swingLook = entry.day_bars.slice(-6);
             const stopExt = isUp ? Math.min(...swingLook.map(b => b.l)) : Math.max(...swingLook.map(b => b.h));
             const stop = isUp ? stopExt - entry.monitor.atr * 0.5 : stopExt + entry.monitor.atr * 0.5;
             const target = isUp ? entry_price + Math.abs(entry_price - stop) * 1.5 : entry_price - Math.abs(entry_price - stop) * 1.5;
+            // Compute proper score using scoreSignal on the counter direction
+            const counterPush = { ...entry.push, is_up: isUp, dir: isUp ? 'up' : 'down' };
+            const [counterScore, counterBreakdown] = scoreSignal(counterPush, 0.5, 0, bar, entry.sr_levels, liveEma, entry.context_score, entry.monitor.atr, 'COUNTER', liveRsi);
             const counterSig = {
               type: 'COUNTER',
               dir: isUp ? 'up' : 'down',
-              score: 60,
+              score: counterScore,
+              breakdown: counterBreakdown,
               entry_price: +entry_price.toFixed(2),
               stop_price: +stop.toFixed(2),
               target_price: +target.toFixed(2),
@@ -1622,13 +1739,26 @@ async function runTier2v7() {
               bar_time: bar.t,
               push_id: entry.push_id + '_C',
               rt_level: null,
-              breakdown: { counter: 1 },
               retrace_pct: null,
             };
+            // Apply alarm filter using context
+            const curIdx = candles.findIndex(c => c.t === bar.t);
+            const ctxAtCounter = computeContext(candles, curIdx >= 0 ? curIdx : candles.length-1, today, counterSig.dir);
+            const finalRes = applyContext(counterSig.score, ctxAtCounter);
+            counterSig.final_score = finalRes.final_score;
+            counterSig.alarm = finalRes.alarm;
+            counterSig.conviction = finalRes.conviction;
+            counterSig.context = ctxAtCounter;
+            if (!counterSig.alarm) {
+              console.log(`[T2v7] ${symbol} COUNTER score=${counterScore} final=${finalRes.final_score} below alarm — skipped`);
+              STATE.blocked_pushes.add(entry.push_id);
+              delete STATE.watchlist[symbol];
+              break;
+            }
             const alert = {
               alert_id: `${symbol}_${entry.push_id}_C_${Date.now()}`,
               symbol, ...counterSig,
-              rationale: `Counter trade: original push direction ${entry.push.dir} reversed >80%. Trading against the original push direction. Entry ₹${counterSig.entry_price} → Target ₹${counterSig.target_price} (R:R 1.5)`,
+              rationale: `Counter trade: original ${entry.push.dir.toUpperCase()} push reversed >80%. Trading against original direction. Entry ₹${counterSig.entry_price} → Target ₹${counterSig.target_price} (R:R 1.5). Score ${counterScore}→${finalRes.final_score}.`,
               push: entry.push,
               fired_at: new Date().toISOString(),
               bar_time: bar.t,
@@ -1636,7 +1766,7 @@ async function runTier2v7() {
               status: 'pending',
             };
             STATE.alerts.push(alert);
-            console.log(`[T2v7 COUNTER] ${symbol} score=60 entry=${counterSig.entry_price}`);
+            console.log(`[T2v7 COUNTER] ${symbol} score=${counterScore}→${finalRes.final_score} entry=${counterSig.entry_price}`);
           }
           STATE.blocked_pushes.add(entry.push_id);
           delete STATE.watchlist[symbol];
@@ -1728,18 +1858,20 @@ app.get('/v8/watchlist', (req, res) => {
 });
 
 app.post('/v8/track', (req, res) => {
-  const { alert_id, fill_price, fill_time } = req.body || {};
+  const { alert_id, fill_price, fill_time, shares } = req.body || {};
   if (!alert_id || !fill_price) return res.status(400).json({ error: 'alert_id and fill_price required' });
   const alert = STATE.alerts.find(a => a.alert_id === alert_id);
   if (!alert) return res.status(404).json({ error: 'alert not found' });
   alert.status = 'taken';
-  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString());
+  const nShares = shares ? +shares : 1;
+  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString(), nShares);
   STATE.live_trades[alert_id] = {
     alert, fill_price: +fill_price, fill_time: fill_time || new Date().toISOString(),
+    shares: nShares,
     tracker, last_bar_t: null, closed: false, last_status: { status: 'open' },
   };
-  console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price}`);
-  res.json({ ok: true, alert_id, fill_price, fill_time });
+  console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price} shares=${nShares}`);
+  res.json({ ok: true, alert_id, fill_price, fill_time, shares: nShares });
 });
 
 app.post('/v8/dismiss', (req, res) => {
@@ -1757,6 +1889,7 @@ app.get('/v8/live-trades', (req, res) => {
     dir: t.alert.dir,
     fill_price: t.fill_price,
     fill_time: t.fill_time,
+    shares: t.shares || 1,
     entry_price: t.alert.entry_price,
     stop_price: t.alert.stop_price,
     target_price: t.alert.target_price,

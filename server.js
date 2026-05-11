@@ -79,7 +79,7 @@ async function fetchInstrumentTokens() {
     // Trigger a fresh Tier 1 scan now that we have tokens
     if (isMarketHours()) {
       console.log('[Kite] Triggering Tier 1 scan with fresh tokens...');
-      runTier1().catch(e => console.error('[Tier1 post-login] Error:', e.message));
+      runTier1v7().catch(e => console.error('[Tier1 post-login] Error:', e.message));
     }
   } catch(e) {
     console.error('[Kite] Failed to fetch instruments:', e.response?.data?.message || e.message);
@@ -1584,6 +1584,7 @@ const STATE = {
   alerts: [],         // open alerts NOT yet taken
   live_trades: {},    // alert_id -> { alert, fill_price, fill_time, tracker, last_bar_t }
   history: [],        // closed live trades
+  audit_log: [],      // ALL alerts ever fired today (permanent record, never deleted)
   blocked_pushes: new Set(),  // push_ids that already fired (don't refire same)
   tier1_running: false,
   tier1_progress: { scanned: 0, total: 0, status: 'idle' },
@@ -1592,6 +1593,167 @@ const STATE = {
   tier2_at: null,
   tier3_at: null,
 };
+
+// ── STATE PERSISTENCE ──────────────────────────────────────────────────
+// Snapshot to /tmp/state.json (Railway preserves /tmp across deploys
+// as long as container isn't fully replaced; for cold restarts, state is lost).
+// For more durable storage, would need Postgres — deferred per project notes.
+
+const fs = require('fs');
+const STATE_FILE = '/tmp/signal_state.json';
+let saveStateTimer = null;
+let lastSaveAt = 0;
+
+function snapshotState() {
+  // Watchlist: drop monitor (will rebuild from day_bars + counter_indices)
+  const watchlistOut = {};
+  for (const [sym, w] of Object.entries(STATE.watchlist)) {
+    watchlistOut[sym] = {
+      push: w.push, push_id: w.push_id,
+      sr_levels: w.sr_levels, broken_sr: w.broken_sr,
+      context_score: w.context_score,
+      day_bars: w.day_bars,
+      atr: w.atr,
+      counter_indices: w.counter_indices || [],
+      push_end_idx: w.push_end_idx,
+      last_bar_t: w.last_bar_t,
+      added_at: w.added_at,
+      // monitor omitted — rebuilt on next Tier 2 cycle
+    };
+  }
+  // Live trades: serialize tracker state
+  const liveTradesOut = {};
+  for (const [id, t] of Object.entries(STATE.live_trades)) {
+    liveTradesOut[id] = {
+      alert: t.alert,
+      fill_price: t.fill_price,
+      fill_time: t.fill_time,
+      shares: t.shares,
+      closed: t.closed,
+      last_bar_t: t.last_bar_t,
+      last_status: t.last_status,
+      // Serialize tracker internal state for reconstruction
+      tracker_state: t.tracker ? {
+        bars_since_fill: t.tracker.bars_since_fill,
+        mfe: t.tracker.mfe,
+        mae: t.tracker.mae,
+        exit_override: t.tracker.exit_override,
+        outcome: t.tracker.outcome,
+        exit_reason: t.tracker.exit_reason,
+        exit_price: t.tracker.exit_price,
+        exit_time: t.tracker.exit_time,
+        last_price: t.tracker.last_price,
+      } : null,
+    };
+  }
+  return {
+    version: 1,
+    saved_at: new Date().toISOString(),
+    watchlist: watchlistOut,
+    alerts: STATE.alerts,
+    live_trades: liveTradesOut,
+    history: STATE.history,
+    audit_log: STATE.audit_log,
+    blocked_pushes: Array.from(STATE.blocked_pushes),
+    tier1_at: STATE.tier1_at,
+    tier2_at: STATE.tier2_at,
+    tier3_at: STATE.tier3_at,
+  };
+}
+
+function saveStateNow() {
+  try {
+    const snap = snapshotState();
+    fs.writeFileSync(STATE_FILE, JSON.stringify(snap));
+    lastSaveAt = Date.now();
+  } catch (e) {
+    console.warn('[STATE] save error:', e.message);
+  }
+}
+
+// Debounced save: schedules a save 2s after the last call (so multiple rapid
+// mutations within a Tier 2 cycle coalesce into one disk write).
+function saveStateDebounced() {
+  if (saveStateTimer) clearTimeout(saveStateTimer);
+  saveStateTimer = setTimeout(saveStateNow, 2000);
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      console.log('[STATE] no snapshot found — starting fresh');
+      return false;
+    }
+    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const snap = JSON.parse(raw);
+    if (snap.version !== 1) {
+      console.warn(`[STATE] snapshot version mismatch (${snap.version}), ignoring`);
+      return false;
+    }
+    // Check freshness — if older than 24h, probably stale (new trading day)
+    const savedAt = new Date(snap.saved_at).getTime();
+    const ageHr = (Date.now() - savedAt) / 3600000;
+    if (ageHr > 24) {
+      console.log(`[STATE] snapshot is ${ageHr.toFixed(1)}h old — too stale, starting fresh`);
+      return false;
+    }
+    // Check trading day — only restore if same calendar day in IST
+    const savedDay = new Date(savedAt + 5.5 * 3600000).toISOString().slice(0, 10);
+    const nowDay = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+    if (savedDay !== nowDay) {
+      console.log(`[STATE] snapshot is from ${savedDay}, today is ${nowDay} — starting fresh`);
+      return false;
+    }
+
+    // Restore watchlist (monitor will be reconstructed on next Tier 2)
+    STATE.watchlist = snap.watchlist || {};
+    STATE.alerts = snap.alerts || [];
+    STATE.history = snap.history || [];
+    STATE.audit_log = snap.audit_log || [];
+    STATE.blocked_pushes = new Set(snap.blocked_pushes || []);
+    STATE.tier1_at = snap.tier1_at;
+    STATE.tier2_at = snap.tier2_at;
+    STATE.tier3_at = snap.tier3_at;
+
+    // Live trades — reconstruct trackers from saved state
+    STATE.live_trades = {};
+    for (const [id, t] of Object.entries(snap.live_trades || {})) {
+      const tracker = new Tier3Tracker(t.alert, t.fill_price, t.fill_time, t.shares || 1);
+      if (t.tracker_state) {
+        tracker.bars_since_fill = t.tracker_state.bars_since_fill || 0;
+        tracker.mfe = t.tracker_state.mfe || 0;
+        tracker.mae = t.tracker_state.mae || 0;
+        tracker.exit_override = t.tracker_state.exit_override || false;
+        tracker.outcome = t.tracker_state.outcome;
+        tracker.exit_reason = t.tracker_state.exit_reason;
+        tracker.exit_price = t.tracker_state.exit_price;
+        tracker.exit_time = t.tracker_state.exit_time;
+        tracker.last_price = t.tracker_state.last_price || t.fill_price;
+      }
+      STATE.live_trades[id] = {
+        alert: t.alert,
+        fill_price: t.fill_price,
+        fill_time: t.fill_time,
+        shares: t.shares || 1,
+        tracker,
+        last_bar_t: t.last_bar_t,
+        closed: t.closed || false,
+        last_status: t.last_status || { status: 'open' },
+      };
+    }
+    console.log(`[STATE] restored from ${snap.saved_at}: ${Object.keys(STATE.watchlist).length} watchlist, ${STATE.alerts.length} alerts, ${Object.keys(STATE.live_trades).length} live trades, ${STATE.history.length} history`);
+    return true;
+  } catch (e) {
+    console.warn('[STATE] load error:', e.message);
+    return false;
+  }
+}
+
+// Load on startup
+loadState();
+
+// Periodic save every 60s as backup (in case debounced saves miss something)
+setInterval(saveStateNow, 60000);
 
 // ── STOCK UNIVERSE (use NSE_UNIVERSE constant from existing server.js) ──
 // NSE_UNIVERSE is already defined in server.js around line ~200
@@ -1645,9 +1807,10 @@ async function runTier1v7() {
       const pushId = qp.push_id;
       if (STATE.blocked_pushes.has(pushId)) { await sleep(80); continue; }
 
-      // Check push is recent (within last few bars)
+      // Check push is recent (within last 2 bars / 10 min)
+      // Was: PUSH_EXPIRY_BARS + 2 = 4 bars / 20 min (too loose)
       const barsSincePush = todayBars.length - 1 - qp.end_idx;
-      if (barsSincePush > ENG.PUSH_EXPIRY_BARS + 2) { await sleep(80); continue; }
+      if (barsSincePush > ENG.PUSH_EXPIRY_BARS) { await sleep(80); continue; }
 
       // Compute SR (using historical bars for context)
       const srRes = computeSR(candles);
@@ -1691,6 +1854,7 @@ async function runTier1v7() {
   STATE.tier1_at = new Date().toISOString();
   const watchCount = Object.keys(STATE.watchlist).length;
   console.log(`[T1v7 ${new Date().toISOString()}] Done — ${watchCount} stocks on watchlist`);
+  saveStateDebounced();
 }
 
 // ── TIER 2: every 5 min, run monitor on each watchlist stock ───────────
@@ -1719,6 +1883,31 @@ async function runTier2v7() {
 
       if (newBars.length === 0) continue;
 
+      // STALENESS CHECK — if the push end is too old by clock time, drop it.
+      // This prevents alerts firing 30+ min after the push ended, even if
+      // monitor state was lost (e.g. server restart) and bar_count would
+      // otherwise allow more processing.
+      // MAX_PUSH_AGE_MIN = 40 (8 bars × 5 min — matches engine's MAX_BARS spirit)
+      const MAX_PUSH_AGE_MIN = 40;
+      const pushEndBar = todayBars.find(b => b.t.slice(11, 16) === entry.push.end_time);
+      if (pushEndBar) {
+        const lastBarT = newBars[newBars.length - 1].t;
+        const ageMin = (new Date(lastBarT) - new Date(pushEndBar.t)) / 60000;
+        if (ageMin > MAX_PUSH_AGE_MIN) {
+          console.log(`[T2v7] ${symbol} push too stale (${Math.round(ageMin)} min since push end ${entry.push.end_time}) — dropping`);
+          STATE.audit_log.push({
+            event: 'SKIPPED', reason: 'push_stale_clock_time',
+            symbol, push_id: entry.push_id,
+            push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+            push_age_min: Math.round(ageMin),
+            bar_time: lastBarT, fired_at: new Date().toISOString(),
+          });
+          STATE.blocked_pushes.add(entry.push_id);
+          delete STATE.watchlist[symbol];
+          continue;
+        }
+      }
+
       // 14:30 cutoff — no new alerts after this time
       const lastBarTime = newBars[newBars.length-1].t.slice(11, 16);
       if (lastBarTime >= '14:30') {
@@ -1729,6 +1918,26 @@ async function runTier2v7() {
 
       // Initialize monitor if not yet
       if (!entry.monitor) {
+        // If we already processed bars beyond prefill (last_bar_t > last counter index),
+        // monitor state was lost (probably server restart). Don't rebuild — drop entry.
+        // Bringing back a fresh monitor would reset bar_count and falsely extend the
+        // 12-bar window, causing stale alerts.
+        const lastCi = (entry.counter_indices && entry.counter_indices.length)
+          ? entry.counter_indices[entry.counter_indices.length - 1] : -1;
+        const lastCiBarT = (lastCi >= 0 && lastCi < todayBars.length) ? todayBars[lastCi].t : null;
+        if (entry.last_bar_t && lastCiBarT && entry.last_bar_t > lastCiBarT) {
+          console.log(`[T2v7] ${symbol} monitor state lost (last_bar_t ${entry.last_bar_t.slice(11,16)} > prefill end ${lastCiBarT.slice(11,16)}) — dropping to avoid stale alert`);
+          STATE.audit_log.push({
+            event: 'SKIPPED', reason: 'monitor_state_lost',
+            symbol, push_id: entry.push_id,
+            push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+            last_bar_processed: entry.last_bar_t,
+            bar_time: entry.last_bar_t, fired_at: new Date().toISOString(),
+          });
+          STATE.blocked_pushes.add(entry.push_id);
+          delete STATE.watchlist[symbol];
+          continue;
+        }
         entry.monitor = new Tier2Monitor(
           entry.push, entry.sr_levels, entry.broken_sr,
           entry.context_score, todayBars[0].o, []
@@ -1743,8 +1952,8 @@ async function runTier2v7() {
         }
         // Mark last_bar_t to the last counter index we prefed
         if (entry.counter_indices && entry.counter_indices.length) {
-          const lastCi = entry.counter_indices[entry.counter_indices.length-1];
-          if (lastCi < todayBars.length) entry.last_bar_t = todayBars[lastCi].t;
+          const lastCi2 = entry.counter_indices[entry.counter_indices.length-1];
+          if (lastCi2 < todayBars.length) entry.last_bar_t = todayBars[lastCi2].t;
         }
       }
 
@@ -1780,6 +1989,13 @@ async function runTier2v7() {
           // Only push if alarm passes (matches Python alarm filter)
           if (!sig.alarm) {
             console.log(`[T2v7] ${symbol} ${sig.type} score=${sig.score} final=${finalRes.final_score} below alarm threshold — skipped`);
+            STATE.audit_log.push({
+              event: 'SKIPPED', reason: 'below_alarm_threshold',
+              symbol, type: sig.type, dir: sig.dir,
+              score: sig.score, final_score: finalRes.final_score,
+              push_id: entry.push_id, push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+              bar_time: bar.t, fired_at: new Date().toISOString(),
+            });
             STATE.blocked_pushes.add(entry.push_id);
             delete STATE.watchlist[symbol];
             break;
@@ -1796,6 +2012,17 @@ async function runTier2v7() {
             status: 'pending',
           };
           STATE.alerts.push(alert);
+          STATE.audit_log.push({
+            event: 'FIRED', alert_id: alert.alert_id,
+            symbol, type: sig.type, dir: sig.dir,
+            score: sig.score, final_score: sig.final_score, conviction: sig.conviction,
+            entry_price: sig.entry_price, stop_price: sig.stop_price, target_price: sig.target_price,
+            rr: sig.rr,
+            push_id: entry.push_id, push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+            push_extreme: entry.push.extreme, push_move: entry.push.net_move,
+            bar_time: bar.t, fired_at: alert.fired_at,
+            broken_sr_count: (entry.broken_sr || []).length,
+          });
           STATE.blocked_pushes.add(entry.push_id);
           console.log(`[T2v7 ALERT] ${symbol} ${sig.type} ${sig.dir} score=${sig.score}→${finalRes.final_score} entry=${sig.entry_price} stop=${sig.stop_price} target=${sig.target_price}`);
           delete STATE.watchlist[symbol];
@@ -1838,6 +2065,13 @@ async function runTier2v7() {
             counterSig.context = ctxAtCounter;
             if (!counterSig.alarm) {
               console.log(`[T2v7] ${symbol} COUNTER score=${counterScore} final=${finalRes.final_score} below alarm — skipped`);
+              STATE.audit_log.push({
+                event: 'SKIPPED', reason: 'counter_below_alarm',
+                symbol, type: 'COUNTER', dir: counterSig.dir,
+                score: counterScore, final_score: finalRes.final_score,
+                push_id: entry.push_id, push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+                bar_time: bar.t, fired_at: new Date().toISOString(),
+              });
               STATE.blocked_pushes.add(entry.push_id);
               delete STATE.watchlist[symbol];
               break;
@@ -1853,6 +2087,18 @@ async function runTier2v7() {
               status: 'pending',
             };
             STATE.alerts.push(alert);
+            STATE.audit_log.push({
+              event: 'FIRED', alert_id: alert.alert_id,
+              symbol, type: 'COUNTER', dir: counterSig.dir,
+              score: counterScore, final_score: counterSig.final_score, conviction: counterSig.conviction,
+              entry_price: counterSig.entry_price, stop_price: counterSig.stop_price, target_price: counterSig.target_price,
+              rr: counterSig.rr,
+              push_id: entry.push_id, push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+              push_extreme: entry.push.extreme, push_move: entry.push.net_move,
+              bar_time: bar.t, fired_at: alert.fired_at,
+              broken_sr_count: (entry.broken_sr || []).length,
+              note: 'Counter trade — original push reversed >80%',
+            });
             console.log(`[T2v7 COUNTER] ${symbol} score=${counterScore}→${finalRes.final_score} entry=${counterSig.entry_price}`);
           }
           STATE.blocked_pushes.add(entry.push_id);
@@ -1874,6 +2120,7 @@ async function runTier2v7() {
 
   STATE.tier2_running = false;
   STATE.tier2_at = new Date().toISOString();
+  saveStateDebounced();
 }
 
 // ── TIER 3: every 1 min when there are live trades, track each ─────────
@@ -1913,6 +2160,7 @@ async function runTier3v7() {
     }
   }
   STATE.tier3_at = new Date().toISOString();
+  saveStateDebounced();
 }
 
 // ── SCHEDULERS ────────────────────────────────────────────────────────
@@ -1958,6 +2206,7 @@ app.post('/v8/track', (req, res) => {
     tracker, last_bar_t: null, closed: false, last_status: { status: 'open' },
   };
   console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price} shares=${nShares}`);
+  saveStateNow();
   res.json({ ok: true, alert_id, fill_price, fill_time, shares: nShares });
 });
 
@@ -1965,6 +2214,7 @@ app.post('/v8/dismiss', (req, res) => {
   const { alert_id } = req.body || {};
   if (!alert_id) return res.status(400).json({ error: 'alert_id required' });
   STATE.alerts = STATE.alerts.filter(a => a.alert_id !== alert_id);
+  saveStateNow();
   res.json({ ok: true });
 });
 
@@ -1990,6 +2240,30 @@ app.get('/v8/history', (req, res) => {
   res.json({ history: STATE.history });
 });
 
+// AUDIT LOG — every alert that ever fired or got skipped today (permanent, never deleted)
+app.get('/v8/audit', (req, res) => {
+  const filter = req.query.event;     // optional: 'FIRED' or 'SKIPPED'
+  const symbol = req.query.symbol;    // optional: filter by stock
+  const type = req.query.type;        // optional: 'H1' | 'RT+H1' | 'B' | 'COUNTER'
+  let log = [...STATE.audit_log];
+  if (filter) log = log.filter(e => e.event === filter);
+  if (symbol) log = log.filter(e => e.symbol === symbol.toUpperCase());
+  if (type) log = log.filter(e => e.type === type);
+  // Summary stats
+  const fired = STATE.audit_log.filter(e => e.event === 'FIRED');
+  const skipped = STATE.audit_log.filter(e => e.event === 'SKIPPED');
+  const byType = {};
+  fired.forEach(e => byType[e.type] = (byType[e.type] || 0) + 1);
+  res.json({
+    summary: {
+      total_fired: fired.length,
+      total_skipped: skipped.length,
+      by_type: byType,
+    },
+    log,
+  });
+});
+
 app.get('/v8/status', (req, res) => {
   res.json({
     market_open: isMarketHours(),
@@ -2002,6 +2276,88 @@ app.get('/v8/status', (req, res) => {
     live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
     blocked_pushes: STATE.blocked_pushes.size,
   });
+});
+
+// ── DIAGNOSTIC ENDPOINT — replay engine on a stock to debug recommendations
+app.get('/v8/diagnose/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  try {
+    const candles = await fetchCandles(symbol);
+    if (!candles || candles.length < 50) return res.status(404).json({ error: 'not enough bar data', symbol });
+    const today = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+    const dayBars = candles.filter(b => b.t.slice(0, 10) === today);
+    const filtered = dayBars.filter(b => b.t.slice(11, 16) >= '09:45');
+    if (filtered.length < 6) return res.json({ symbol, message: 'insufficient today bars yet', today_bars: filtered.length });
+
+    // Run streaming detector on today's bars
+    const priorBars = candles.filter(b => b.t.slice(0, 10) !== today);
+    const atr = priorBars.length > 14 ? computeATR(priorBars.slice(-75)) : computeATR(candles);
+    const detector = new StreamingPushDetector(atr, ENG.MIN_BARS);
+    const events = [];
+    for (const bar of filtered) {
+      const ev = detector.processBar(bar);
+      if (ev) {
+        const qp = eventToQualifyingPush(ev, atr, ENG.MIN_ATR_MULT, ENG.MIN_SLOPE_PCT, ENG.MIN_BARS);
+        events.push({
+          detected_at: filtered[ev.detected_at_idx].t.slice(11, 16),
+          start_time: filtered[ev.start_idx].t.slice(11, 16),
+          end_time: filtered[ev.end_idx].t.slice(11, 16),
+          dir: ev.dir, bars: ev.bars,
+          counter_indices: ev.counter_indices,
+          qualifies: !!qp,
+          qp: qp ? {
+            push_id: qp.push_id, start_price: qp.start_price, end_price: qp.end_price,
+            extreme: qp.extreme, net_move: qp.net_move, slope_mid: qp.slope_mid,
+            move_atr_ratio: +(qp.net_move / atr).toFixed(2), strength: qp.strength,
+          } : null,
+        });
+      }
+    }
+
+    // Watchlist + alerts status
+    const inWatchlist = STATE.watchlist[symbol] || null;
+    const stockAlerts = STATE.alerts.filter(a => a.symbol === symbol);
+    const stockLive = Object.values(STATE.live_trades).filter(t => t.alert && t.alert.symbol === symbol);
+
+    res.json({
+      symbol, today, atr: +atr.toFixed(2),
+      today_bars: filtered.length,
+      detected_events: events,
+      in_watchlist: inWatchlist ? {
+        push_id: inWatchlist.push_id,
+        push_dir: inWatchlist.push.dir,
+        push_time: `${inWatchlist.push.start_time}→${inWatchlist.push.end_time}`,
+        context_score: inWatchlist.context_score,
+        added_at: inWatchlist.added_at,
+        has_monitor: !!inWatchlist.monitor,
+        monitor_state: inWatchlist.monitor ? {
+          bar_count: inWatchlist.monitor.bar_count,
+          counter_count: inWatchlist.monitor.counter_count,
+          max_retrace: inWatchlist.monitor.max_retrace,
+          h1_complete: inWatchlist.monitor.h1_complete,
+          leg_bars: inWatchlist.monitor.leg_bars,
+          state: inWatchlist.monitor.state,
+        } : null,
+      } : null,
+      alerts: stockAlerts.map(a => ({
+        alert_id: a.alert_id, type: a.type, dir: a.dir, score: a.score, final_score: a.final_score,
+        entry_price: a.entry_price, stop_price: a.stop_price, target_price: a.target_price,
+        push_time: `${a.push_start}→${a.push_end}`, fired_at: a.fired_at, status: a.status,
+      })),
+      live_trades: stockLive.map(t => ({
+        fill_price: t.fill_price, shares: t.shares,
+        status: t.last_status, closed: t.closed,
+      })),
+      last_5_bars: filtered.slice(-5).map(b => ({
+        time: b.t.slice(11, 16),
+        o: b.o, h: b.h, l: b.l, c: b.c, v: b.v,
+        body_pct: +(Math.abs(b.c - b.o) / Math.max(b.h - b.l, 0.01)).toFixed(2),
+      })),
+    });
+  } catch (e) {
+    console.warn(`[diagnose] ${symbol}:`, e.message);
+    res.status(500).json({ error: e.message, symbol });
+  }
 });
 
 // Manual trigger for testing
@@ -2019,7 +2375,9 @@ app.post('/v8/reset-day', (req, res) => {
   STATE.blocked_pushes.clear();
   STATE.alerts = [];
   STATE.watchlist = {};
+  STATE.audit_log = [];      // fresh audit each trading day
   // Keep live_trades and history
+  saveStateNow();
   res.json({ ok: true });
 });
 
@@ -2030,9 +2388,11 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v7.0 — new Tier2Monitor + 5 rules + Fix 1',
+  engine: 'v7.2 — Tier2Monitor + context + persistence',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
+  state_persisted: fs.existsSync(STATE_FILE),
+  state_last_save: lastSaveAt ? new Date(lastSaveAt).toISOString() : null,
 }));
 
 app.get('/', (req, res) => res.json({

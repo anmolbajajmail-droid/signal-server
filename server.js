@@ -1614,6 +1614,7 @@ function snapshotState() {
       push_end_idx: w.push_end_idx,
       last_bar_t: w.last_bar_t,
       added_at: w.added_at,
+      monitor_was_created: w.monitor_was_created || false,   // for restart-detection guard
       // monitor omitted — rebuilt on next Tier 2 cycle
     };
   }
@@ -1914,14 +1915,15 @@ async function runTier2v7() {
 
       // Initialize monitor if not yet
       if (!entry.monitor) {
-        // If we already processed bars beyond prefill (last_bar_t > last counter index),
-        // monitor state was lost (probably server restart). Don't rebuild — drop entry.
-        // Bringing back a fresh monitor would reset bar_count and falsely extend the
-        // 12-bar window, causing stale alerts.
+        // If we already processed bars beyond prefill in a PRIOR session
+        // (entry.monitor_was_created flag set, but monitor is null now),
+        // monitor state was lost (probably server restart). Drop entry to
+        // avoid resetting the bar_count timer.
+        // First-time Tier 2 (monitor never existed) does NOT trigger this.
         const lastCi = (entry.counter_indices && entry.counter_indices.length)
           ? entry.counter_indices[entry.counter_indices.length - 1] : -1;
         const lastCiBarT = (lastCi >= 0 && lastCi < todayBars.length) ? todayBars[lastCi].t : null;
-        if (entry.last_bar_t && lastCiBarT && entry.last_bar_t > lastCiBarT) {
+        if (entry.monitor_was_created && entry.last_bar_t && lastCiBarT && entry.last_bar_t > lastCiBarT) {
           console.log(`[T2v7] ${symbol} monitor state lost (last_bar_t ${entry.last_bar_t.slice(11,16)} > prefill end ${lastCiBarT.slice(11,16)}) — dropping to avoid stale alert`);
           STATE.audit_log.push({
             event: 'SKIPPED', reason: 'monitor_state_lost',
@@ -1938,6 +1940,7 @@ async function runTier2v7() {
           entry.push, entry.sr_levels, entry.broken_sr,
           entry.context_score, todayBars[0].o, []
         );
+        entry.monitor_was_created = true;   // mark for restart-detection
         // Prefill counter bars from push event
         if (entry.counter_indices) {
           for (const cidx of entry.counter_indices) {

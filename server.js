@@ -1884,8 +1884,10 @@ async function runTier2v7() {
       // This prevents alerts firing 30+ min after the push ended, even if
       // monitor state was lost (e.g. server restart) and bar_count would
       // otherwise allow more processing.
-      // MAX_PUSH_AGE_MIN = 40 (8 bars × 5 min — matches engine's MAX_BARS spirit)
-      const MAX_PUSH_AGE_MIN = 40;
+      // MAX_PUSH_AGE_MIN = 65 — validated against parity test on May 8
+      // (40 min killed 5 valid B/H2 setups; 65 min catches LALPATHLAB-style
+      // 75-min stale bugs while preserving all legitimate setups)
+      const MAX_PUSH_AGE_MIN = 65;
       const pushEndBar = todayBars.find(b => b.t.slice(11, 16) === entry.push.end_time);
       if (pushEndBar) {
         const lastBarT = newBars[newBars.length - 1].t;

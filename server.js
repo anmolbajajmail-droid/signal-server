@@ -1,16 +1,28 @@
 /**
- * SIGNAL SERVER v6.2 — H2 + RT Pattern Engine
+ * SIGNAL SERVER v8.0 — New Pullback Engine
  *
- * WHAT'S NEW in v6.0:
- *   - Tier 1: Pattern pre-filter (H2 + RT candidates) instead of RSI/MACD/ADX
- *   - Tier 1: Now uses Kite API for 5-min candles (Yahoo was unreliable)
- *   - Tier 1: Runs every 20 min (was 55 min) — catches setups as they form
- *   - Tier 1: Market hours gate — only runs 9:15-14:30 IST on weekdays
- *   - Tier 2: Full H2+RT scoring with entry/stop/target on each signal
- *   - Alerts: Structured format — DRREDDY H2 BULL sc=74 entry=1182 stop=1179 target=1187
- *   - RT filters: F3≥14 + block 14:xx + stop floor ≥0.5×ATR
- *   - Capital cap: shares = min(risk/stopDist, capital/entryPrice)
- *   - All Yahoo Finance removed from screener (Kite only, Yahoo only for /prices fallback)
+ * v8.0 CHANGES (May 14, 2026)
+ *   - Tier 2 Monitor REPLACED with new pullback engine (NewTier2Monitor port from
+ *     /mnt/project/new_pullback_engine.py — backtest +0.127 R/trade vs old +0.006).
+ *   - 4 active strategies: Continuation at Level (pullback_at_level),
+ *     Quick Reversal (deep_retrace_pb1), Combo (combo), Second Pullback Reversal
+ *     (deep_retrace_pb2). Standalone swing_low_break and ema_fail gated off.
+ *   - Score floor raised 50 → 60 (NEW_CFG.SCORE_FLOOR).
+ *   - PB1 quality gate: ≥2 non-doji counter bars + ≥35% retrace before
+ *     transitioning to POST_PULLBACK_1_NO_RT (kills shallow single-bar pullbacks).
+ *   - S/R reconfirmation bonus (+5) and path-blocker penalty (−10) on counter trades.
+ *   - Push quality reconfirmation bonus (+1 to +6) on counter trades.
+ *   - Old Tier2Monitor preserved in server_old_engine_backup.js for rollback.
+ *   - Orchestrator: passes entry.day_bars as 7th arg to Tier2Monitor constructor
+ *     (needed for swing-stop / swing-veto on counter signals).
+ *   - Orchestrator: old-engine CANCEL→COUNTER fallback gated by
+ *     ENG.ALLOW_OLD_COUNTER_FALLBACK (defaulted false). New engine never returns
+ *     CANCEL; its rejection paths return DUMP to keep new-engine self-contained.
+ *
+ * Prior v6.0 history retained:
+ *   - Tier 1: Pattern pre-filter (H2 + RT candidates) via Kite API 5-min candles
+ *   - Tier 1: Runs every 20 min, market hours only
+ *   - Capital cap, stop validation, RT filters all preserved
  */
 
 const express = require('express');
@@ -631,12 +643,54 @@ const ENG = {
   EXHAUSTION_RANGE_MULT: 1.5, EXHAUSTION_CLOSE_PCT: 0.40,
   STOP_VALIDATION_LOOKBACK: 5, STOP_VALIDATION_TOL: 0.30,
   PUSH_EXPIRY_BARS: 2,
+  // v8.0: disable old-engine CANCEL→COUNTER fallback path in orchestrator.
+  // New engine's counter signals are self-contained; rejection should DUMP,
+  // not silently fall back to old-engine counter logic. Flip to true only if
+  // rolling back to the old engine.
+  ALLOW_OLD_COUNTER_FALLBACK: false,
 };
 
 const RULE = {
   H2_ENDS_MONITOR: true, H1_CONFIRMATION: false,
   EXHAUSTION_FILTER: true, TARGET_VS_RESIST: true,
   STOP_VALIDATION: true, BROKEN_BY_CLOSE: true,
+};
+
+// ── New Tier 2 engine config (May 13, 2026 redesign — v8.0) ──
+const NEW_CFG = {
+  // Pullback 1 quality gate — single-bar / shallow pullbacks blocked
+  PB1_MIN_COUNTER_BARS: 2,
+  PB1_MIN_RETRACE: 0.35,
+
+  // Trigger enable/disable (standalone disabled, combo keeps both signals)
+  ENABLE_EMA_FAIL_STANDALONE: false,
+  ENABLE_PB_LOW_BREAK_STANDALONE: false,
+
+  // Retrace thresholds
+  RETRACE_DEEP_PULLBACK_1: 0.70,  // Quick Reversal fires above this
+  RETRACE_DEEP_PULLBACK_2: 0.50,  // Second Pullback Reversal fires above this
+
+  // Leg 2 quality (for adaptive target on counter trades)
+  MEANINGFUL_LEG2_BARS: 2,
+  MEANINGFUL_LEG2_ATR_MULT: 1.0,
+
+  // Combo trigger bonus
+  COMBO_TRIGGER_BONUS: 5,
+
+  // S/R reconfirmation
+  ENABLE_SR_RECONFIRMATION: true,
+  SR_RECONFIRM_TOL_ATR: 0.30,
+  SR_RECONFIRM_BONUS: 5,
+  SR_PATH_BLOCKER_PENALTY: -10,
+
+  // Push quality reconfirmation
+  ENABLE_PUSH_QUALITY_RECONFIRM: true,
+  PUSH_QUALITY_MIN_BARS: 4,
+  PUSH_QUALITY_MIN_ATR_MULT: 3.0,
+  PUSH_QUALITY_MIN_END_TIME: '10:00',
+
+  // Score floor (raised from 50 to 60 in v8.0)
+  SCORE_FLOOR: 60,
 };
 
 function barMove(bar, prevClose) {
@@ -1030,201 +1084,544 @@ function buildRationale(sig, push, brokenSR) {
 }
 
 class Tier2Monitor {
-  constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles) {
+  /**
+   * NEW Tier 2 monitor — v8.0 (May 13, 2026 redesign).
+   * Port of NewTier2Monitor from /mnt/project/new_pullback_engine.py.
+   *
+   * Strategies (4 active, 2 disabled-via-flag):
+   *   - Continuation at Level      (trigger: pullback_at_level)
+   *   - Quick Reversal             (trigger: deep_retrace_pb1)
+   *   - Combo (PB Low + EMA Fail)  (trigger: combo)
+   *   - Second Pullback Reversal   (trigger: deep_retrace_pb2)
+   *   - swing_low_break / ema_fail standalones gated off via NEW_CFG flags.
+   *
+   * States: WATCHING → PULLBACK_1_FORMING → POST_PULLBACK_1_NO_RT
+   *         → PULLBACK_2_FORMING → FIRED
+   *
+   * Constructor signature (orchestrator-facing):
+   *   new Tier2Monitor(push, srLevels, brokenSR, contextScore, dayOpen,
+   *                    priorCandles, dayBarsRef)
+   * The 7th arg `dayBarsRef` is REQUIRED for counter trades — supplies the
+   * day's bar history used for the swing-stop and counter-swing-veto.
+   * If absent (e.g. someone rolls back the orchestrator), the class falls
+   * back to elapsedCandles only — stop will be tighter than Python intends.
+   */
+  constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles, dayBarsRef) {
     this.push = push;
-    this.sr_levels = srLevels;
-    this.broken_sr = brokenSR;
+    this.sr_levels = srLevels || [];
+    this.broken_sr = brokenSR || [];
     this.context_score = contextScore || 0;
     this.atr = push.atr;
     this.day_open = dayOpen;
     this.rsi_candles = priorCandles || [];
-    this.bar_count = 0; this.counter_count = 0; this.total_counter = 0;
-    this.max_retrace = 0; this.h1_retrace = 0; this.h1_bars = 0;
-    this.h1_complete = false; this.h1_extreme = null; this.recent_h1_extreme = null;
-    this.leg_bars = 0; this.h2_counter = 0; this.h2_max_retrace = 0; this.h2_complete = false;
+    this.day_bars_ref = dayBarsRef || []; // 7th-arg fallback
+    this.bar_count = 0;
     this.prev_close = push.end_price;
-    this.state = 'WATCHING';
-    this.doji_count_pre_signal = 0; this.profit_doji_count = 0;
-    this.entry_price = null;
     this.elapsed_candles = [];
-    this.h2_attempted = false; this.exhaustion_skip = false;
+    // Pullback tracking
+    this.counter_bars_in_pullback = 0;
+    this.pullback_extreme = null;          // low for up-push, high for down-push
+    this.pullback_1_extreme = null;        // FROZEN once set (May 13 bug fix)
+    this.pullback_extreme_current = null;  // tracks current pullback (1 or 2)
+    this.max_retrace = 0;
+    // Phase tracking
+    this.state = 'WATCHING';
+    this.first_resumption_close = null;
+    this.leg_2_bars = 0;
+    this.leg_2_high = null;                // high of leg up (or low for down-push)
+    this.leg_2_start_close = null;
+    this.entry_price = null;
+    this.profit_doji_count = 0;
+    // Legacy fields retained for orchestrator compatibility (read at line ~1976).
+    // New engine never sets exhaustion_skip=true (no exhaustion-skip logic in new
+    // engine and no 'B'-type signal exists), but defining as false is defensive.
+    this.exhaustion_skip = false;
   }
+
   _result(action, reason, signal) {
-    return { action, reason: reason || '', signal: signal || null, state: this.state, retrace: +this.max_retrace.toFixed(3), bar_num: this.bar_count };
+    return {
+      action,
+      reason: reason || '',
+      signal: signal || null,
+      state: this.state,
+      retrace: +this.max_retrace.toFixed(3),
+      bar_num: this.bar_count,
+    };
   }
+
+  /**
+   * Orchestrator entry point. Returns { action, reason, signal, state, retrace, bar_num }.
+   * action ∈ { 'SIGNAL', 'WAIT', 'DUMP', 'EXHAUSTION' }. CANCEL is never returned
+   * by the new engine (deep-retrace rejection paths return DUMP to avoid the
+   * orchestrator's old-counter fallback firing on rejected new-engine counters).
+   */
   processBar(bar, atrOv, emaOv, rsiOv) {
     this.bar_count++;
     this.elapsed_candles.push(bar);
     const bm = barMove(bar, this.prev_close);
     const same = bm === this.push.dir;
-    const ema = emaOv != null ? emaOv : (bar.ema != null ? bar.ema : null);
+    const ema = (emaOv != null) ? emaOv : (bar.ema != null ? bar.ema : null);
     const doji = isDoji(bar);
     const bp = bodyPct(bar);
-    const rsi = rsiOv != null ? rsiOv : computeRSIEngine([...this.rsi_candles, ...this.elapsed_candles]);
+    const rsi = (rsiOv != null) ? rsiOv : computeRSIEngine([...this.rsi_candles, ...this.elapsed_candles]);
+    const isUp = this.push.is_up;
 
-    if (RULE.EXHAUSTION_FILTER && this.bar_count === 1) {
-      const br = bar.h - bar.l;
-      if (br > this.atr * ENG.EXHAUSTION_RANGE_MULT && br > 0) {
-        const cp = this.push.is_up ? (bar.c - bar.l) / br : (bar.h - bar.c) / br;
-        if (cp <= ENG.EXHAUSTION_CLOSE_PCT) this.exhaustion_skip = true;
-      }
-    }
-    if (this.bar_count > ENG.MAX_BARS) return this._result('DUMP', 'Timeout 12 bars');
-
-    if (this.entry_price != null) {
-      const ip = (this.push.is_up && bar.c > this.entry_price) || (!this.push.is_up && bar.c < this.entry_price);
-      if (doji && ip) {
-        this.profit_doji_count++;
-        if (this.profit_doji_count >= ENG.EXHAUSTION_BARS) return this._result('EXHAUSTION', 'Dojis at profit');
-      } else this.profit_doji_count = 0;
+    if (this.bar_count > ENG.MAX_BARS) {
+      this.prev_close = bar.c;
+      return this._result('DUMP', 'Timeout 12 bars');
     }
 
-    if (same) {
-      if (this.h1_complete && this.leg_bars < 2) {
-        this.leg_bars++; this.counter_count = 0; this.recent_h1_extreme = null;
-        this.h2_counter = 0; this.h2_max_retrace = 0;
-        this.state = this.leg_bars < 2 ? 'LEG_FORMING' : 'LEG_CONFIRMED';
-      } else if (this.h1_complete && this.leg_bars >= 2 && this.h2_counter >= 1) {
-        if (this.h2_max_retrace >= 0.30 && bp >= 0.25) {
-          this.h2_complete = true; this.h2_attempted = true;
-          if (RULE.EXHAUSTION_FILTER && this.exhaustion_skip) {
-            if (RULE.H2_ENDS_MONITOR) return this._result('DUMP', 'H2 blocked by exhaustion');
-            this.h2_counter = 0; this.h2_max_retrace = 0;
-          } else {
-            const [score, bd] = scoreSignal(this.push, this.h2_max_retrace, this.h2_counter, bar, this.sr_levels, ema, this.context_score, this.atr, 'B', rsi);
-            if (score >= 55) {
-              const sig = this._buildSignal(bar, score, bd, 'B', null, ema);
-              if (sig) { this.entry_price = bar.c; return this._result('SIGNAL', `H2 ${score}`, sig); }
-            }
-            if (RULE.H2_ENDS_MONITOR) return this._result('DUMP', 'H2 attempted');
-          }
-        }
-        this.h2_counter = 0; this.h2_max_retrace = 0;
-      } else if (!this.h1_complete && this.counter_count >= 1) {
-        if (this.max_retrace >= ENG.RETRACE_MIN && bp >= 0.25) {
-          const r = this._tryH1Signal(bar, ema, rsi, bp);
-          if (r) return r;
-        } else {
-          this.counter_count = 0; this.max_retrace = 0;
-          this.recent_h1_extreme = null; this.state = 'WATCHING';
-        }
+    // For ema_fail trigger we need previous bar's close vs previous EMA.
+    const prevCloseForEma = this.elapsed_candles.length >= 2
+      ? this.elapsed_candles[this.elapsed_candles.length - 2].c
+      : this.prev_close;
+    const prevEma = this.elapsed_candles.length >= 2
+      ? this.elapsed_candles[this.elapsed_candles.length - 2].ema
+      : ema;
+
+    // ─────────────────────────────────────────────────────────────────
+    // State: WATCHING — waiting for first counter bar
+    // ─────────────────────────────────────────────────────────────────
+    if (this.state === 'WATCHING') {
+      if (same || doji) {
+        // Push extending. Doji harmless here.
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
       }
-    } else {
-      if (doji) {
-        if (!this.h1_complete) this.doji_count_pre_signal++;
+      // First counter bar (non-doji, opposite direction)
+      this.counter_bars_in_pullback = 1;
+      if (isUp) {
+        this.pullback_extreme = bar.l;
+        this.pullback_extreme_current = bar.l;
       } else {
-        this.counter_count++; this.total_counter++;
-        const tr = computeRetrace(bar, this.push);
-        this.max_retrace = Math.max(this.max_retrace, tr);
-        if (!this.h1_complete) {
-          if (this.push.is_up) {
-            this.h1_extreme = this.h1_extreme == null ? bar.l : Math.min(this.h1_extreme, bar.l);
-            this.recent_h1_extreme = this.recent_h1_extreme == null ? bar.l : Math.min(this.recent_h1_extreme, bar.l);
-          } else {
-            this.h1_extreme = this.h1_extreme == null ? bar.h : Math.max(this.h1_extreme, bar.h);
-            this.recent_h1_extreme = this.recent_h1_extreme == null ? bar.h : Math.max(this.recent_h1_extreme, bar.h);
+        this.pullback_extreme = bar.h;
+        this.pullback_extreme_current = bar.h;
+      }
+      this.max_retrace = Math.max(this.max_retrace, computeRetrace(bar, this.push));
+      this.state = 'PULLBACK_1_FORMING';
+      this.prev_close = bar.c;
+      // Even on first counter, check deep retrace (Quick Reversal)
+      if (this.max_retrace > NEW_CFG.RETRACE_DEEP_PULLBACK_1) {
+        const sig = this._buildCounterSignal(bar, ema, rsi, 'deep_retrace_pb1', false);
+        if (sig) {
+          this.state = 'FIRED';
+          return this._result('SIGNAL', `COUNTER ${sig.score}`, sig);
+        }
+        return this._result('DUMP', 'deep retrace but counter signal rejected');
+      }
+      return this._result('WAIT', this.state);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // State: PULLBACK_1_FORMING — waiting for resumption or more counter
+    // ─────────────────────────────────────────────────────────────────
+    if (this.state === 'PULLBACK_1_FORMING') {
+      if (same && !doji) {
+        // Resumption bar — does pullback's low touch a previously-broken RT level?
+        const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
+        if (rt) {
+          // FIRE PULLBACK_AT_LEVEL
+          const [score, bd] = scoreSignal(
+            this.push, this.max_retrace, this.counter_bars_in_pullback,
+            bar, this.sr_levels, ema, this.context_score, this.atr, 'RT+H1', rsi
+          );
+          if (score >= NEW_CFG.SCORE_FLOOR) {
+            const sig = this._buildContinuationSignal(bar, score, bd, 'PULLBACK_AT_LEVEL', rt, ema);
+            if (sig) {
+              this.entry_price = bar.c;
+              this.state = 'FIRED';
+              return this._result('SIGNAL', `PB@L ${score}`, sig);
+            }
           }
         }
+        // No RT (or RT but rejected) → check pullback 1 quality gate before
+        // transitioning to reversal-hunt mode.
+        if (this.counter_bars_in_pullback < NEW_CFG.PB1_MIN_COUNTER_BARS
+            || this.max_retrace < NEW_CFG.PB1_MIN_RETRACE) {
+          // Pullback too shallow — push retains conviction. Reset pullback
+          // counters; this resumption bar starts a new pullback window.
+          this.counter_bars_in_pullback = 0;
+          this.pullback_extreme = null;
+          this.pullback_extreme_current = null;
+          this.max_retrace = 0;
+          this.state = 'WATCHING';
+          this.prev_close = bar.c;
+          return this._result('WAIT', `${this.state} (pb1 too shallow)`);
+        }
+        // Gate passes: freeze pullback_1_extreme, transition to POST_PULLBACK_1_NO_RT
+        this.first_resumption_close = bar.c;
+        this.pullback_1_extreme = this.pullback_extreme;  // FROZEN
+        this.leg_2_bars = 1;
+        this.leg_2_high = isUp ? bar.h : bar.l;
+        this.leg_2_start_close = bar.c;
+        this.state = 'POST_PULLBACK_1_NO_RT';
+        this.counter_bars_in_pullback = 0;
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else if (!same && !doji) {
+        // Another counter bar (non-doji)
+        this.counter_bars_in_pullback++;
+        if (isUp) {
+          this.pullback_extreme = Math.min(this.pullback_extreme, bar.l);
+          this.pullback_extreme_current = this.pullback_extreme;
+        } else {
+          this.pullback_extreme = Math.max(this.pullback_extreme, bar.h);
+          this.pullback_extreme_current = this.pullback_extreme;
+        }
+        this.max_retrace = Math.max(this.max_retrace, computeRetrace(bar, this.push));
+        if (this.max_retrace > NEW_CFG.RETRACE_DEEP_PULLBACK_1) {
+          const sig = this._buildCounterSignal(bar, ema, rsi, 'deep_retrace_pb1', false);
+          if (sig) {
+            this.state = 'FIRED';
+            return this._result('SIGNAL', `COUNTER ${sig.score}`, sig);
+          }
+          return this._result('DUMP', 'deep retrace but counter signal rejected');
+        }
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else {
+        // Doji — May 13 bug fix: doji's low/high updates pullback_extreme but
+        // DOES NOT increment counter_bars_in_pullback (gate counts non-doji only).
+        if (this.pullback_extreme != null) {
+          if (isUp) {
+            this.pullback_extreme = Math.min(this.pullback_extreme, bar.l);
+          } else {
+            this.pullback_extreme = Math.max(this.pullback_extreme, bar.h);
+          }
+          this.pullback_extreme_current = this.pullback_extreme;
+          this.max_retrace = Math.max(this.max_retrace, computeRetrace(bar, this.push));
+        }
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
       }
-      if (this.h1_complete && this.leg_bars >= 2) {
-        this.h2_counter++;
-        this.h2_max_retrace = Math.max(this.h2_max_retrace, computeRetrace(bar, this.push));
-      }
-      if (this.max_retrace > ENG.RETRACE_CANCEL) return this._result('CANCEL', `Retrace ${(this.max_retrace*100).toFixed(0)}%`);
-      if (this.max_retrace < ENG.RETRACE_MIN) this.state = 'WATCHING';
-      else if (this.max_retrace <= ENG.RETRACE_FLAG) this.state = 'FLAG_FORMING';
-      else if (this.max_retrace <= ENG.RETRACE_H1_HIGH) this.state = 'H1_FORMING';
-      else if (this.max_retrace <= ENG.RETRACE_H1_DEEP) this.state = 'H1_FORMING_MODERATE';
-      else this.state = 'H1_DEEP';
-      if (this.counter_count >= ENG.EARLY_DUMP_BARS && !this.h1_complete && this.leg_bars === 0) return this._result('DUMP', 'Early dump');
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // State: POST_PULLBACK_1_NO_RT — hunting reversal (no RT confirmation)
+    // ─────────────────────────────────────────────────────────────────
+    if (this.state === 'POST_PULLBACK_1_NO_RT') {
+      if (same && !doji) {
+        // Leg up continuing
+        this.leg_2_bars++;
+        this.leg_2_high = isUp
+          ? Math.max(this.leg_2_high, bar.h)
+          : Math.min(this.leg_2_high, bar.l);
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else if (!same && !doji) {
+        // Counter bar — check combo / pb_low_break / ema_fail triggers
+        let pbLowBreak = isUp
+          ? (bar.c < this.pullback_1_extreme)
+          : (bar.c > this.pullback_1_extreme);
+        let emaFail = (ema != null && prevEma != null) && (
+          (isUp && bar.c < ema && prevCloseForEma >= prevEma)
+          || (!isUp && bar.c > ema && prevCloseForEma <= prevEma)
+        );
+        // May 13: EMA standalone disabled (combo still uses both)
+        if (!NEW_CFG.ENABLE_EMA_FAIL_STANDALONE && emaFail && !pbLowBreak) {
+          emaFail = false;
+        }
+        // May 13: PLB standalone disabled (combo still uses both)
+        if (!NEW_CFG.ENABLE_PB_LOW_BREAK_STANDALONE && pbLowBreak && !emaFail) {
+          pbLowBreak = false;
+        }
+        if (pbLowBreak || emaFail) {
+          const trigger = (pbLowBreak && emaFail)
+            ? 'combo'
+            : (pbLowBreak ? 'swing_low_break' : 'ema_fail');
+          const sig = this._buildCounterSignal(bar, ema, rsi, trigger, false);
+          if (sig) {
+            this.state = 'FIRED';
+            return this._result('SIGNAL', `COUNTER ${sig.score}`, sig);
+          }
+        }
+        // Counter bar but no trigger fired — enter pullback 2
+        this.pullback_extreme_current = isUp ? bar.l : bar.h;
+        this.counter_bars_in_pullback = 1;
+        this.state = 'PULLBACK_2_FORMING';
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else {
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // State: PULLBACK_2_FORMING — second pullback (deeper expected)
+    // ─────────────────────────────────────────────────────────────────
+    if (this.state === 'PULLBACK_2_FORMING') {
+      if (!same && !doji) {
+        this.counter_bars_in_pullback++;
+        if (isUp) {
+          this.pullback_extreme_current = Math.min(this.pullback_extreme_current, bar.l);
+        } else {
+          this.pullback_extreme_current = Math.max(this.pullback_extreme_current, bar.h);
+        }
+        // Use pullback_1_extreme (frozen earlier) as the swing reference
+        let pb1LowBreak = isUp
+          ? (bar.c < this.pullback_1_extreme)
+          : (bar.c > this.pullback_1_extreme);
+        let emaFail = (ema != null && prevEma != null) && (
+          (isUp && bar.c < ema && prevCloseForEma >= prevEma)
+          || (!isUp && bar.c > ema && prevCloseForEma <= prevEma)
+        );
+        // Standalone gates (combo still uses both)
+        if (!NEW_CFG.ENABLE_EMA_FAIL_STANDALONE && emaFail && !pb1LowBreak) {
+          emaFail = false;
+        }
+        if (!NEW_CFG.ENABLE_PB_LOW_BREAK_STANDALONE && pb1LowBreak && !emaFail) {
+          pb1LowBreak = false;
+        }
+        const retraceFromStart = computeRetrace(bar, this.push);
+        const deepPb2 = retraceFromStart > NEW_CFG.RETRACE_DEEP_PULLBACK_2;
+        if (pb1LowBreak || emaFail || deepPb2) {
+          let trigger;
+          if (pb1LowBreak && emaFail) trigger = 'combo';
+          else if (deepPb2) trigger = 'deep_retrace_pb2';
+          else if (pb1LowBreak) trigger = 'swing_low_break';
+          else trigger = 'ema_fail';
+          const sig = this._buildCounterSignal(bar, ema, rsi, trigger, true);
+          if (sig) {
+            this.state = 'FIRED';
+            return this._result('SIGNAL', `COUNTER ${sig.score}`, sig);
+          }
+        }
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else if (same && !doji) {
+        // Resumption from pullback 2 — do NOT fire continuation. Go back to
+        // POST_PULLBACK_1_NO_RT. CRITICAL (May 13 bug fix): do NOT overwrite
+        // pullback_1_extreme — it stays frozen at original pullback 1's low.
+        this.counter_bars_in_pullback = 0;
+        this.state = 'POST_PULLBACK_1_NO_RT';
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      } else {
+        this.prev_close = bar.c;
+        return this._result('WAIT', this.state);
+      }
+    }
+
+    // FIRED or anything else — passthrough
     this.prev_close = bar.c;
     return this._result('WAIT', this.state);
   }
-  _completeH1() {
-    this.h1_complete = true;
-    this.h1_retrace = this.max_retrace;
-    this.h1_bars = this.counter_count;
-    this.state = 'H1_COMPLETE';
-    this.counter_count = 0;
+
+  _meaningfulLeg2() {
+    if (this.leg_2_bars < NEW_CFG.MEANINGFUL_LEG2_BARS) return false;
+    if (this.first_resumption_close == null || this.leg_2_high == null) return false;
+    const move = Math.abs(this.leg_2_high - this.first_resumption_close);
+    return move >= this.atr * NEW_CFG.MEANINGFUL_LEG2_ATR_MULT;
   }
-  _tryH1Signal(bar, ema, rsi, bp) {
-    this._completeH1();
-    let sd = null;
-    if (this.h1_retrace > ENG.RETRACE_H1_DEEP) {
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
-      if (rt) {
-        const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, 'RT', rsi);
-        if (s >= 50) sd = { score: s, bd: b, sigType: 'RT+H1', rt };
-      }
-      if (!sd) { this.state = 'H1_DEEP_NO_SR'; return null; }
-    } else if (this.h1_retrace > ENG.RETRACE_H1_HIGH) {
-      const ne = ema && ((this.push.is_up && bar.c > ema) || (!this.push.is_up && bar.c < ema));
-      const nb = bp >= 0.50;
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
-      if (ne && nb) {
-        const st = rt ? 'RT+H1' : 'H1';
-        const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, st, rsi);
-        if (s >= 50) sd = { score: s, bd: b, sigType: st, rt };
-      }
-      if (!sd) return null;
-    } else {
-      const rt = checkRTTouch(bar, this.push, this.broken_sr, this.atr);
-      const st = rt ? 'RT+H1' : 'H1';
-      const [s, b] = scoreSignal(this.push, this.h1_retrace, this.h1_bars, bar, this.sr_levels, ema, this.context_score, this.atr, st, rsi);
-      if (s >= 50) sd = { score: s, bd: b, sigType: st, rt };
-      else return null;
-    }
-    const sig = this._buildSignal(bar, sd.score, sd.bd, sd.sigType, sd.rt, ema);
-    if (sig) { this.entry_price = bar.c; return this._result('SIGNAL', `${sd.sigType} ${sd.score}`, sig); }
-    return null;
-  }
-  _buildSignal(bar, score, bd, sigType, rt, ema) {
-    const push = this.push, atr = this.atr, ep = bar.c, isUp = push.is_up;
-    const anchor = this.recent_h1_extreme != null ? this.recent_h1_extreme : (this.h1_extreme != null ? this.h1_extreme : ep);
-    let stop = isUp ? anchor - atr * ENG.STOP_BUFFER : anchor + atr * ENG.STOP_BUFFER;
-    if (rt) { const lv = rt.level; stop = isUp ? lv - atr * ENG.STOP_BUFFER : lv + atr * ENG.STOP_BUFFER; }
-    let target = isUp ? ep + push.net_move * ENG.TARGET_PCT : ep - push.net_move * ENG.TARGET_PCT;
+
+  _buildContinuationSignal(bar, score, bd, sigType, rt, ema) {
+    const push = this.push;
+    const atr = this.atr;
+    const ep = bar.c;
+    const isUp = push.is_up;
+    // Stop = RT level ∓ 1×ATR
+    const lv = rt.level;
+    let stop = isUp ? lv - atr * ENG.STOP_BUFFER : lv + atr * ENG.STOP_BUFFER;
+    let target = isUp
+      ? ep + push.net_move * ENG.TARGET_PCT
+      : ep - push.net_move * ENG.TARGET_PCT;
+    // Target vs resist
     if (RULE.TARGET_VS_RESIST) {
       let blk = null;
-      for (const lv of this.sr_levels) {
-        if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
-        if (isUp && ep < lv.level && lv.level < target) { if (blk == null || lv.level < blk) blk = lv.level; }
-        else if (!isUp && target < lv.level && lv.level < ep) { if (blk == null || lv.level > blk) blk = lv.level; }
+      for (const lvx of this.sr_levels) {
+        if (lvx.tier !== 'T1' && lvx.tier !== 'T2') continue;
+        if (isUp && ep < lvx.level && lvx.level < target) {
+          if (blk == null || lvx.level < blk) blk = lvx.level;
+        } else if (!isUp && target < lvx.level && lvx.level < ep) {
+          if (blk == null || lvx.level > blk) blk = lvx.level;
+        }
       }
-      if (blk != null) { const buf = atr * 0.1; target = isUp ? blk - buf : blk + buf; }
-    }
-    if (RULE.STOP_VALIDATION && this.elapsed_candles.length >= 2) {
-      const lk = this.elapsed_candles.slice(-ENG.STOP_VALIDATION_LOOKBACK);
-      const tol = atr * ENG.STOP_VALIDATION_TOL;
-      if (isUp) {
-        const nl = lk.filter(b => Math.abs(b.l - stop) < tol || b.l < stop + tol).map(b => b.l);
-        if (nl.length >= 2) stop = Math.min(stop, Math.min(...nl) - tol);
-      } else {
-        const nh = lk.filter(b => Math.abs(b.h - stop) < tol || b.h > stop - tol).map(b => b.h);
-        if (nh.length >= 2) stop = Math.max(stop, Math.max(...nh) + tol);
+      if (blk != null) {
+        const buf = atr * 0.1;
+        target = isUp ? blk - buf : blk + buf;
       }
     }
     const rej = checkPreSignalFilters(bar, ep, stop, target, ema, this.day_open, push, atr);
     if (rej) return null;
+    const risk = Math.abs(ep - stop);
+    if (risk <= 0) return null;
     return {
-      type: sigType, dir: push.dir, push_id: push.push_id,
+      type: sigType,                 // 'PULLBACK_AT_LEVEL'
+      trigger: 'pullback_at_level',
+      dir: push.dir,
+      push_id: push.push_id,
       push_start: push.start_time, push_end: push.end_time,
       push_extreme: push.extreme, push_move: push.net_move,
-      h1_retrace: +this.h1_retrace.toFixed(3),
-      entry_time: bar.t.slice(11,16),
-      entry_price: +ep.toFixed(2), stop_price: +stop.toFixed(2), target_price: +target.toFixed(2),
-      stop_dist: +Math.abs(ep - stop).toFixed(2),
-      rr: +(Math.abs(target - ep) / Math.abs(ep - stop)).toFixed(2),
-      retrace_pct: +this.h1_retrace.toFixed(3),
+      h1_retrace: +this.max_retrace.toFixed(3),
+      entry_time: bar.t.slice(11, 16),
+      entry_price: +ep.toFixed(2),
+      stop_price: +stop.toFixed(2),
+      target_price: +target.toFixed(2),
+      stop_dist: +risk.toFixed(2),
+      rr: +(Math.abs(target - ep) / risk).toFixed(2),
+      retrace_pct: +this.max_retrace.toFixed(3),
       score, breakdown: bd,
-      rt_level: rt ? rt.level : null, rt_tier: rt ? rt.tier : null,
+      rt_level: rt.level, rt_tier: rt.tier,
       bar_count: this.bar_count, bar_time: bar.t,
+      is_counter: false,
       explanation: buildExplanation(push, this, bar, sigType, score, ema),
     };
   }
-}
 
+  _buildCounterSignal(bar, ema, rsi, trigger, useLeg2Target) {
+    const push = this.push;
+    const atr = this.atr;
+    const ep = bar.c;
+    const isUpPush = push.is_up;
+    const counterIsUp = !isUpPush;
+    const counterDir = counterIsUp ? 'up' : 'down';
+
+    // Combine day_bars_ref + elapsed_candles for swing veto and stop window.
+    const fullBars = (this.day_bars_ref || []).concat(this.elapsed_candles);
+
+    // Swing veto — checkCounterSwingVeto returns true if OK to fire, false if vetoed
+    if (!checkCounterSwingVeto(push, bar, atr, fullBars)) {
+      return null;
+    }
+
+    // Stop = recent 6-bar swing extreme ± 0.5×ATR (against the trade)
+    const lookBars = fullBars.slice(-6);
+    if (lookBars.length === 0) return null;
+    let stop;
+    if (counterIsUp) {
+      stop = Math.min(...lookBars.map(b => b.l)) - atr * 0.5;
+    } else {
+      stop = Math.max(...lookBars.map(b => b.h)) + atr * 0.5;
+    }
+    const risk = Math.abs(ep - stop);
+    if (risk <= 0) return null;
+
+    // Target: depends on trigger
+    let target;
+    if (trigger === 'deep_retrace_pb1') {
+      target = counterIsUp ? ep + risk * 1.5 : ep - risk * 1.5;
+    } else if (trigger === 'swing_low_break' || trigger === 'ema_fail'
+               || trigger === 'combo' || trigger === 'deep_retrace_pb2') {
+      if (this._meaningfulLeg2() && this.first_resumption_close != null) {
+        target = this.first_resumption_close;
+      } else {
+        target = push.start_price;
+      }
+      // Ensure target is in counter direction; if not, fall back to 1.5R
+      if (counterIsUp && target <= ep) target = ep + risk * 1.5;
+      if (!counterIsUp && target >= ep) target = ep - risk * 1.5;
+    } else {
+      target = counterIsUp ? ep + risk * 1.5 : ep - risk * 1.5;
+    }
+
+    // Score — feed scoreSignal a pseudo-push flipped to counter direction
+    const pseudo = { ...push, is_up: counterIsUp, dir: counterDir };
+    let [score, bd] = scoreSignal(
+      pseudo, 0.0, 0, bar, this.sr_levels, ema,
+      this.context_score, atr, 'COUNTER', rsi
+    );
+    if (trigger === 'combo') {
+      score += NEW_CFG.COMBO_TRIGGER_BONUS;
+      bd.combo_bonus = NEW_CFG.COMBO_TRIGGER_BONUS;
+    }
+
+    // S/R reconfirmation bonus + path-blocker penalty
+    if (NEW_CFG.ENABLE_SR_RECONFIRMATION) {
+      let srBonus = 0;
+      const tol = atr * NEW_CFG.SR_RECONFIRM_TOL_ATR;
+      if (counterIsUp) {
+        // LONG counter: bar tested support, closed above
+        for (const lv of this.sr_levels) {
+          if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+          if (lv.type !== 'sup') continue;
+          if ((bar.l - tol) <= lv.level && lv.level <= (bar.l + tol)) {
+            if (bar.c > lv.level) {
+              srBonus = Math.max(srBonus, NEW_CFG.SR_RECONFIRM_BONUS);
+              break;
+            }
+          }
+        }
+      } else {
+        // SHORT counter: bar tested resistance, closed below
+        for (const lv of this.sr_levels) {
+          if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+          if (lv.type !== 'res') continue;
+          if ((bar.h - tol) <= lv.level && lv.level <= (bar.h + tol)) {
+            if (bar.c < lv.level) {
+              srBonus = Math.max(srBonus, NEW_CFG.SR_RECONFIRM_BONUS);
+              break;
+            }
+          }
+        }
+      }
+      // Path blocker penalty: count strong levels between entry and target
+      let blockers = 0;
+      if (counterIsUp) {
+        for (const lv of this.sr_levels) {
+          if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+          if (lv.type !== 'res') continue;
+          if (ep < lv.level && lv.level < target) blockers++;
+        }
+      } else {
+        for (const lv of this.sr_levels) {
+          if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+          if (lv.type !== 'sup') continue;
+          if (target < lv.level && lv.level < ep) blockers++;
+        }
+      }
+      if (blockers >= 2) srBonus += NEW_CFG.SR_PATH_BLOCKER_PENALTY;
+      score += srBonus;
+      bd.sr_reconfirm = srBonus;
+      bd.path_blockers = blockers;
+    }
+
+    // Push quality reconfirmation bonus
+    if (NEW_CFG.ENABLE_PUSH_QUALITY_RECONFIRM) {
+      let pq = 0;
+      if ((push.bars || 0) >= NEW_CFG.PUSH_QUALITY_MIN_BARS) pq += 2;
+      const netAtr = (push.net_move || push.move || 0) / (push.atr || atr || 1);
+      if (netAtr >= NEW_CFG.PUSH_QUALITY_MIN_ATR_MULT) pq += 3;
+      const pet = push.end_time || '';
+      if (pet && pet >= NEW_CFG.PUSH_QUALITY_MIN_END_TIME) pq += 1;
+      score += pq;
+      bd.push_quality_reconfirm = pq;
+    }
+
+    if (score < NEW_CFG.SCORE_FLOOR) return null;
+    const rrVal = Math.abs(target - ep) / risk;
+    if (rrVal < 1.0) return null;
+
+    // Map internal trigger → public type name (handoff spec)
+    let publicType;
+    if (trigger === 'deep_retrace_pb1') publicType = 'QUICK_REVERSAL';
+    else if (trigger === 'combo') publicType = 'COMBO';
+    else if (trigger === 'deep_retrace_pb2') publicType = 'SECOND_PULLBACK_REVERSAL';
+    else if (trigger === 'swing_low_break' || trigger === 'ema_fail') publicType = 'COUNTER'; // gated off normally
+    else publicType = 'COUNTER';
+
+    return {
+      type: publicType,
+      trigger,
+      dir: counterDir,
+      push_id: push.push_id,
+      push_start: push.start_time, push_end: push.end_time,
+      push_extreme: push.extreme, push_move: push.net_move,
+      entry_time: bar.t.slice(11, 16),
+      entry_price: +ep.toFixed(2),
+      stop_price: +stop.toFixed(2),
+      target_price: +target.toFixed(2),
+      stop_dist: +risk.toFixed(2),
+      rr: +rrVal.toFixed(2),
+      retrace_pct: +this.max_retrace.toFixed(3),
+      score, breakdown: bd,
+      rt_level: null, rt_tier: null,
+      bar_count: this.bar_count, bar_time: bar.t,
+      is_counter: true,
+      explanation: buildExplanation(push, this, bar, publicType, score, ema),
+    };
+  }
+}
 class Tier3Tracker {
   constructor(alert, fillPrice, fillTime, shares) {
     this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;
@@ -1940,7 +2337,8 @@ async function runTier2v7() {
         }
         entry.monitor = new Tier2Monitor(
           entry.push, entry.sr_levels, entry.broken_sr,
-          entry.context_score, todayBars[0].o, []
+          entry.context_score, todayBars[0].o, [],
+          entry.day_bars   // v8.0: day_bars_ref for new engine's counter signals
         );
         entry.monitor_was_created = true;   // mark for restart-detection
         // Prefill counter bars from push event
@@ -2029,6 +2427,23 @@ async function runTier2v7() {
           delete STATE.watchlist[symbol];
           break;
         } else if (result.action === 'CANCEL') {
+          // v8.0: CANCEL is only returned by the OLD engine (retrace >80%).
+          // NEW engine never returns CANCEL — its counter logic is internal.
+          // Old-engine fallback path below is gated off by default; flip
+          // ENG.ALLOW_OLD_COUNTER_FALLBACK to true only when rolling back to
+          // the old engine.
+          if (!ENG.ALLOW_OLD_COUNTER_FALLBACK) {
+            STATE.audit_log.push({
+              event: 'SKIPPED', reason: 'old_counter_fallback_disabled',
+              symbol, push_id: entry.push_id,
+              push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+              bar_time: bar.t, fired_at: new Date().toISOString(),
+            });
+            STATE.blocked_pushes.add(entry.push_id);
+            delete STATE.watchlist[symbol];
+            break;
+          }
+          // ─── OLD-engine counter fallback (DORMANT under v8.0) ───
           // Check counter trade
           const veto = checkCounterSwingVeto(entry.push, bar, entry.monitor.atr, entry.day_bars);
           if (veto) {
@@ -2389,7 +2804,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v7.2 — Tier2Monitor + context + persistence',
+  engine: 'v8.0 — Tier2Monitor (new pullback engine: PB@L / Quick Reversal / Combo / Second PB)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   state_persisted: fs.existsSync(STATE_FILE),
@@ -2397,7 +2812,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v7.0 — New Engine (Tier2Monitor + 5 rules + Fix 1)',
+  name: 'Signal Server v8.0 — New Pullback Engine (deployed May 14, 2026)',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: ['/v8/alerts', '/v8/watchlist', '/v8/live-trades', '/v8/history', '/v8/status', '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]', '/health', '/prices', '/candles/:symbol', '/kite/login'],

@@ -1,5 +1,12 @@
 /**
- * SIGNAL SERVER v8.0 — New Pullback Engine
+ * SIGNAL SERVER v8.0.1 — New Pullback Engine + Nifty 100 universe
+ *
+ * v8.0.1 CHANGES (May 12, 2026 evening)
+ *   - Universe restricted to Nifty 100 (NIFTY100_SYMBOLS ∩ INSTRUMENT_TOKENS = 92 stocks).
+ *     5-day backtest on full ~350-stock universe showed NEW engine has negative
+ *     EV on mid/small caps. New engine was validated on 25-stock large-cap subset
+ *     in May 13 backtest — restricting to Nifty 100 keeps the universe aligned
+ *     with validation. To revert: clear NIFTY100_SYMBOLS to an empty Set.
  *
  * v8.0 CHANGES (May 14, 2026)
  *   - Tier 2 Monitor REPLACED with new pullback engine (NewTier2Monitor port from
@@ -254,8 +261,38 @@ const INSTRUMENT_TOKENS = {
   'ZENTEC':3992577,'ZUARIIND':3994881,
 };
 
-// All stocks we scan — symbols only (Kite tokens looked up from map above)
-const NSE_UNIVERSE = Object.keys(INSTRUMENT_TOKENS);
+// ─── NIFTY 100 FILTER (v8.0.1, May 12, 2026) ─────────────────────────────────
+// Backtest on full ~350-stock universe showed NEW engine has negative EV on
+// mid/small caps. Restrict to Nifty 100 (where the May 13 backtest validated
+// +0.127 R/trade EV) to keep signal quality high while running NEW engine live.
+// To revert: change NIFTY100_SYMBOLS to an empty Set — universe falls back to
+// the full INSTRUMENT_TOKENS list.
+const NIFTY100_SYMBOLS = new Set([
+  // Nifty 50
+  'RELIANCE','HDFCBANK','ICICIBANK','TCS','INFY','BHARTIARTL','SBIN','ITC',
+  'HINDUNILVR','LT','KOTAKBANK','AXISBANK','BAJFINANCE','MARUTI','ASIANPAINT',
+  'TITAN','HCLTECH','SUNPHARMA','NESTLEIND','ULTRACEMCO','ADANIENT','WIPRO',
+  'M&M','ONGC','JSWSTEEL','TATAMOTORS','NTPC','POWERGRID','TATASTEEL',
+  'BAJAJFINSV','COALINDIA','HINDALCO','TECHM','INDUSINDBK','CIPLA','DRREDDY',
+  'BAJAJ-AUTO','BPCL','ADANIPORTS','SHRIRAMFIN','GRASIM','HEROMOTOCO',
+  'DIVISLAB','SBILIFE','HDFCLIFE','BRITANNIA','EICHERMOT','APOLLOHOSP',
+  'LTIM','TATACONSUM',
+  // Nifty Next 50
+  'ABB','ADANIGREEN','ADANIPOWER','AMBUJACEM','BAJAJHLDNG','BANKBARODA',
+  'BERGEPAINT','BOSCHLTD','CANBK','CGPOWER','CHOLAFIN','COLPAL','DABUR',
+  'DLF','DMART','GAIL','GODREJCP','HAL','HAVELLS','HINDPETRO','ICICIGI',
+  'ICICIPRULI','INDIGO','INDUSTOWER','IOC','IRCTC','IRFC','JINDALSTEL',
+  'JIO','JIOFIN','JSWENERGY','LICI','LODHA','MARICO','MOTHERSON','NAUKRI',
+  'NHPC','OFSS','PFC','PIDILITIND','POWERFIN','PNB','RECLTD','SIEMENS',
+  'SUZLON','TATAPOWER','TORNTPHARM','TRENT','TVSMOTOR','VBL','ZOMATO',
+  'ZYDUSLIFE','UNIONBANK',
+]);
+
+// All stocks we scan — symbols only (Kite tokens looked up from map above).
+// Filtered to Nifty 100 intersected with INSTRUMENT_TOKENS (some Nifty 100
+// names like ITC/JIO/JIOFIN don't have hardcoded tokens — they'll be skipped
+// unless you add them to INSTRUMENT_TOKENS).
+const NSE_UNIVERSE = Object.keys(INSTRUMENT_TOKENS).filter(s => NIFTY100_SYMBOLS.has(s));
 
 // ─── SECTOR MAP ───────────────────────────────────────────────────────────────
 const SECTORS = {
@@ -2804,7 +2841,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0 — Tier2Monitor (new pullback engine: PB@L / Quick Reversal / Combo / Second PB)',
+  engine: 'v8.0.1 — Tier2Monitor (new pullback engine, Nifty 100 universe)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   state_persisted: fs.existsSync(STATE_FILE),

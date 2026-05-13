@@ -728,6 +728,10 @@ const NEW_CFG = {
 
   // Score floor (raised from 50 to 60 in v8.0)
   SCORE_FLOOR: 60,
+
+  // v8.0.1: diagnostic logging. True = one log line per bar per monitor.
+  // Verbose but tells us why monitors aren't firing. Set false once issue understood.
+  LOG_MONITOR_BARS: true,
 };
 
 function barMove(bar, prevClose) {
@@ -1176,6 +1180,16 @@ class Tier2Monitor {
   }
 
   _result(action, reason, signal) {
+    // v8.0.1: per-bar diagnostic logging (turned on for current investigation).
+    // Logs one line per processBar invocation showing symbol, bar count, state,
+    // retrace, action. Keep concise. Set NEW_CFG.LOG_MONITOR_BARS = false to disable.
+    if (NEW_CFG.LOG_MONITOR_BARS && this.symbol) {
+      const lastBar = this.elapsed_candles[this.elapsed_candles.length - 1];
+      const bt = lastBar && lastBar.t ? lastBar.t.slice(11, 16) : '?';
+      const counterBars = this.counter_bars_in_pullback;
+      const pbExt = this.pullback_extreme != null ? this.pullback_extreme.toFixed(2) : '-';
+      console.log(`[T2 ${this.symbol}] b${this.bar_count} ${bt} state=${this.state} retrace=${(this.max_retrace*100).toFixed(0)}% counterBars=${counterBars} pbExt=${pbExt} action=${action} reason="${reason || ''}"`);
+    }
     return {
       action,
       reason: reason || '',
@@ -2377,6 +2391,7 @@ async function runTier2v7() {
           entry.context_score, todayBars[0].o, [],
           entry.day_bars   // v8.0: day_bars_ref for new engine's counter signals
         );
+        entry.monitor.symbol = symbol; // for v8.0.1 diagnostic logging
         entry.monitor_was_created = true;   // mark for restart-detection
         // Prefill counter bars from push event
         if (entry.counter_indices) {

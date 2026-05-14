@@ -1,5 +1,44 @@
 /**
- * SIGNAL SERVER v8.0.1 — New Pullback Engine + Nifty 100 universe
+ * SIGNAL SERVER v8.0.2 — Lifecycle Release + Shadow Tracking + BE-Window + Leg-2 Gate
+ *
+ * v8.0.2 CHANGES (May 13, 2026 evening) — BACKLOG #1
+ *   - New helper releaseStock(symbol, push_id, reason): frees a stock from
+ *     Tier 2 watchlist and blocked_pushes so Tier 1 can detect fresh pushes
+ *     on it. Called on: dismiss, manual exit, auto-close.
+ *   - STATE.shadow_trades: parallel tracker for dismissed alerts. System
+ *     keeps watching the alert's original entry/target/stop in the background
+ *     ("what would have happened?") without affecting real P&L.
+ *   - New endpoint POST /v8/dismiss-alert: moves alert to history with status
+ *     DISMISSED, starts shadow tracking, releases stock.
+ *   - New endpoint POST /v8/manual-exit-trade: closes a live trade at user-
+ *     supplied fill price/time, moves to history (MANUAL_EXIT), releases stock.
+ *   - New endpoint GET /v8/shadow-history: returns shadow (dismissed) trades.
+ *   - Tier 3 auto-close now calls releaseStock after logging outcome.
+ *   - Tier 3 shadow runner: tracks shadow trades alongside live trades, same
+ *     target/stop/timeout logic but never affects real P&L. Hard EOD close
+ *     at 15:30 IST.
+ *   - /v8/dismiss (legacy endpoint) preserved for backwards compatibility,
+ *     now also runs the new release+shadow flow.
+ *   - reset-day clears shadow_trades.
+ *   - LOG_MONITOR_BARS flipped to false (no longer needed for diagnosis;
+ *     was filling Railway logs).
+ *
+ * v8.0.2 ADDITIONS (May 14, 2026 morning) — BACKLOG #7 + #9
+ *   - Breakeven-window stop in Tier3Tracker (live + shadow):
+ *       at +0.5R unrealized → move stop to entry + BE_BUFFER_ATR×ATR
+ *       at +0.7R unrealized → release stop back to original (once released,
+ *       never re-activates)
+ *       Backtest: WR 53.6% → 56.9%, total R +15.21 → +13.16. Tradeoff: small
+ *       EV cost for variance reduction.
+ *       New trade fields: breakeven_active, breakeven_released, original_stop,
+ *       stop_history[].
+ *   - Leg-2 retrace gate in _buildCounterSignal:
+ *       when counter trade about to fire AND leg 2 has extended past original
+ *       push extreme, compute leg-2 retrace (% retreat from leg-2 peak back
+ *       toward pullback-1 bottom, as % of leg-2 range). If < 40%, CANCEL with
+ *       reason 'leg2_retrace_shallow'.
+ *       Backtest (614 stock-days): rejects 8 fires worth −2.47R, WR 50% → 52%,
+ *       total R +1.61 → +4.09.
  *
  * v8.0.1 CHANGES (May 12, 2026 evening)
  *   - Universe restricted to Nifty 100 (NIFTY100_SYMBOLS ∩ INSTRUMENT_TOKENS = 92 stocks).
@@ -731,7 +770,18 @@ const NEW_CFG = {
 
   // v8.0.1: diagnostic logging. True = one log line per bar per monitor.
   // Verbose but tells us why monitors aren't firing. Set false once issue understood.
-  LOG_MONITOR_BARS: true,
+  // v8.0.2 (May 13 EOD): flipped to false — engine verified working live, no longer needed.
+  LOG_MONITOR_BARS: false,
+
+  // v8.0.2 (BACKLOG #7): Breakeven-window stop on Tier3Tracker
+  ENABLE_BREAKEVEN_WINDOW: true,
+  BE_ACTIVATE_R: 0.5,          // unrealized R to turn BE on
+  BE_RELEASE_R: 0.7,           // unrealized R to release BE back to original
+  BE_BUFFER_ATR: 0.05,         // buffer past entry (× ATR) in profit direction
+
+  // v8.0.2 (BACKLOG #9): Leg-2 retrace gate on counter signals
+  ENABLE_LEG2_RETRACE_GATE: true,
+  LEG2_RETRACE_MIN: 0.40,      // reject counter fire if leg-2 retrace < this
 };
 
 function barMove(bar, prevClose) {
@@ -1177,6 +1227,10 @@ class Tier2Monitor {
     // New engine never sets exhaustion_skip=true (no exhaustion-skip logic in new
     // engine and no 'B'-type signal exists), but defining as false is defensive.
     this.exhaustion_skip = false;
+    // v8.0.2 (BACKLOG #9): per-bar leg-2 retrace gate rejection log.
+    // Orchestrator drains this after each processBar call and appends to
+    // STATE.audit_log so we can validate the rule live.
+    this.leg2_rejections = [];
   }
 
   _result(action, reason, signal) {
@@ -1466,6 +1520,65 @@ class Tier2Monitor {
     return move >= this.atr * NEW_CFG.MEANINGFUL_LEG2_ATR_MULT;
   }
 
+  /**
+   * v8.0.2 (BACKLOG #9): Leg-2 retrace gate.
+   *
+   * Plain English:
+   *   When leg 2 has extended past the original push extreme, the relevant
+   *   pullback structure is leg 2 itself, NOT the original push. Measure how
+   *   far price has retreated from the leg-2 peak back toward the pullback-1
+   *   bottom as a percentage of the leg-2 range. If under 40%, the move
+   *   hasn't been consumed — fire is premature.
+   *
+   * Returns: { rejected: bool, retrace_pct: float|null, reason: string|null }
+   *
+   * Returns rejected=false (gate does not apply) when:
+   *   - leg 2 has not extended past push extreme
+   *   - leg_2_high not set (no leg 2 formed yet)
+   *   - pullback_1_extreme not set (defensive)
+   */
+  _checkLeg2RetraceGate(bar) {
+    const push = this.push;
+    const isUp = push.is_up;
+    const pushExtreme = push.extreme;
+    const leg2Peak = this.leg_2_high;
+    const pb1Bottom = this.pullback_1_extreme;
+
+    // Defensive: gate doesn't apply if we don't have the data
+    if (leg2Peak == null || pb1Bottom == null || pushExtreme == null) {
+      return { rejected: false, retrace_pct: null, reason: null };
+    }
+
+    // Has leg 2 extended past original push extreme?
+    const extended = isUp
+      ? (leg2Peak > pushExtreme)
+      : (leg2Peak < pushExtreme);
+    if (!extended) {
+      return { rejected: false, retrace_pct: null, reason: null };
+    }
+
+    // Compute leg-2 range
+    const leg2Range = Math.abs(leg2Peak - pb1Bottom);
+    if (leg2Range <= 0) {
+      return { rejected: false, retrace_pct: null, reason: null };
+    }
+
+    // Compute current retreat from leg-2 peak toward pb1 bottom, using bar close
+    // (the bar that's about to fire). For up-push, retreat = leg2Peak − bar.c.
+    // For down-push, retreat = bar.c − leg2Peak.
+    const retreat = isUp ? (leg2Peak - bar.c) : (bar.c - leg2Peak);
+    const retracePct = retreat / leg2Range;
+
+    if (retracePct < NEW_CFG.LEG2_RETRACE_MIN) {
+      return {
+        rejected: true,
+        retrace_pct: +retracePct.toFixed(3),
+        reason: 'leg2_retrace_shallow',
+      };
+    }
+    return { rejected: false, retrace_pct: +retracePct.toFixed(3), reason: null };
+  }
+
   _buildContinuationSignal(bar, score, bd, sigType, rt, ema) {
     const push = this.push;
     const atr = this.atr;
@@ -1516,6 +1629,7 @@ class Tier2Monitor {
       rt_level: rt.level, rt_tier: rt.tier,
       bar_count: this.bar_count, bar_time: bar.t,
       is_counter: false,
+      atr: +atr.toFixed(4),  // v8.0.2: needed by Tier3Tracker for BE buffer
       explanation: buildExplanation(push, this, bar, sigType, score, ema),
     };
   }
@@ -1534,6 +1648,28 @@ class Tier2Monitor {
     // Swing veto — checkCounterSwingVeto returns true if OK to fire, false if vetoed
     if (!checkCounterSwingVeto(push, bar, atr, fullBars)) {
       return null;
+    }
+
+    // v8.0.2 (BACKLOG #9): Leg-2 retrace gate.
+    // When leg 2 has pushed past the original push extreme, measure how far
+    // price has retreated from leg-2 peak as % of leg-2 range. If < 40%, the
+    // move hasn't been consumed enough — cancel the counter signal.
+    if (NEW_CFG.ENABLE_LEG2_RETRACE_GATE && this.pullback_1_extreme != null) {
+      const leg2Gate = this._checkLeg2RetraceGate(bar);
+      if (leg2Gate.rejected) {
+        this._last_leg2_reject = leg2Gate;
+        // Record a rejection for orchestrator to drain into audit log
+        this.leg2_rejections.push({
+          trigger,
+          reason: leg2Gate.reason,
+          retrace_pct: leg2Gate.retrace_pct,
+          leg2_peak: this.leg_2_high,
+          pb1_bottom: this.pullback_1_extreme,
+          push_extreme: push.extreme,
+          bar_time: bar.t,
+        });
+        return null;
+      }
     }
 
     // Stop = recent 6-bar swing extreme ± 0.5×ATR (against the trade)
@@ -1669,6 +1805,7 @@ class Tier2Monitor {
       rt_level: null, rt_tier: null,
       bar_count: this.bar_count, bar_time: bar.t,
       is_counter: true,
+      atr: +atr.toFixed(4),  // v8.0.2: needed by Tier3Tracker for BE buffer
       explanation: buildExplanation(push, this, bar, publicType, score, ema),
     };
   }
@@ -1680,26 +1817,99 @@ class Tier3Tracker {
     this.bars_since_fill = 0; this.mfe = 0; this.mae = 0; this.exit_override = false;
     this.outcome = null; this.exit_reason = null; this.exit_price = null; this.exit_time = null;
     this.last_price = fillPrice;
+    // v8.0.2 (BACKLOG #7): Breakeven-window stop. The "active stop" used for
+    // hit detection lives in `current_stop`, starts equal to alert.stop_price,
+    // moves to entry + buffer when BE activates, returns to original on release.
+    this.original_stop = alert.stop_price;
+    this.current_stop = alert.stop_price;
+    this.breakeven_active = false;
+    this.breakeven_released = false;
+    this.stop_history = [];  // [{ time, from, to, reason }]
+    // v8.0.2: capture ATR from alert for BE buffer (matches backtest spec).
+    // Falls back to null for legacy alerts that don't carry it.
+    this.atr = (alert.atr != null) ? alert.atr : null;
   }
   _pnl(price) {
     const isUp = this.alert.dir === 'up';
     return (isUp ? (price - this.fill_price) : (this.fill_price - price)) * this.shares;
+  }
+  /**
+   * v8.0.2 (BACKLOG #7): Breakeven-window update.
+   * Called once per bar BEFORE target/stop hit checks. Updates current_stop in
+   * place. Activate at +0.5R, release back at +0.7R, never re-activate.
+   */
+  _updateBreakevenStop(bar, R) {
+    if (!NEW_CFG.ENABLE_BREAKEVEN_WINDOW) return;
+    const isUp = this.alert.dir === 'up';
+    // Use bar close for the R-check (consistent with backtest harness).
+    const m = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
+    const unrealR = m / R;
+    // Buffer = ATR × BE_BUFFER_ATR (matches backtest spec). Falls back to
+    // 1R-distance (R) for legacy alerts that don't carry atr.
+    const bufferBase = (this.atr != null && this.atr > 0) ? this.atr : R;
+    const buffer = bufferBase * NEW_CFG.BE_BUFFER_ATR;
+
+    // ACTIVATE: +0.5R, not yet active, not yet released
+    if (!this.breakeven_active && !this.breakeven_released
+        && unrealR >= NEW_CFG.BE_ACTIVATE_R) {
+      const newStop = isUp
+        ? this.alert.entry_price + buffer
+        : this.alert.entry_price - buffer;
+      this.stop_history.push({
+        time: bar.t, from: +this.current_stop.toFixed(2),
+        to: +newStop.toFixed(2), reason: 'BE_ACTIVATE',
+        unrealized_R: +unrealR.toFixed(3),
+      });
+      this.current_stop = newStop;
+      this.breakeven_active = true;
+      return;
+    }
+
+    // RELEASE: +0.7R, currently active
+    if (this.breakeven_active && !this.breakeven_released
+        && unrealR >= NEW_CFG.BE_RELEASE_R) {
+      const newStop = this.original_stop;
+      this.stop_history.push({
+        time: bar.t, from: +this.current_stop.toFixed(2),
+        to: +newStop.toFixed(2), reason: 'BE_RELEASE',
+        unrealized_R: +unrealR.toFixed(3),
+      });
+      this.current_stop = newStop;
+      this.breakeven_active = false;
+      this.breakeven_released = true;
+    }
   }
   processBar(bar) {
     this.last_price = bar.c;
     if (this.outcome) return { status: 'closed', ...this.summary() };
     this.bars_since_fill++;
     const isUp = this.alert.dir === 'up';
-    const R = Math.abs(this.alert.entry_price - this.alert.stop_price);
+    const R = Math.abs(this.alert.entry_price - this.original_stop);
     const m = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
     const mR = m / R;
     if (mR > this.mfe) this.mfe = mR;
     if (mR < this.mae) this.mae = mR;
     if (this.mfe > 0.7) this.exit_override = true;
+    // v8.0.2: target/stop hit checks use the stop level that was in effect
+    // DURING this bar (i.e. before the close). BE adjustments take effect for
+    // SUBSEQUENT bars only — matches real-broker semantics where a stop is
+    // placed after a bar closes.
+    const stopInEffect = this.current_stop;
+    const beWasActiveBeforeBar = this.breakeven_active;
+    // Target check (unchanged — target never moves)
     if (isUp && bar.h >= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
     if (!isUp && bar.l <= this.alert.target_price) return this._close('WIN', this.alert.target_price, 'target', bar.t);
-    if (isUp && bar.l <= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
-    if (!isUp && bar.h >= this.alert.stop_price) return this._close('LOSS', this.alert.stop_price, 'stop', bar.t);
+    // Stop check uses the stop that was in effect during the bar
+    if (isUp && bar.l <= stopInEffect) {
+      const exitReason = beWasActiveBeforeBar ? 'breakeven_stop' : 'stop';
+      return this._close('LOSS', stopInEffect, exitReason, bar.t);
+    }
+    if (!isUp && bar.h >= stopInEffect) {
+      const exitReason = beWasActiveBeforeBar ? 'breakeven_stop' : 'stop';
+      return this._close('LOSS', stopInEffect, exitReason, bar.t);
+    }
+    // No hit on this bar — now update BE for subsequent bars based on this close
+    this._updateBreakevenStop(bar, R);
     if (!this.exit_override) {
       if (this.bars_since_fill === 2 && mR <= -0.5 && this.mfe > 0) return this._close('EARLY_EXIT', bar.c, 'bar2_reversal', bar.t);
       if (this.alert.type === 'RT+H1' && this.alert.rt_level) {
@@ -1714,6 +1924,9 @@ class Tier3Tracker {
       mfe: +this.mfe.toFixed(2), mae: +this.mae.toFixed(2),
       bars_since_fill: this.bars_since_fill,
       current_price: +bar.c.toFixed(2),
+      current_stop: +this.current_stop.toFixed(2),
+      breakeven_active: this.breakeven_active,
+      breakeven_released: this.breakeven_released,
       pnl: +this._pnl(bar.c).toFixed(2),
       pnl_pct: +((this._pnl(bar.c) / (this.fill_price * this.shares)) * 100).toFixed(2),
     };
@@ -1730,6 +1943,11 @@ class Tier3Tracker {
       pnl: this.exit_price != null ? +this._pnl(this.exit_price).toFixed(2) : 0,
       pnl_pct: this.exit_price != null ? +((this._pnl(this.exit_price) / (this.fill_price * this.shares)) * 100).toFixed(2) : 0,
       shares: this.shares,
+      // v8.0.2 (BACKLOG #7): breakeven audit
+      original_stop: this.original_stop,
+      breakeven_active: this.breakeven_active,
+      breakeven_released: this.breakeven_released,
+      stop_history: this.stop_history,
     };
   }
 }
@@ -2027,7 +2245,8 @@ const STATE = {
   watchlist: {},      // sym -> { push, detector_state, monitor, fetched_at }
   alerts: [],         // open alerts NOT yet taken
   live_trades: {},    // alert_id -> { alert, fill_price, fill_time, tracker, last_bar_t }
-  history: [],        // closed live trades
+  shadow_trades: {},  // alert_id -> { alert, tracker, last_bar_t, dismissed_at } — what-if tracker for dismissed alerts
+  history: [],        // closed live trades AND dismissed alerts (entry_type: REALIZED or SHADOW or DISMISSED)
   audit_log: [],      // ALL alerts ever fired today (permanent record, never deleted)
   blocked_pushes: new Set(),  // push_ids that already fired (don't refire same)
   tier1_running: false,
@@ -2047,6 +2266,37 @@ const fs = require('fs');
 const STATE_FILE = '/tmp/signal_state.json';
 let saveStateTimer = null;
 let lastSaveAt = 0;
+
+// ─────────────────────────────────────────────────────────────────────────
+// LIFECYCLE — releaseStock (BACKLOG #1, v8.0.2)
+// ─────────────────────────────────────────────────────────────────────────
+// Server-side cleanup: removes a stock from Tier 2 watchlist and clears
+// its push_id from blocked_pushes, so Tier 1 can detect fresh pushes
+// on the same stock without waiting for natural timeout.
+// Called by: dismiss-alert, manual-exit-trade, Tier 3 auto-close.
+function releaseStock(symbol, push_id, reason) {
+  let releasedWatchlist = false;
+  let releasedBlocked = false;
+  if (symbol && STATE.watchlist[symbol]) {
+    delete STATE.watchlist[symbol];
+    releasedWatchlist = true;
+  }
+  if (push_id && STATE.blocked_pushes.has(push_id)) {
+    STATE.blocked_pushes.delete(push_id);
+    releasedBlocked = true;
+  }
+  STATE.audit_log.push({
+    event: 'RELEASED',
+    symbol: symbol || null,
+    push_id: push_id || null,
+    reason: reason || 'unspecified',
+    released_watchlist: releasedWatchlist,
+    released_blocked: releasedBlocked,
+    time: new Date().toISOString(),
+  });
+  console.log(`[RELEASE] ${symbol} push_id=${push_id} reason=${reason} wl=${releasedWatchlist} blk=${releasedBlocked}`);
+  return { released_watchlist: releasedWatchlist, released_blocked: releasedBlocked };
+}
 
 function snapshotState() {
   // Watchlist: drop monitor (will rebuild from day_bars + counter_indices)
@@ -2088,15 +2338,50 @@ function snapshotState() {
         exit_price: t.tracker.exit_price,
         exit_time: t.tracker.exit_time,
         last_price: t.tracker.last_price,
+        // v8.0.2 (BACKLOG #7): breakeven state
+        original_stop: t.tracker.original_stop,
+        current_stop: t.tracker.current_stop,
+        breakeven_active: t.tracker.breakeven_active,
+        breakeven_released: t.tracker.breakeven_released,
+        stop_history: t.tracker.stop_history,
+      } : null,
+    };
+  }
+  // Shadow trades: same shape, just for dismissed alerts
+  const shadowTradesOut = {};
+  for (const [id, t] of Object.entries(STATE.shadow_trades)) {
+    shadowTradesOut[id] = {
+      alert: t.alert,
+      dismissed_at: t.dismissed_at,
+      closed: t.closed,
+      last_bar_t: t.last_bar_t,
+      last_status: t.last_status,
+      tracker_state: t.tracker ? {
+        bars_since_fill: t.tracker.bars_since_fill,
+        mfe: t.tracker.mfe,
+        mae: t.tracker.mae,
+        exit_override: t.tracker.exit_override,
+        outcome: t.tracker.outcome,
+        exit_reason: t.tracker.exit_reason,
+        exit_price: t.tracker.exit_price,
+        exit_time: t.tracker.exit_time,
+        last_price: t.tracker.last_price,
+        // v8.0.2 (BACKLOG #7): breakeven state for shadow tracker
+        original_stop: t.tracker.original_stop,
+        current_stop: t.tracker.current_stop,
+        breakeven_active: t.tracker.breakeven_active,
+        breakeven_released: t.tracker.breakeven_released,
+        stop_history: t.tracker.stop_history,
       } : null,
     };
   }
   return {
-    version: 1,
+    version: 2,
     saved_at: new Date().toISOString(),
     watchlist: watchlistOut,
     alerts: STATE.alerts,
     live_trades: liveTradesOut,
+    shadow_trades: shadowTradesOut,
     history: STATE.history,
     audit_log: STATE.audit_log,
     blocked_pushes: Array.from(STATE.blocked_pushes),
@@ -2131,7 +2416,7 @@ function loadState() {
     }
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
     const snap = JSON.parse(raw);
-    if (snap.version !== 1) {
+    if (snap.version !== 1 && snap.version !== 2) {
       console.warn(`[STATE] snapshot version mismatch (${snap.version}), ignoring`);
       return false;
     }
@@ -2174,6 +2459,12 @@ function loadState() {
         tracker.exit_price = t.tracker_state.exit_price;
         tracker.exit_time = t.tracker_state.exit_time;
         tracker.last_price = t.tracker_state.last_price || t.fill_price;
+        // v8.0.2 (BACKLOG #7): rehydrate breakeven state
+        if (t.tracker_state.original_stop != null) tracker.original_stop = t.tracker_state.original_stop;
+        if (t.tracker_state.current_stop != null) tracker.current_stop = t.tracker_state.current_stop;
+        tracker.breakeven_active = t.tracker_state.breakeven_active || false;
+        tracker.breakeven_released = t.tracker_state.breakeven_released || false;
+        tracker.stop_history = Array.isArray(t.tracker_state.stop_history) ? t.tracker_state.stop_history : [];
       }
       STATE.live_trades[id] = {
         alert: t.alert,
@@ -2186,7 +2477,39 @@ function loadState() {
         last_status: t.last_status || { status: 'open' },
       };
     }
-    console.log(`[STATE] restored from ${snap.saved_at}: ${Object.keys(STATE.watchlist).length} watchlist, ${STATE.alerts.length} alerts, ${Object.keys(STATE.live_trades).length} live trades, ${STATE.history.length} history`);
+    // Shadow trades — reconstruct trackers (entry_price used as "fill", shares=1)
+    STATE.shadow_trades = {};
+    for (const [id, t] of Object.entries(snap.shadow_trades || {})) {
+      const fillPx = t.alert.entry_price;
+      const fillTime = t.dismissed_at || new Date().toISOString();
+      const tracker = new Tier3Tracker(t.alert, fillPx, fillTime, 1);
+      if (t.tracker_state) {
+        tracker.bars_since_fill = t.tracker_state.bars_since_fill || 0;
+        tracker.mfe = t.tracker_state.mfe || 0;
+        tracker.mae = t.tracker_state.mae || 0;
+        tracker.exit_override = t.tracker_state.exit_override || false;
+        tracker.outcome = t.tracker_state.outcome;
+        tracker.exit_reason = t.tracker_state.exit_reason;
+        tracker.exit_price = t.tracker_state.exit_price;
+        tracker.exit_time = t.tracker_state.exit_time;
+        tracker.last_price = t.tracker_state.last_price || fillPx;
+        // v8.0.2 (BACKLOG #7): rehydrate breakeven state for shadow tracker
+        if (t.tracker_state.original_stop != null) tracker.original_stop = t.tracker_state.original_stop;
+        if (t.tracker_state.current_stop != null) tracker.current_stop = t.tracker_state.current_stop;
+        tracker.breakeven_active = t.tracker_state.breakeven_active || false;
+        tracker.breakeven_released = t.tracker_state.breakeven_released || false;
+        tracker.stop_history = Array.isArray(t.tracker_state.stop_history) ? t.tracker_state.stop_history : [];
+      }
+      STATE.shadow_trades[id] = {
+        alert: t.alert,
+        dismissed_at: t.dismissed_at,
+        tracker,
+        last_bar_t: t.last_bar_t,
+        closed: t.closed || false,
+        last_status: t.last_status || { status: 'open' },
+      };
+    }
+    console.log(`[STATE] restored from ${snap.saved_at}: ${Object.keys(STATE.watchlist).length} watchlist, ${STATE.alerts.length} alerts, ${Object.keys(STATE.live_trades).length} live trades, ${Object.keys(STATE.shadow_trades).length} shadow trades, ${STATE.history.length} history`);
     return true;
   } catch (e) {
     console.warn('[STATE] load error:', e.message);
@@ -2419,6 +2742,28 @@ async function runTier2v7() {
 
         const result = entry.monitor.processBar(bar, liveAtr, liveEma, liveRsi);
 
+        // v8.0.2 (BACKLOG #9): drain any leg-2 retrace gate rejections from
+        // this bar into the audit log so the rule's impact is visible.
+        if (entry.monitor.leg2_rejections && entry.monitor.leg2_rejections.length) {
+          for (const rej of entry.monitor.leg2_rejections) {
+            STATE.audit_log.push({
+              event: 'COUNTER_REJECTED',
+              symbol,
+              push_id: entry.push_id,
+              push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+              trigger: rej.trigger,
+              reason: rej.reason,
+              retrace_pct: rej.retrace_pct,
+              leg2_peak: rej.leg2_peak,
+              pb1_bottom: rej.pb1_bottom,
+              push_extreme: rej.push_extreme,
+              bar_time: rej.bar_time,
+              fired_at: new Date().toISOString(),
+            });
+          }
+          entry.monitor.leg2_rejections = [];
+        }
+
         if (result.action === 'SIGNAL') {
           // Fire alert
           const sig = result.signal;
@@ -2591,13 +2936,16 @@ async function runTier2v7() {
   saveStateDebounced();
 }
 
-// ── TIER 3: every 1 min when there are live trades, track each ─────────
+// ── TIER 3: every 1 min — tracks live trades AND shadow (dismissed) trades ──
 async function runTier3v7() {
-  if (!isMarketHours()) return;
+  // v8.0.2: still run shadow tracker even outside market hours (need to handle
+  // EOD close at 15:30 IST, and isMarketHours caps at 14:30).
+  const inMarket = isMarketHours();
   const liveIds = Object.keys(STATE.live_trades).filter(id => !STATE.live_trades[id].closed);
-  if (!liveIds.length) return;
 
-  for (const id of liveIds) {
+  // Process live trades only when market is in tradeable hours
+  if (inMarket && liveIds.length) {
+    for (const id of liveIds) {
     const lt = STATE.live_trades[id];
     try {
       const candles = await fetchKite5Min(lt.alert.symbol);
@@ -2618,7 +2966,17 @@ async function runTier3v7() {
         lt.last_status = r;
         if (r.status === 'closed') {
           lt.closed = true;
-          STATE.history.push({...lt.alert, ...r, fill_price: lt.fill_price, fill_time: lt.fill_time});
+          STATE.history.push({
+            entry_type: 'REALIZED',
+            ...lt.alert,
+            ...r,
+            fill_price: lt.fill_price,
+            fill_time: lt.fill_time,
+            closed_at: new Date().toISOString(),
+          });
+          // v8.0.2 (BACKLOG #1): release stock so Tier 1 can find fresh pushes
+          const pushId = lt.alert.push_id || (lt.alert.push && lt.alert.push.push_id) || null;
+          releaseStock(lt.alert.symbol, pushId, `auto_close_${r.exit_reason}`);
           console.log(`[T3v7] CLOSED ${lt.alert.symbol} ${r.outcome} ${r.exit_reason} @ ${r.exit_price}`);
           break;
         }
@@ -2626,9 +2984,97 @@ async function runTier3v7() {
     } catch (e) {
       console.warn(`[T3v7] ${id} error:`, e.message);
     }
-  }
+    }  // end for live trade loop
+  }  // end if (inMarket && liveIds.length)
+
+  // v8.0.2: Run shadow tracker for dismissed alerts (parallel to live trades)
+  await runTier3Shadow();
+
   STATE.tier3_at = new Date().toISOString();
   saveStateDebounced();
+}
+
+// ── TIER 3 SHADOW: tracks dismissed alerts in the background (v8.0.2) ──
+// Same target/stop/timeout logic as live trades, but never affects real P&L.
+// Hard EOD close at 15:30 IST (regardless of outcome).
+//
+// History flow for a dismissed alert:
+//   1. On dismiss: DISMISSED entry pushed to history immediately (visible in UI).
+//   2. On shadow close: that same entry is UPGRADED in place to SHADOW with the
+//      outcome. We don't push a second entry — that would double-count in sumR.
+function upgradeDismissedToShadow(alertId, alertObj, closeResult, dismissedAt) {
+  const idx = STATE.history.findIndex(
+    h => h.entry_type === 'DISMISSED' && h.alert_id === alertId
+  );
+  const upgraded = {
+    entry_type: 'SHADOW',
+    ...alertObj,
+    ...closeResult,
+    dismissed_at: dismissedAt,
+    closed_at: new Date().toISOString(),
+  };
+  if (idx >= 0) {
+    STATE.history[idx] = upgraded;
+  } else {
+    // Safety net: if DISMISSED entry wasn't found (shouldn't happen), push fresh
+    STATE.history.push(upgraded);
+  }
+}
+
+async function runTier3Shadow() {
+  if (!Object.keys(STATE.shadow_trades).length) return;
+
+  // Compute IST time for EOD check
+  const now = new Date();
+  const istMs = now.getTime() + (5.5 * 60 * 60 * 1000);
+  const ist = new Date(istMs);
+  const hm = ist.getHours() * 100 + ist.getMinutes();
+  const isAfterClose = hm >= 1530;
+
+  const shadowIds = Object.keys(STATE.shadow_trades).filter(id => !STATE.shadow_trades[id].closed);
+  for (const id of shadowIds) {
+    const st = STATE.shadow_trades[id];
+    try {
+      // EOD close: if past 15:30 IST and still open, close at last known price
+      if (isAfterClose) {
+        const lastPx = st.tracker.last_price || st.alert.entry_price;
+        const r = st.tracker._close('EOD', lastPx, 'shadow_eod_close', new Date().toISOString());
+        st.closed = true;
+        st.last_status = r;
+        upgradeDismissedToShadow(id, st.alert, r, st.dismissed_at);
+        console.log(`[T3v7-SHADOW] EOD CLOSE ${st.alert.symbol} @ ${lastPx}`);
+        continue;
+      }
+
+      const candles = await fetchKite5Min(st.alert.symbol);
+      if (!candles || !candles.length) continue;
+
+      const today = candles[candles.length-1].t.slice(0, 10);
+      const todayBars = candles.filter(b => b.t.slice(0,10) === today);
+
+      // Process bars after dismiss time.
+      // dismissed_at is UTC ISO; bar.t is IST-local from Kite. Compare via Date objects.
+      const dismissMs = new Date(st.dismissed_at).getTime();
+      const dismissIdx = todayBars.findIndex(b => new Date(b.t).getTime() >= dismissMs);
+      const sinceDismiss = dismissIdx >= 0 ? todayBars.slice(dismissIdx) : todayBars.slice(-1);
+      const lastSeenIdx = st.last_bar_t ? sinceDismiss.findIndex(b => b.t === st.last_bar_t) : -1;
+      const newBars = lastSeenIdx >= 0 ? sinceDismiss.slice(lastSeenIdx + 1) : sinceDismiss;
+
+      for (const bar of newBars) {
+        const r = st.tracker.processBar(bar);
+        st.last_bar_t = bar.t;
+        st.last_status = r;
+        if (r.status === 'closed') {
+          st.closed = true;
+          upgradeDismissedToShadow(id, st.alert, r, st.dismissed_at);
+          console.log(`[T3v7-SHADOW] CLOSED ${st.alert.symbol} ${r.outcome} ${r.exit_reason} @ ${r.exit_price}`);
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn(`[T3v7-SHADOW] ${id} error:`, e.message);
+    }
+  }
 }
 
 // ── SCHEDULERS ────────────────────────────────────────────────────────
@@ -2678,12 +3124,87 @@ app.post('/v8/track', (req, res) => {
   res.json({ ok: true, alert_id, fill_price, fill_time, shares: nShares });
 });
 
-app.post('/v8/dismiss', (req, res) => {
+// ── v8.0.2: Dismiss alert (BACKLOG #1) ─────────────────────────────────────
+// Moves alert to history with status DISMISSED, starts shadow tracking
+// (system keeps watching original entry/target/stop), releases stock.
+// Both /v8/dismiss (legacy) and /v8/dismiss-alert (new) hit this handler.
+function handleDismissAlert(req, res) {
   const { alert_id } = req.body || {};
   if (!alert_id) return res.status(400).json({ error: 'alert_id required' });
+  const alert = STATE.alerts.find(a => a.alert_id === alert_id);
+  if (!alert) {
+    // Already dismissed or doesn't exist — still return ok for idempotency
+    return res.json({ ok: true, note: 'alert not in active list (may already be dismissed)' });
+  }
+  const dismissedAt = new Date().toISOString();
+
+  // 1. Remove from active alerts
   STATE.alerts = STATE.alerts.filter(a => a.alert_id !== alert_id);
+
+  // 2. Add to history as DISMISSED entry (immediately, before shadow resolves)
+  STATE.history.push({
+    entry_type: 'DISMISSED',
+    ...alert,
+    dismissed_at: dismissedAt,
+    status: 'dismissed',
+  });
+
+  // 3. Start shadow tracking — use alert.entry_price as the "fill" price,
+  //    alert.bar_time (or now) as the start of tracking
+  const shadowFillTime = alert.bar_time || dismissedAt;
+  const tracker = new Tier3Tracker(alert, alert.entry_price, shadowFillTime, 1);
+  STATE.shadow_trades[alert_id] = {
+    alert,
+    dismissed_at: dismissedAt,
+    tracker,
+    last_bar_t: null,
+    closed: false,
+    last_status: { status: 'open' },
+  };
+
+  // 4. Release stock so Tier 1 can find fresh pushes
+  const pushId = alert.push_id || (alert.push && alert.push.push_id) || null;
+  releaseStock(alert.symbol, pushId, 'user_dismissed');
+
+  console.log(`[DISMISS] ${alert.symbol} ${alert.type} → shadow tracking started`);
   saveStateNow();
-  res.json({ ok: true });
+  res.json({ ok: true, alert_id, dismissed_at: dismissedAt, shadow_started: true });
+}
+app.post('/v8/dismiss', handleDismissAlert);          // legacy path preserved
+app.post('/v8/dismiss-alert', handleDismissAlert);    // new explicit path
+
+// ── v8.0.2: Manual exit live trade (BACKLOG #1) ───────────────────────────
+// User clicks Exit on a live trade row, supplies fill_price (defaults to last
+// known price) and fill_time (defaults to now). Trade closes, moves to history
+// as REALIZED+manual_exit, releases stock.
+app.post('/v8/manual-exit-trade', (req, res) => {
+  const { trade_id, alert_id, fill_price, fill_time } = req.body || {};
+  const id = trade_id || alert_id;
+  if (!id) return res.status(400).json({ error: 'trade_id (or alert_id) required' });
+  const lt = STATE.live_trades[id];
+  if (!lt) return res.status(404).json({ error: 'live trade not found', id });
+  if (lt.closed) return res.status(400).json({ error: 'trade already closed' });
+
+  const exitPx = fill_price != null ? +fill_price : (lt.tracker.last_price || lt.fill_price);
+  const exitTime = fill_time || new Date().toISOString();
+  const r = lt.tracker._close('MANUAL_EXIT', exitPx, 'manual_exit', exitTime);
+  lt.closed = true;
+  lt.last_status = r;
+
+  STATE.history.push({
+    entry_type: 'REALIZED',
+    ...lt.alert,
+    ...r,
+    fill_price: lt.fill_price,
+    fill_time: lt.fill_time,
+    closed_at: new Date().toISOString(),
+  });
+
+  const pushId = lt.alert.push_id || (lt.alert.push && lt.alert.push.push_id) || null;
+  releaseStock(lt.alert.symbol, pushId, 'user_manual_exit');
+  console.log(`[T3v7] MANUAL EXIT ${lt.alert.symbol} @ ${exitPx} R=${r.bars_held}b`);
+  saveStateNow();
+  res.json({ ok: true, trade_id: id, exit_price: exitPx, exit_time: exitTime, summary: r });
 });
 
 app.get('/v8/live-trades', (req, res) => {
@@ -2704,8 +3225,58 @@ app.get('/v8/live-trades', (req, res) => {
   res.json({ live: lt.filter(l => !l.closed), closed: lt.filter(l => l.closed), history_count: STATE.history.length });
 });
 
+// v8.0.2: history now contains REALIZED + SHADOW + DISMISSED entries.
+// Use ?type=REALIZED or ?type=SHADOW or ?type=DISMISSED to filter.
 app.get('/v8/history', (req, res) => {
-  res.json({ history: STATE.history });
+  const t = req.query.type;
+  let h = [...STATE.history];
+  if (t) h = h.filter(e => e.entry_type === t);
+  // Totals
+  const realized = STATE.history.filter(e => e.entry_type === 'REALIZED');
+  const shadow = STATE.history.filter(e => e.entry_type === 'SHADOW');
+  const dismissed = STATE.history.filter(e => e.entry_type === 'DISMISSED');
+  const sumR = arr => arr.reduce((s, x) => {
+    // R captured: if outcome present, use (exit-fill)/(entry-stop). Else 0.
+    if (x.exit_price == null) return s;
+    const isUp = (x.dir === 'up') || (x.direction === 'long');
+    const fill = x.fill_price != null ? x.fill_price : x.entry_price;
+    const stopDist = Math.abs(x.entry_price - x.stop_price);
+    if (stopDist === 0) return s;
+    const captured = isUp ? (x.exit_price - fill) / stopDist : (fill - x.exit_price) / stopDist;
+    return s + captured;
+  }, 0);
+  res.json({
+    history: h,
+    totals: {
+      realized_count: realized.length,
+      realized_R: +sumR(realized).toFixed(3),
+      shadow_count: shadow.length,
+      shadow_R: +sumR(shadow).toFixed(3),
+      dismissed_open: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
+    },
+  });
+});
+
+// v8.0.2: Shadow trades (dismissed alerts being tracked in background)
+app.get('/v8/shadow-history', (req, res) => {
+  const open = Object.entries(STATE.shadow_trades)
+    .filter(([id, t]) => !t.closed)
+    .map(([id, t]) => ({
+      alert_id: id,
+      symbol: t.alert.symbol,
+      type: t.alert.type,
+      dir: t.alert.dir,
+      entry_price: t.alert.entry_price,
+      stop_price: t.alert.stop_price,
+      target_price: t.alert.target_price,
+      dismissed_at: t.dismissed_at,
+      bars_since: t.tracker ? t.tracker.bars_since_fill : 0,
+      mfe: t.tracker ? +t.tracker.mfe.toFixed(2) : 0,
+      mae: t.tracker ? +t.tracker.mae.toFixed(2) : 0,
+      current_price: t.tracker ? t.tracker.last_price : null,
+    }));
+  const closed = STATE.history.filter(e => e.entry_type === 'SHADOW');
+  res.json({ open, closed, open_count: open.length, closed_count: closed.length });
 });
 
 // AUDIT LOG — every alert that ever fired or got skipped today (permanent, never deleted)
@@ -2742,6 +3313,7 @@ app.get('/v8/status', (req, res) => {
     watchlist_count: Object.keys(STATE.watchlist).length,
     alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
     live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
+    shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
     blocked_pushes: STATE.blocked_pushes.size,
   });
 });
@@ -2844,6 +3416,7 @@ app.post('/v8/reset-day', (req, res) => {
   STATE.alerts = [];
   STATE.watchlist = {};
   STATE.audit_log = [];      // fresh audit each trading day
+  STATE.shadow_trades = {};  // v8.0.2: clear open shadow trackers
   // Keep live_trades and history
   saveStateNow();
   res.json({ ok: true });
@@ -2856,18 +3429,26 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.1 — Tier2Monitor (new pullback engine, Nifty 100 universe)',
+  engine: 'v8.0.2 — Tier2Monitor (new pullback engine, Nifty 100 universe, lifecycle release + shadow tracking + BE-window stop + leg-2 retrace gate)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
+  shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
   state_persisted: fs.existsSync(STATE_FILE),
   state_last_save: lastSaveAt ? new Date(lastSaveAt).toISOString() : null,
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0 — New Pullback Engine (deployed May 14, 2026)',
+  name: 'Signal Server v8.0.2 — New Pullback Engine + Lifecycle Release Path',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
-  endpoints: ['/v8/alerts', '/v8/watchlist', '/v8/live-trades', '/v8/history', '/v8/status', '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]', '/health', '/prices', '/candles/:symbol', '/kite/login'],
+  endpoints: [
+    '/v8/alerts', '/v8/watchlist', '/v8/live-trades', '/v8/history',
+    '/v8/shadow-history', '/v8/status',
+    '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/dismiss-alert [POST]',
+    '/v8/manual-exit-trade [POST]',
+    '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]',
+    '/health', '/prices', '/candles/:symbol', '/kite/login',
+  ],
   marketHours: isMarketHours(),
 }));
 

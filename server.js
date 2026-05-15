@@ -1073,13 +1073,20 @@ function checkPreSignalFilters(bar, ep, stop, target, ema, dayOpen, push, atr) {
   return null;
 }
 
-function buildExplanation(push, monitor, bar, sigType, score, ema) {
-  const dirStr = push.is_up ? 'UP' : 'DOWN';
-  const actStr = push.is_up ? 'LONG' : 'SHORT';
-  const ret = monitor.h1_retrace || 0;
+function buildExplanation(push, monitor, bar, sigType, score, ema, signalDir) {
+  // v8.0.2 (#11 fix): use the actual signal direction (LONG/SHORT) instead of
+  // the push direction. For counter trades, the trade direction is opposite
+  // the push. signalDir is 'up' for LONG, 'down' for SHORT.
+  const pushDirStr = push.is_up ? 'UP' : 'DOWN';
+  const sigIsLong = signalDir != null ? (signalDir === 'up') : push.is_up;
+  const actStr = sigIsLong ? 'LONG' : 'SHORT';
+  // v8.0.2 (#11 fix): use monitor.max_retrace (the actual tracked value),
+  // not the non-existent h1_retrace field. Fall back gracefully.
+  const ret = (monitor.max_retrace != null) ? monitor.max_retrace
+            : (monitor.h1_retrace || 0);
   const retDesc = ret <= 0.30 ? 'shallow flag' : ret <= 0.40 ? 'high-conviction pullback' : ret <= 0.60 ? 'moderate pullback' : 'deep pullback held at S/R';
   const parts = [];
-  parts.push(`${dirStr} push ${push.start_time}→${push.end_time} (₹${push.net_move.toFixed(1)} = ${(push.net_move/push.atr).toFixed(1)}× ATR)`);
+  parts.push(`${pushDirStr} push ${push.start_time}→${push.end_time} (₹${push.net_move.toFixed(1)} = ${(push.net_move/push.atr).toFixed(1)}× ATR)`);
   parts.push(`${retDesc}, ${(ret*100).toFixed(0)}%`);
   if (sigType && sigType.startsWith('RT')) parts.push('Pullback held at previously broken level');
   if (ema) parts.push(`Price ${bar.c > ema ? 'above' : 'below'} EMA`);
@@ -1113,8 +1120,20 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
   // SECTION 3: What happened after push
   lines.push('');
   if (isCounter) {
+    // v8.0.2 (#11 fix): describe what the new engine actually does, not the
+    // old hardcoded "80% retrace" / "1.5× target" assumption.
+    const retPctCt = sig.retrace_pct ? (sig.retrace_pct * 100).toFixed(0) : '?';
+    const trigger = sig.trigger || 'unknown';
     lines.push(`🔄 COUNTER TRADE LOGIC`);
-    lines.push(`• Push retracement exceeded 80% (push failed/reversed)`);
+    if (trigger === 'deep_retrace_pb1') {
+      lines.push(`• Pullback 1 retraced ${retPctCt}% of push (≥70% threshold met)`);
+    } else if (trigger === 'deep_retrace_pb2') {
+      lines.push(`• Pullback 2 retraced ${retPctCt}% of push after leg-2 attempt failed`);
+    } else if (trigger === 'combo' || trigger === 'combo_or_structural_break') {
+      lines.push(`• Structural break — push high/low broken by counter wave`);
+    } else {
+      lines.push(`• Counter trigger: ${trigger} (retrace ${retPctCt}%)`);
+    }
     lines.push(`• Trading AGAINST original ${pushDir} direction — now ${isUp ? 'LONG' : 'SHORT'}`);
     lines.push(`• Counter swing veto passed (no recent swing extreme within 0.5× ATR blocking entry)`);
     lines.push(`• Note: counter trades are higher-risk — push direction reversed entirely`);
@@ -1142,7 +1161,12 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
   if (isCounter) {
     lines.push(`• Original ${pushDir} momentum exhausted/reversed; ride the new direction`);
     lines.push(`• Stop ₹${sig.stop_price} = beyond recent swing extreme + 0.5× ATR`);
-    lines.push(`• Target ₹${sig.target_price} = 1.5× risk (R:R 1.5)`);
+    // v8.0.2 (#11 fix): show real R:R from the signal, not hardcoded 1.5
+    const rrCt = sig.rr || (Math.abs(sig.target_price - sig.entry_price) / Math.abs(sig.entry_price - sig.stop_price)).toFixed(2);
+    const trgPctCt = (sig.trigger === 'deep_retrace_pb2' || sig.trigger === 'combo')
+      ? '50% of leg-2 range'
+      : '50% of push extension';
+    lines.push(`• Target ₹${sig.target_price} = ${trgPctCt} (R:R ${rrCt})`);
   } else {
     lines.push(`• ${pushDir} momentum holding through pullback — expecting continuation`);
     lines.push(`• Stop ₹${sig.stop_price} = beyond pullback extreme + 1× ATR buffer`);
@@ -1630,7 +1654,7 @@ class Tier2Monitor {
       bar_count: this.bar_count, bar_time: bar.t,
       is_counter: false,
       atr: +atr.toFixed(4),  // v8.0.2: needed by Tier3Tracker for BE buffer
-      explanation: buildExplanation(push, this, bar, sigType, score, ema),
+      explanation: buildExplanation(push, this, bar, sigType, score, ema, push.dir),
     };
   }
 
@@ -1806,12 +1830,12 @@ class Tier2Monitor {
       bar_count: this.bar_count, bar_time: bar.t,
       is_counter: true,
       atr: +atr.toFixed(4),  // v8.0.2: needed by Tier3Tracker for BE buffer
-      explanation: buildExplanation(push, this, bar, publicType, score, ema),
+      explanation: buildExplanation(push, this, bar, publicType, score, ema, counterDir),
     };
   }
 }
 class Tier3Tracker {
-  constructor(alert, fillPrice, fillTime, shares) {
+  constructor(alert, fillPrice, fillTime, shares, isShadow) {
     this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;
     this.shares = shares || 1;
     this.bars_since_fill = 0; this.mfe = 0; this.mae = 0; this.exit_override = false;
@@ -1828,6 +1852,16 @@ class Tier3Tracker {
     // v8.0.2: capture ATR from alert for BE buffer (matches backtest spec).
     // Falls back to null for legacy alerts that don't carry it.
     this.atr = (alert.atr != null) ? alert.atr : null;
+    // v8.0.2 (BACKLOG #14): Distinguish shadow vs live taken trade.
+    // Shadow: early-exit rules auto-close (no real money).
+    // Live taken: early-exit rules become NOTIFY only — never auto-close.
+    // Trade closes only on target, stop (original or BE), manual exit, or EOD.
+    this.is_shadow = !!isShadow;
+    // v8.0.2 (BACKLOG #14, #16): notifications queued for orchestrator to drain
+    // and push to Telegram + dashboard. Shape:
+    //   { type: 'BE_ACTIVATE' | 'BE_RELEASE' | 'EARLY_EXIT_ADVISORY',
+    //     reason, time, current_stop, current_price, mfe, mae, unrealized_R, advisory_text }
+    this.notifications = [];
   }
   _pnl(price) {
     const isUp = this.alert.dir === 'up';
@@ -1862,6 +1896,17 @@ class Tier3Tracker {
       });
       this.current_stop = newStop;
       this.breakeven_active = true;
+      // v8.0.2 (BACKLOG #16): queue notification for live trades only
+      if (!this.is_shadow) {
+        this.notifications.push({
+          type: 'BE_ACTIVATE',
+          time: bar.t,
+          current_stop: +newStop.toFixed(2),
+          original_stop: +this.original_stop.toFixed(2),
+          current_price: +bar.c.toFixed(2),
+          unrealized_R: +unrealR.toFixed(3),
+        });
+      }
       return;
     }
 
@@ -1877,6 +1922,17 @@ class Tier3Tracker {
       this.current_stop = newStop;
       this.breakeven_active = false;
       this.breakeven_released = true;
+      // v8.0.2 (BACKLOG #16): queue notification for live trades only
+      if (!this.is_shadow) {
+        this.notifications.push({
+          type: 'BE_RELEASE',
+          time: bar.t,
+          current_stop: +newStop.toFixed(2),
+          original_stop: +this.original_stop.toFixed(2),
+          current_price: +bar.c.toFixed(2),
+          unrealized_R: +unrealR.toFixed(3),
+        });
+      }
     }
   }
   processBar(bar) {
@@ -1911,13 +1967,55 @@ class Tier3Tracker {
     // No hit on this bar — now update BE for subsequent bars based on this close
     this._updateBreakevenStop(bar, R);
     if (!this.exit_override) {
-      if (this.bars_since_fill === 2 && mR <= -0.5 && this.mfe > 0) return this._close('EARLY_EXIT', bar.c, 'bar2_reversal', bar.t);
+      // v8.0.2 (BACKLOG #14): For LIVE TAKEN trades, the early-exit rules
+      // (bar2_reversal, pattern_break, time_stagnation) become advisory only —
+      // they queue a notification but DO NOT close the trade. Engine continues
+      // to track. Trade only closes on target, original/BE stop, manual exit,
+      // or EOD. For SHADOW trades, behavior is unchanged: auto-close.
+      const advisorize = (reason, advisoryText) => {
+        if (this.is_shadow) return this._close('EARLY_EXIT', bar.c, reason, bar.t);
+        // Live: notify once per reason per trade (avoid spam every bar)
+        const alreadyFired = (this._advisories_fired = this._advisories_fired || {});
+        if (!alreadyFired[reason]) {
+          alreadyFired[reason] = true;
+          this.notifications.push({
+            type: 'EARLY_EXIT_ADVISORY',
+            reason,
+            advisory_text: advisoryText,
+            time: bar.t,
+            current_price: +bar.c.toFixed(2),
+            current_stop: +this.current_stop.toFixed(2),
+            mfe: +this.mfe.toFixed(2),
+            mae: +this.mae.toFixed(2),
+            unrealized_R: +mR.toFixed(3),
+          });
+        }
+        return null;  // do not close; fall through to open-status return below
+      };
+
+      if (this.bars_since_fill === 2 && mR <= -0.5 && this.mfe > 0) {
+        const out = advisorize('bar2_reversal',
+          'Bar 2 reversal: trade reached MFE then reversed to ≤−0.5R. Consider exiting.');
+        if (out) return out;
+      }
       if (this.alert.type === 'RT+H1' && this.alert.rt_level) {
         const lv = this.alert.rt_level;
-        if (isUp && bar.c < lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
-        if (!isUp && bar.c > lv) return this._close('EARLY_EXIT', bar.c, 'pattern_break', bar.t);
+        if (isUp && bar.c < lv) {
+          const out = advisorize('pattern_break',
+            `Pattern broken: close ${bar.c.toFixed(2)} below RT level ${lv.toFixed(2)}. Consider exiting.`);
+          if (out) return out;
+        }
+        if (!isUp && bar.c > lv) {
+          const out = advisorize('pattern_break',
+            `Pattern broken: close ${bar.c.toFixed(2)} above RT level ${lv.toFixed(2)}. Consider exiting.`);
+          if (out) return out;
+        }
       }
-      if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) return this._close('EARLY_EXIT', bar.c, 'time_stagnation', bar.t);
+      if (this.bars_since_fill >= 6 && this.mfe < 0.5 && this.mae <= -0.5) {
+        const out = advisorize('time_stagnation',
+          `Time stagnation: ${this.bars_since_fill} bars, MFE +${this.mfe.toFixed(2)}R, MAE ${this.mae.toFixed(2)}R. Consider exiting.`);
+        if (out) return out;
+      }
     }
     return {
       status: 'open',
@@ -2248,6 +2346,10 @@ const STATE = {
   shadow_trades: {},  // alert_id -> { alert, tracker, last_bar_t, dismissed_at } — what-if tracker for dismissed alerts
   history: [],        // closed live trades AND dismissed alerts (entry_type: REALIZED or SHADOW or DISMISSED)
   audit_log: [],      // ALL alerts ever fired today (permanent record, never deleted)
+  // v8.0.2 (BACKLOG #14, #16): Tier 3 notifications queued for dashboard polling.
+  // Dashboard polls /v8/tier3-notifications, sends to Telegram from browser,
+  // marks them as read via /v8/tier3-notifications/mark-read.
+  tier3_notifications: [],
   blocked_pushes: new Set(),  // push_ids that already fired (don't refire same)
   tier1_running: false,
   tier1_progress: { scanned: 0, total: 0, status: 'idle' },
@@ -2344,6 +2446,8 @@ function snapshotState() {
         breakeven_active: t.tracker.breakeven_active,
         breakeven_released: t.tracker.breakeven_released,
         stop_history: t.tracker.stop_history,
+        // v8.0.2 (BACKLOG #14): live vs shadow distinction
+        is_shadow: !!t.tracker.is_shadow,
       } : null,
     };
   }
@@ -2372,6 +2476,8 @@ function snapshotState() {
         breakeven_active: t.tracker.breakeven_active,
         breakeven_released: t.tracker.breakeven_released,
         stop_history: t.tracker.stop_history,
+        // v8.0.2 (BACKLOG #14): live vs shadow distinction
+        is_shadow: true,
       } : null,
     };
   }
@@ -2384,6 +2490,7 @@ function snapshotState() {
     shadow_trades: shadowTradesOut,
     history: STATE.history,
     audit_log: STATE.audit_log,
+    tier3_notifications: STATE.tier3_notifications || [],
     blocked_pushes: Array.from(STATE.blocked_pushes),
     tier1_at: STATE.tier1_at,
     tier2_at: STATE.tier2_at,
@@ -2440,6 +2547,7 @@ function loadState() {
     STATE.alerts = snap.alerts || [];
     STATE.history = snap.history || [];
     STATE.audit_log = snap.audit_log || [];
+    STATE.tier3_notifications = snap.tier3_notifications || [];
     STATE.blocked_pushes = new Set(snap.blocked_pushes || []);
     STATE.tier1_at = snap.tier1_at;
     STATE.tier2_at = snap.tier2_at;
@@ -2448,7 +2556,7 @@ function loadState() {
     // Live trades — reconstruct trackers from saved state
     STATE.live_trades = {};
     for (const [id, t] of Object.entries(snap.live_trades || {})) {
-      const tracker = new Tier3Tracker(t.alert, t.fill_price, t.fill_time, t.shares || 1);
+      const tracker = new Tier3Tracker(t.alert, t.fill_price, t.fill_time, t.shares || 1, false);
       if (t.tracker_state) {
         tracker.bars_since_fill = t.tracker_state.bars_since_fill || 0;
         tracker.mfe = t.tracker_state.mfe || 0;
@@ -2465,6 +2573,8 @@ function loadState() {
         tracker.breakeven_active = t.tracker_state.breakeven_active || false;
         tracker.breakeven_released = t.tracker_state.breakeven_released || false;
         tracker.stop_history = Array.isArray(t.tracker_state.stop_history) ? t.tracker_state.stop_history : [];
+        // v8.0.2 (BACKLOG #14): always re-assert live trade
+        tracker.is_shadow = false;
       }
       STATE.live_trades[id] = {
         alert: t.alert,
@@ -2482,7 +2592,7 @@ function loadState() {
     for (const [id, t] of Object.entries(snap.shadow_trades || {})) {
       const fillPx = t.alert.entry_price;
       const fillTime = t.dismissed_at || new Date().toISOString();
-      const tracker = new Tier3Tracker(t.alert, fillPx, fillTime, 1);
+      const tracker = new Tier3Tracker(t.alert, fillPx, fillTime, 1, true);
       if (t.tracker_state) {
         tracker.bars_since_fill = t.tracker_state.bars_since_fill || 0;
         tracker.mfe = t.tracker_state.mfe || 0;
@@ -2499,6 +2609,8 @@ function loadState() {
         tracker.breakeven_active = t.tracker_state.breakeven_active || false;
         tracker.breakeven_released = t.tracker_state.breakeven_released || false;
         tracker.stop_history = Array.isArray(t.tracker_state.stop_history) ? t.tracker_state.stop_history : [];
+        // v8.0.2 (BACKLOG #14): always re-assert shadow trade
+        tracker.is_shadow = true;
       }
       STATE.shadow_trades[id] = {
         alert: t.alert,
@@ -2964,6 +3076,37 @@ async function runTier3v7() {
         const r = lt.tracker.processBar(bar);
         lt.last_bar_t = bar.t;
         lt.last_status = r;
+        // v8.0.2 (BACKLOG #14, #16): drain notifications from tracker.
+        // The dashboard polls /v8/tier3-notifications and pushes to Telegram
+        // from the browser side (server has no Telegram credentials).
+        // Live trades only — shadow tracker never queues notifications.
+        if (lt.tracker.notifications && lt.tracker.notifications.length) {
+          for (const n of lt.tracker.notifications) {
+            STATE.tier3_notifications.push({
+              alert_id: id,
+              symbol: lt.alert.symbol,
+              type: lt.alert.type,
+              dir: lt.alert.dir,
+              entry_price: lt.alert.entry_price,
+              ...n,
+              created_at: new Date().toISOString(),
+              read: false,
+            });
+            STATE.audit_log.push({
+              event: 'TIER3_NOTIFY',
+              symbol: lt.alert.symbol,
+              alert_id: id,
+              notify_type: n.type,
+              reason: n.reason || null,
+              current_stop: n.current_stop,
+              current_price: n.current_price,
+              unrealized_R: n.unrealized_R,
+              time: n.time,
+              fired_at: new Date().toISOString(),
+            });
+          }
+          lt.tracker.notifications = [];
+        }
         if (r.status === 'closed') {
           lt.closed = true;
           STATE.history.push({
@@ -3064,6 +3207,11 @@ async function runTier3Shadow() {
         const r = st.tracker.processBar(bar);
         st.last_bar_t = bar.t;
         st.last_status = r;
+        // v8.0.2: shadow trackers should never queue notifications (is_shadow
+        // gate is set true at construct), but clear defensively to keep memory tidy.
+        if (st.tracker.notifications && st.tracker.notifications.length) {
+          st.tracker.notifications = [];
+        }
         if (r.status === 'closed') {
           st.closed = true;
           upgradeDismissedToShadow(id, st.alert, r, st.dismissed_at);
@@ -3113,7 +3261,7 @@ app.post('/v8/track', (req, res) => {
   if (!alert) return res.status(404).json({ error: 'alert not found' });
   alert.status = 'taken';
   const nShares = shares ? +shares : 1;
-  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString(), nShares);
+  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString(), nShares, false);
   STATE.live_trades[alert_id] = {
     alert, fill_price: +fill_price, fill_time: fill_time || new Date().toISOString(),
     shares: nShares,
@@ -3152,7 +3300,7 @@ function handleDismissAlert(req, res) {
   // 3. Start shadow tracking — use alert.entry_price as the "fill" price,
   //    alert.bar_time (or now) as the start of tracking
   const shadowFillTime = alert.bar_time || dismissedAt;
-  const tracker = new Tier3Tracker(alert, alert.entry_price, shadowFillTime, 1);
+  const tracker = new Tier3Tracker(alert, alert.entry_price, shadowFillTime, 1, true);
   STATE.shadow_trades[alert_id] = {
     alert,
     dismissed_at: dismissedAt,
@@ -3277,6 +3425,86 @@ app.get('/v8/shadow-history', (req, res) => {
     }));
   const closed = STATE.history.filter(e => e.entry_type === 'SHADOW');
   res.json({ open, closed, open_count: open.length, closed_count: closed.length });
+});
+
+// v8.0.2 (BACKLOG #14, #16): Tier 3 notifications endpoint.
+// Dashboard polls this, displays + sends to Telegram, then calls mark-read.
+app.get('/v8/tier3-notifications', (req, res) => {
+  const onlyUnread = req.query.unread === '1' || req.query.unread === 'true';
+  const list = (STATE.tier3_notifications || []).filter(n => !onlyUnread || !n.read);
+  res.json({ notifications: list, count: list.length });
+});
+
+app.post('/v8/tier3-notifications/mark-read', express.json(), (req, res) => {
+  const { alert_id, type, time } = req.body || {};
+  let updated = 0;
+  (STATE.tier3_notifications || []).forEach(n => {
+    if (n.read) return;
+    if (alert_id && n.alert_id !== alert_id) return;
+    if (type && n.type !== type) return;
+    if (time && n.time !== time) return;
+    n.read = true;
+    updated++;
+  });
+  res.json({ ok: true, marked: updated });
+});
+
+
+// Returns per-trade unrealized R for both live and shadow, plus totals.
+app.get('/v8/unrealized', (req, res) => {
+  function unrealForTracker(t) {
+    if (!t || !t.tracker) return { unreal_R: 0, current_price: null };
+    const tr = t.tracker;
+    const a = tr.alert;
+    const isUp = a.dir === 'up';
+    const fill = tr.fill_price;
+    const last = tr.last_price != null ? tr.last_price : fill;
+    const R = Math.abs(a.entry_price - (tr.original_stop || a.stop_price));
+    if (R <= 0) return { unreal_R: 0, current_price: last };
+    const m = isUp ? (last - fill) : (fill - last);
+    return { unreal_R: +(m / R).toFixed(3), current_price: last };
+  }
+  function rowFor(id, t, kind) {
+    const u = unrealForTracker(t);
+    return {
+      alert_id: id,
+      kind,
+      symbol: t.alert.symbol,
+      type: t.alert.type,
+      dir: t.alert.dir,
+      entry_price: t.alert.entry_price,
+      original_stop: t.tracker ? t.tracker.original_stop : t.alert.stop_price,
+      current_stop: t.tracker ? +t.tracker.current_stop.toFixed(2) : t.alert.stop_price,
+      target_price: t.alert.target_price,
+      current_price: u.current_price,
+      unrealized_R: u.unreal_R,
+      mfe: t.tracker ? +t.tracker.mfe.toFixed(2) : 0,
+      mae: t.tracker ? +t.tracker.mae.toFixed(2) : 0,
+      bars_since: t.tracker ? t.tracker.bars_since_fill : 0,
+      breakeven_active: t.tracker ? !!t.tracker.breakeven_active : false,
+      breakeven_released: t.tracker ? !!t.tracker.breakeven_released : false,
+      fill_time: t.fill_time || t.dismissed_at || null,
+    };
+  }
+  const live = Object.entries(STATE.live_trades)
+    .filter(([id, t]) => !t.closed)
+    .map(([id, t]) => rowFor(id, t, 'LIVE'));
+  const shadow = Object.entries(STATE.shadow_trades)
+    .filter(([id, t]) => !t.closed)
+    .map(([id, t]) => rowFor(id, t, 'SHADOW'));
+  const liveTotal = live.reduce((s, r) => s + r.unrealized_R, 0);
+  const shadowTotal = shadow.reduce((s, r) => s + r.unrealized_R, 0);
+  res.json({
+    live,
+    shadow,
+    totals: {
+      live_count: live.length,
+      live_unrealized_R: +liveTotal.toFixed(3),
+      shadow_count: shadow.length,
+      shadow_unrealized_R: +shadowTotal.toFixed(3),
+      grand_unrealized_R: +(liveTotal + shadowTotal).toFixed(3),
+    },
+  });
 });
 
 // AUDIT LOG — every alert that ever fired or got skipped today (permanent, never deleted)
@@ -3443,7 +3671,7 @@ app.get('/', (req, res) => res.json({
   universe: NSE_UNIVERSE.length,
   endpoints: [
     '/v8/alerts', '/v8/watchlist', '/v8/live-trades', '/v8/history',
-    '/v8/shadow-history', '/v8/status',
+    '/v8/shadow-history', '/v8/unrealized', '/v8/tier3-notifications', '/v8/status',
     '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/dismiss-alert [POST]',
     '/v8/manual-exit-trade [POST]',
     '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]',

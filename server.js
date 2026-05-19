@@ -1,4 +1,23 @@
 /**
+ * SIGNAL SERVER v8.0.4.1 — PB1 Classifier audit dedup fix
+ *
+ * v8.0.4.1 PATCH (19/05/2026 afternoon)
+ *   - Pb1LiveWalker: added `_audited_bar_times` Set to dedup PB1_BAR_TICK
+ *     emissions. Previously, when subsequent ticks re-walked the confirm
+ *     window starting from `reached_idx`, the same bar (e.g. the touch bar
+ *     at 12:25) was re-audited as a confirm candidate on every cycle,
+ *     producing N duplicates per bar over the wait window. Walker decision
+ *     logic unchanged — only audit output is deduplicated.
+ *
+ *   - Bug observed live at 12:25-12:55 IST 19/05/2026 on BANKBARODA: same
+ *     12:25 confirm-candidate bar emitted 8 audit rows over 8 cycles.
+ *
+ *   - Memory bound: per walker, ≤12 bars in the set; walker discarded on
+ *     resolution or push block. No retention issue.
+ *
+ *   - No change to: classifier decisions, fire timing, V5 gate logic,
+ *     wait-state transitions. Patch is audit-only.
+ *
  * SIGNAL SERVER v8.0.4 — PB1 Sub-Strategy Classifier LIVE (wait-state)
  *
  * v8.0.4 CHANGES (19/05/2026 evening) — BACKLOG #19
@@ -3239,6 +3258,9 @@ class Pb1LiveWalker {
     this.bars_seen = 0;            // bars passed to tick() after signal bar
     this.finished = false;
     this.fire_result = null;       // populated on FIRE
+    // v8.0.4 fix: dedup set of bar-times already audited as PB1_BAR_TICK to
+    // prevent re-emission when subsequent ticks re-walk the confirm window.
+    this._audited_bar_times = new Set();
   }
 
   // Returns array of per-bar audit entries (one entry per tick that's added).
@@ -3361,15 +3383,18 @@ class Pb1LiveWalker {
         // windows the first pass works correctly).
         this.consol_idx_range = pb1ZoneConsolidation(this.dayBars, this.reached_idx, this.atr);
       }
-      // Audit even when waiting for touch
-      this.audit_ticks.push({
-        event: 'PB1_BAR_TICK',
-        bar_t: bar.t,
-        bar_o: bar.o, bar_h: bar.h, bar_l: bar.l, bar_c: bar.c,
-        close_status: 'pre_reach',
-        barrier_reached: this.reached_idx !== null,
-        bars_from_walk_start: barsFromWalkStart,
-      });
+      // Audit even when waiting for touch (dedup by bar-time)
+      if (!this._audited_bar_times.has(bar.t)) {
+        this._audited_bar_times.add(bar.t);
+        this.audit_ticks.push({
+          event: 'PB1_BAR_TICK',
+          bar_t: bar.t,
+          bar_o: bar.o, bar_h: bar.h, bar_l: bar.l, bar_c: bar.c,
+          close_status: 'pre_reach',
+          barrier_reached: this.reached_idx !== null,
+          bars_from_walk_start: barsFromWalkStart,
+        });
+      }
       return { action: 'WAIT' };
     }
 
@@ -3426,24 +3451,28 @@ class Pb1LiveWalker {
 
       const gate = pb1V5Gate(cb, this.atr, status, candidateIsQrReverse);
 
-      // Per-bar audit at candidate
+      // Per-bar audit at candidate (dedup by bar-time — same bar may be
+      // re-walked on later ticks; only emit audit once per bar)
       const barRange = Math.max(cb.h - cb.l, 1e-9);
       const bodyP = Math.abs(cb.c - cb.o) / barRange;
       const closePos = (status === 'above') ? (cb.c - cb.l) / barRange : (cb.h - cb.c) / barRange;
       const rangeAtr = barRange / Math.max(this.atr, 1e-9);
-      this.audit_ticks.push({
-        event: 'PB1_BAR_TICK',
-        bar_t: cb.t,
-        bar_o: cb.o, bar_h: cb.h, bar_l: cb.l, bar_c: cb.c,
-        close_status: status,
-        candidate_confirm_dir: candidateConfirmDir,
-        candidate_has_consol: candidateHasConsol,
-        candidate_is_qr_reverse: candidateIsQrReverse,
-        body_pct: +bodyP.toFixed(3),
-        close_pos: +closePos.toFixed(3),
-        range_atr: +rangeAtr.toFixed(3),
-        v5_gate_result: gate,
-      });
+      if (!this._audited_bar_times.has(cb.t)) {
+        this._audited_bar_times.add(cb.t);
+        this.audit_ticks.push({
+          event: 'PB1_BAR_TICK',
+          bar_t: cb.t,
+          bar_o: cb.o, bar_h: cb.h, bar_l: cb.l, bar_c: cb.c,
+          close_status: status,
+          candidate_confirm_dir: candidateConfirmDir,
+          candidate_has_consol: candidateHasConsol,
+          candidate_is_qr_reverse: candidateIsQrReverse,
+          body_pct: +bodyP.toFixed(3),
+          close_pos: +closePos.toFixed(3),
+          range_atr: +rangeAtr.toFixed(3),
+          v5_gate_result: gate,
+        });
+      }
 
       if (gate === 'fail_v5_reverse') {
         this.finished = true;
@@ -3535,10 +3564,10 @@ class Pb1LiveWalker {
       return { action: 'SKIP', reason: 'no_confirm', sub_strategy: 'QR-skip' };
     }
 
-    // Standard waiting bar (we touched barrier but no confirm yet)
-    if (this.audit_ticks[this.audit_ticks.length - 1]
-        && this.audit_ticks[this.audit_ticks.length - 1].event !== 'PB1_BAR_TICK') {
-      // ensure a bar tick is emitted
+    // Standard waiting bar (we touched barrier but no confirm yet — emit
+    // once per bar via dedup; the dedup set covers all prior tick kinds too)
+    if (!this._audited_bar_times.has(bar.t)) {
+      this._audited_bar_times.add(bar.t);
       this.audit_ticks.push({
         event: 'PB1_BAR_TICK',
         bar_t: bar.t,
@@ -5135,7 +5164,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.4 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, full per-bar audit)',
+  engine: 'v8.0.4.1 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, audit dedup fix)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5144,7 +5173,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.4 — PB1 Sub-Strategy Classifier LIVE',
+  name: 'Signal Server v8.0.4.1 — PB1 Sub-Strategy Classifier LIVE (audit dedup fix)',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

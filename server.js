@@ -1,4 +1,103 @@
 /**
+ * SIGNAL SERVER v8.0.4 — PB1 Sub-Strategy Classifier LIVE (wait-state)
+ *
+ * v8.0.4 CHANGES (19/05/2026 evening) — BACKLOG #19
+ *   - Tier2Monitor LIVE wait-state. When raw PB1 (deep_retrace_pb1) would
+ *     fire AND ENABLE_PB1_SUBSTRATEGIES=true AND LOG_ONLY=false, monitor
+ *     transitions to WAITING_FOR_PB1_CONFIRM instead. New Pb1LiveWalker
+ *     processes subsequent bars one at a time:
+ *       - Identifies barrier (PathSR band / push-start / push-extreme)
+ *       - Walks forward looking for barrier touch + consolidation + confirm
+ *       - Applies V5 gate on QR-reverse candidates (skip on weak confirm)
+ *       - Fires classified alert (QR-clean-runway / QR-break / QR-continue /
+ *         QR-reverse / QR-break-against) with sub-strategy entry/stop/target
+ *       - Skips on cutoff (14:30), barrier never reached, no confirm, etc.
+ *
+ *   - Alerts that fire from the classifier carry:
+ *       trigger = 'deep_retrace_pb1'  (unchanged — Tier 3 compatibility)
+ *       sub_strategy = 'QR-break' etc. (new field)
+ *       type = 'QR_BREAK' etc.        (new per-sub display type)
+ *
+ *   - When classifier SKIPS, no alert fires. The decision and per-bar walk
+ *     are captured in audit_log as PB1_WAIT_START / PB1_BAR_TICK / PB1_SKIP
+ *     events. Full per-bar verbosity: every bar evaluated emits an audit row
+ *     with bar OHLC, close_status (above/below/inside barrier), body_pct,
+ *     close_pos, range_atr, v5_gate_result.
+ *
+ *   - Watchlist entries now store multi_day_bars (the ~5-day candle history
+ *     Kite returns), passed to Tier2Monitor as the 8th constructor arg, used
+ *     by Pb1LiveWalker for PathSR detection. Refreshed each Tier 2 cycle.
+ *
+ *   - INSTANT ROLLBACK to raw PB1 (= v8.0.2.1 behaviour): set
+ *     ENABLE_PB1_SUBSTRATEGIES=false and redeploy.
+ *
+ *   - Backtest (in-sample 13 days full universe + cross-day push fix):
+ *       Classified V5: +205.19 R (raw PB1: +15.56 R)
+ *       Per sub: QR-break +99R, QR-break-against +54R, QR-continue +10R,
+ *                QR-clean-runway +2R, QR-reverse −6R (V5-filtered)
+ *
+ *   - The /v8/pb1-shadow-log endpoint and shadow runner (added v8.0.3) are
+ *     PRESERVED but NOT USED when LOG_ONLY=false. They become active again
+ *     if you flip LOG_ONLY back to true.
+ *
+ * SIGNAL SERVER v8.0.3 — PB1 Sub-Strategy Classifier (scaffolding)
+ *
+ * v8.0.3 CHANGES (19/05/2026) — BACKLOG #19
+ *   - StreamingPushDetector (both JS in server.js and Python in
+ *     new_pullback_engine.py): hardened with date-boundary reset. If a bar
+ *     arrives with a different calendar date than the previous bar, the
+ *     detector resets internal state. Defence-in-depth fix for bug #22
+ *     (cross-day push stitching). Live server's Tier 1 already filters to
+ *     single-day bars before calling the detector, so this reset never fires
+ *     in production today — but protects any future caller (e.g. backtest
+ *     harness) that feeds multi-day bars.
+ *
+ *   - PathSR detector (JS port of luxsr_v2.py): LonesomeTheBlue
+ *     pivot-channel detector with proximity boost. Output: top-N bands with
+ *     high/low/mid/strength. Used by the PB1 sub-strategy classifier to find
+ *     path blockers between entry and target.
+ *
+ *   - PB1 sub-strategy classifier (JS port of
+ *     backtest_pb1_sub_strategies.py): routes raw deep_retrace_pb1 fires
+ *     into one of 5 sub-strategies based on barriers in the path:
+ *       QR-clean-runway / QR-break / QR-continue / QR-reverse / QR-break-against
+ *     With V5 gate that skips weak QR-reverse confirms (body<50% OR close
+ *     not in favourable 30% of range OR range<0.5×ATR).
+ *
+ *     Backtest (in-sample 13 days full universe, OOS 5 stocks varied months):
+ *       In-sample: classified +198.84 R vs raw +15.56 R (+183 R uplift)
+ *       OOS: classified +18.82 R vs raw +8.06 R (+10.76 R uplift)
+ *     QR-reverse loss reduced 101 fires/−16.07R → 55 fires/−6.11R (in-sample)
+ *
+ *   - DEPLOY MODE: classifier ENABLED in LOG_ONLY mode.
+ *       NEW_CFG.ENABLE_PB1_SUBSTRATEGIES = true   (classifier runs)
+ *       NEW_CFG.PB1_SUBSTRATEGIES_LOG_ONLY = true (raw PB1 still drives live)
+ *
+ *     Raw PB1 fires exactly as v8.0.2.1 — same alerts to dashboard + Telegram,
+ *     same Tier 3 tracking, same trade outcomes. Classifier runs in parallel:
+ *     each raw PB1 fire is queued; once 12+ bars accumulate (or day ends),
+ *     runner evaluates what the classifier WOULD have done and writes it to
+ *     /v8/pb1-shadow-log alongside the raw fire. Use this for several days
+ *     of comparison before deciding to flip LOG_ONLY=false.
+ *
+ *     INSTANT ROLLBACK: set ENABLE_PB1_SUBSTRATEGIES=false and redeploy.
+ *     Production reverts to exact v8.0.2.1 behaviour. No code rollback needed.
+ *
+ *     LOG_ONLY mode does NOT flip live behaviour to classified firing. That
+ *     requires the wait-state implementation (v8.0.4 — not in this ship).
+ *
+ *   - New endpoint /v8/pb1-shadow-log: returns shadow comparison entries
+ *     and per-sub-strategy WR/EV summary.
+ *
+ *   - /v8/status now reports pb1_substrategies block (enabled / log_only /
+ *     pending_count / log_count).
+ *
+ *   - /v8/reset-day clears pb1_shadow_pending and pb1_shadow_log alongside
+ *     other per-day state.
+ *
+ *   - NO change to: live alert firing path, Tier 3, dashboard contract,
+ *     state file shape (new fields are additive). Rollback = flip the flag.
+ *
  * SIGNAL SERVER v8.0.2 — Lifecycle Release + Shadow Tracking + BE-Window + Leg-2 Gate
  *
  * v8.0.2 CHANGES (May 13, 2026 evening) — BACKLOG #1
@@ -782,6 +881,60 @@ const NEW_CFG = {
   // v8.0.2 (BACKLOG #9): Leg-2 retrace gate on counter signals
   ENABLE_LEG2_RETRACE_GATE: true,
   LEG2_RETRACE_MIN: 0.40,      // reject counter fire if leg-2 retrace < this
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v8.0.3 — PB1 SUB-STRATEGY CLASSIFIER (BACKLOG #19)
+  // ─────────────────────────────────────────────────────────────────────
+  // When ENABLED: PB1 (deep_retrace_pb1) does NOT fire immediately on the
+  // deep-retrace bar. Instead the monitor enters WAITING_FOR_PB1_CONFIRM,
+  // identifies the nearest barrier (PathSR band / push-start / push-extreme)
+  // and walks forward looking for a confirmation bar. On confirmation, fires
+  // with sub-strategy-specific entry/stop/target (QR-clean-runway, QR-break,
+  // QR-continue, QR-reverse, QR-break-against). The V5 gate skips QR-reverse
+  // candidates whose confirm bar is weak (body<50%, close not in favourable
+  // 30% of range, or range<0.5×ATR).
+  //
+  // LOG_ONLY: when ENABLE is true AND LOG_ONLY is true, classifier runs but
+  // does NOT change live fires. PB1 fires raw as today; classifier output is
+  // logged to /v8/pb1-shadow-log for offline comparison. Use this to validate
+  // classifier behaviour for several days before flipping LOG_ONLY=false.
+  //
+  // v8.0.4 ship: classifier ENABLED LIVE. Raw PB1 is intercepted by the
+  // wait-state walker. Alerts fire as one of the 5 sub-strategies, with
+  // entry/stop/target per STRATEGY_SPEC_19_v2. To revert to raw PB1
+  // behaviour (= v8.0.2.1): flip ENABLE_PB1_SUBSTRATEGIES to false.
+  // LOG_ONLY=true (with ENABLE=true) would re-enable shadow logging beside
+  // raw PB1 fires; leave false to make the classifier authoritative.
+  ENABLE_PB1_SUBSTRATEGIES: true,
+  PB1_SUBSTRATEGIES_LOG_ONLY: false,
+
+  // Classifier knobs (mirror backtest)
+  PB1_RUNWAY_THRESHOLD_ATR: 1.5,
+  PB1_CONFIRM_BARS_REQUIRED: 2,
+  PB1_MIN_RR: 1.0,
+  PB1_STOP_ATR_CLEAN: 1.5,
+  PB1_BUFFER_ATR: 0.25,
+  PB1_MIN_BODY_PCT: 0.30,
+  PB1_ZONE_MIN_BARS: 4,
+  PB1_ZONE_MAX_WIN: 12,
+  PB1_ZONE_HEIGHT_ATR: 1.25,
+  PB1_ZONE_SLOPE_PCT: 0.15,
+  PB1_FALLBACK_RR: 1.0,
+  PB1_MAX_LOOKAHEAD: 15,
+  PB1_ENTRY_CUTOFF_HM: 1430,  // hard 14:30 IST cutoff for new entries
+  PB1_V5_BODY_MIN: 0.50,
+  PB1_V5_CLOSE_POS_MIN: 0.70,
+  PB1_V5_RANGE_ATR_MIN: 0.50,
+
+  // PathSR detector knobs (port of luxsr_v2.py)
+  PATHSR_PIVOT_PERIOD: 3,
+  PATHSR_CHANNEL_WIDTH_PCT: 5.0,
+  PATHSR_MIN_STRENGTH: 20,
+  PATHSR_LOOPBACK: 390,
+  PATHSR_MAX_CHANNELS: 6,
+  PATHSR_RANGE_WINDOW: 300,
+  PATHSR_PROXIMITY_ATR_MULT: 1.0,
+  PATHSR_PROXIMITY_MULTIPLIER: 1.5,
 };
 
 function barMove(bar, prevClose) {
@@ -1221,7 +1374,7 @@ class Tier2Monitor {
    * If absent (e.g. someone rolls back the orchestrator), the class falls
    * back to elapsedCandles only — stop will be tighter than Python intends.
    */
-  constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles, dayBarsRef) {
+  constructor(push, srLevels, brokenSR, contextScore, dayOpen, priorCandles, dayBarsRef, multiDayBars) {
     this.push = push;
     this.sr_levels = srLevels || [];
     this.broken_sr = brokenSR || [];
@@ -1230,6 +1383,9 @@ class Tier2Monitor {
     this.day_open = dayOpen;
     this.rsi_candles = priorCandles || [];
     this.day_bars_ref = dayBarsRef || []; // 7th-arg fallback
+    // v8.0.4: 8th arg — multi-day candles for PathSR detection in the wait-state
+    // walker. Optional; if not supplied, PathSR runs on day_bars_ref + elapsed.
+    this.multi_day_bars = multiDayBars || null;
     this.bar_count = 0;
     this.prev_close = push.end_price;
     this.elapsed_candles = [];
@@ -1255,6 +1411,11 @@ class Tier2Monitor {
     // Orchestrator drains this after each processBar call and appends to
     // STATE.audit_log so we can validate the rule live.
     this.leg2_rejections = [];
+    // v8.0.4: PB1 live wait-state walker. Holds a Pb1LiveWalker when in
+    // state WAITING_FOR_PB1_CONFIRM. Orchestrator drains pb1_audit_ticks
+    // after each processBar.
+    this.pb1_walker = null;
+    this.pb1_audit_ticks = [];
   }
 
   _result(action, reason, signal) {
@@ -1295,6 +1456,27 @@ class Tier2Monitor {
     const rsi = (rsiOv != null) ? rsiOv : computeRSIEngine([...this.rsi_candles, ...this.elapsed_candles]);
     const isUp = this.push.is_up;
 
+    // v8.0.4: WAITING_FOR_PB1_CONFIRM — feed bar through walker, drain audit.
+    // Walker enforces its own bar limit (12 bars from barrier touch); MAX_BARS
+    // is bypassed so the classifier gets the bar budget it needs.
+    if (this.state === 'WAITING_FOR_PB1_CONFIRM' && this.pb1_walker) {
+      const wr = this.pb1_walker.tick(bar);
+      this.pb1_audit_ticks.push(...this.pb1_walker.drainTicks());
+      this.prev_close = bar.c;
+      if (wr.action === 'FIRE') {
+        const sig = this._buildClassifiedCounterSignal(bar, ema, rsi, this.pb1_walker);
+        if (sig) {
+          this.state = 'FIRED';
+          return this._result('SIGNAL', `CLASSIFIED ${sig.sub_strategy} ${sig.score}`, sig);
+        }
+        return this._result('DUMP', `classified fire build failed for ${this.pb1_walker.fire_result?.sub_strategy}`);
+      }
+      if (wr.action === 'SKIP') {
+        return this._result('DUMP', `pb1_classifier_skip:${wr.reason}`);
+      }
+      return this._result('WAIT', this.state);
+    }
+
     if (this.bar_count > ENG.MAX_BARS) {
       this.prev_close = bar.c;
       return this._result('DUMP', 'Timeout 12 bars');
@@ -1331,6 +1513,29 @@ class Tier2Monitor {
       this.prev_close = bar.c;
       // Even on first counter, check deep retrace (Quick Reversal)
       if (this.max_retrace > NEW_CFG.RETRACE_DEEP_PULLBACK_1) {
+        // v8.0.4: try classifier wait-state intercept
+        const intercept = this._maybeEnterPb1Wait(bar);
+        if (intercept) {
+          this.pb1_walker = intercept.walker;
+          this.pb1_audit_ticks.push(...this.pb1_walker.drainTicks());
+          if (intercept.action.action === 'FIRE') {
+            const sig = this._buildClassifiedCounterSignal(bar, ema, rsi, this.pb1_walker);
+            if (sig) {
+              this.state = 'FIRED';
+              return this._result('SIGNAL', `CLASSIFIED ${sig.sub_strategy} ${sig.score}`, sig);
+            }
+            this.state = 'WAITING_FOR_PB1_CONFIRM';
+            return this._result('DUMP', `classified fire build failed for ${this.pb1_walker.fire_result?.sub_strategy}`);
+          }
+          if (intercept.action.action === 'SKIP') {
+            this.state = 'WAITING_FOR_PB1_CONFIRM';
+            return this._result('DUMP', `pb1_classifier_skip:${intercept.action.reason}`);
+          }
+          // WAIT
+          this.state = 'WAITING_FOR_PB1_CONFIRM';
+          return this._result('WAIT', this.state);
+        }
+        // Fallback / not-intercepted: original raw PB1 path
         const sig = this._buildCounterSignal(bar, ema, rsi, 'deep_retrace_pb1', false);
         if (sig) {
           this.state = 'FIRED';
@@ -1399,6 +1604,29 @@ class Tier2Monitor {
         }
         this.max_retrace = Math.max(this.max_retrace, computeRetrace(bar, this.push));
         if (this.max_retrace > NEW_CFG.RETRACE_DEEP_PULLBACK_1) {
+          // v8.0.4: try classifier wait-state intercept
+          const intercept = this._maybeEnterPb1Wait(bar);
+          if (intercept) {
+            this.pb1_walker = intercept.walker;
+            this.pb1_audit_ticks.push(...this.pb1_walker.drainTicks());
+            if (intercept.action.action === 'FIRE') {
+              const sig = this._buildClassifiedCounterSignal(bar, ema, rsi, this.pb1_walker);
+              if (sig) {
+                this.state = 'FIRED';
+                return this._result('SIGNAL', `CLASSIFIED ${sig.sub_strategy} ${sig.score}`, sig);
+              }
+              this.state = 'WAITING_FOR_PB1_CONFIRM';
+              return this._result('DUMP', `classified fire build failed for ${this.pb1_walker.fire_result?.sub_strategy}`);
+            }
+            if (intercept.action.action === 'SKIP') {
+              this.state = 'WAITING_FOR_PB1_CONFIRM';
+              return this._result('DUMP', `pb1_classifier_skip:${intercept.action.reason}`);
+            }
+            // WAIT
+            this.state = 'WAITING_FOR_PB1_CONFIRM';
+            return this._result('WAIT', this.state);
+          }
+          // Fallback / not-intercepted: original raw PB1 path
           const sig = this._buildCounterSignal(bar, ema, rsi, 'deep_retrace_pb1', false);
           if (sig) {
             this.state = 'FIRED';
@@ -1601,6 +1829,125 @@ class Tier2Monitor {
       };
     }
     return { rejected: false, retrace_pct: +retracePct.toFixed(3), reason: null };
+  }
+
+  // v8.0.4 — Decides whether the raw PB1 fire should be intercepted by the
+  // sub-strategy classifier wait-state.
+  //
+  // Returns:
+  //   null              → not intercepted; caller should fire raw PB1 as today
+  //   { walker, action } → intercepted; caller transitions state per action.
+  //     action.action === 'FIRE'  → walker resolved immediately (QR-clean-runway)
+  //                                  → caller builds classified signal & FIRES
+  //     action.action === 'SKIP'  → walker resolved immediately (no_barriers, etc.)
+  //                                  → caller should NOT fire (alert silenced),
+  //                                    return DUMP with skip reason
+  //     action.action === 'WAIT'  → caller transitions to WAITING_FOR_PB1_CONFIRM
+  //                                  and returns WAIT
+  _maybeEnterPb1Wait(bar) {
+    if (!NEW_CFG.ENABLE_PB1_SUBSTRATEGIES) return null;
+    if (NEW_CFG.PB1_SUBSTRATEGIES_LOG_ONLY) return null;
+    // PathSR needs multi-day bars. If monitor wasn't constructed with them,
+    // fall back gracefully — skip the intercept and let raw PB1 fire.
+    if (!this.multi_day_bars || !this.multi_day_bars.length) return null;
+
+    // Compute PathSR bands as of the signal bar.
+    let mdSigIdx = -1;
+    for (let i = this.multi_day_bars.length - 1; i >= 0; i--) {
+      if (this.multi_day_bars[i].t === bar.t) { mdSigIdx = i; break; }
+    }
+    if (mdSigIdx < 0) mdSigIdx = this.multi_day_bars.length - 1;
+    const bands = detectPathSRChannels(this.multi_day_bars, mdSigIdx);
+
+    // Day bars buffer = today's bars from start of day up to signal bar.
+    // We use day_bars_ref (today's bars set at watchlist time) plus elapsed
+    // candles, dedup by timestamp.
+    const todayDate = bar.t.slice(0, 10);
+    const allTodayMap = new Map();
+    for (const c of this.day_bars_ref || []) {
+      if (c.t.slice(0, 10) === todayDate) allTodayMap.set(c.t, c);
+    }
+    for (const c of this.elapsed_candles) {
+      if (c.t.slice(0, 10) === todayDate) allTodayMap.set(c.t, c);
+    }
+    if (!allTodayMap.has(bar.t)) allTodayMap.set(bar.t, bar);
+    const dayBarsAtStart = Array.from(allTodayMap.values())
+      .sort((a, b) => a.t.localeCompare(b.t));
+    const sigBarIdx = dayBarsAtStart.findIndex(b2 => b2.t === bar.t);
+    if (sigBarIdx < 0) return null;
+
+    const tradeDir = this.push.is_up ? 'short' : 'long';
+
+    const walker = new Pb1LiveWalker({
+      sigBar: bar,
+      sigBarIdx,
+      push: this.push,
+      atr: this.atr,
+      bands,
+      tradeDir,
+      dayBarsAtStart,
+      signalDate: todayDate,
+    });
+    const action = walker.startTicks();
+    return { walker, action };
+  }
+
+  // v8.0.4 — Build a classified counter signal from a walker's fire_result.
+  // Returns a signal dict shaped like _buildCounterSignal output (so the
+  // orchestrator alert-shipping code requires no changes downstream).
+  _buildClassifiedCounterSignal(bar, ema, rsi, walker) {
+    const tr = walker.fire_result;
+    if (!tr) return null;
+    const push = this.push;
+    const atr = this.atr;
+    const counterDir = tr.trade_direction === 'long' ? 'up' : 'down';
+
+    // Score using engine's standard counter scoring path, so the alarm/
+    // conviction logic downstream works unchanged.
+    const pseudo = { ...push, is_up: counterDir === 'up', dir: counterDir };
+    const sigBarForScore = { ...bar, c: tr.entry_price };
+    let [score, bd] = scoreSignal(
+      pseudo, 0.0, 0, sigBarForScore, this.sr_levels, ema,
+      this.context_score, atr, 'COUNTER', rsi
+    );
+
+    // Map sub-strategy to publicType for dashboard. Each sub-strategy gets
+    // its own type name so they're visually distinct in the alerts list.
+    const subToType = {
+      'QR-clean-runway': 'QR_CLEAN_RUNWAY',
+      'QR-break': 'QR_BREAK',
+      'QR-continue': 'QR_CONTINUE',
+      'QR-reverse': 'QR_REVERSE',
+      'QR-break-against': 'QR_BREAK_AGAINST',
+    };
+    const publicType = subToType[tr.sub_strategy] || 'QUICK_REVERSAL';
+
+    const stopDist = Math.abs(tr.entry_price - tr.stop_price);
+
+    return {
+      type: publicType,
+      trigger: 'deep_retrace_pb1',
+      sub_strategy: tr.sub_strategy,
+      dir: counterDir,
+      push_id: push.push_id,
+      push_start: push.start_time, push_end: push.end_time,
+      push_extreme: push.extreme, push_move: push.net_move,
+      entry_time: bar.t.slice(11, 16),
+      entry_price: tr.entry_price,
+      stop_price: tr.stop_price,
+      target_price: tr.target_price,
+      stop_dist: +stopDist.toFixed(2),
+      rr: tr.rr,
+      retrace_pct: +this.max_retrace.toFixed(3),
+      score, breakdown: bd,
+      rt_level: null, rt_tier: null,
+      bar_count: this.bar_count, bar_time: bar.t,
+      is_counter: true,
+      atr: +atr.toFixed(4),
+      barrier_type: tr.barrier_type,
+      classified: true,  // marker for dashboard / audit
+      explanation: buildExplanation(push, this, bar, publicType, score, ema, counterDir),
+    };
   }
 
   _buildContinuationSignal(bar, score, bd, sigType, rt, ema) {
@@ -2167,6 +2514,7 @@ class StreamingPushDetector {
     this.atr = atr;
     this.minBars = minBars || 3;
     this.reset();
+    this._lastBarDate = null;  // v8.0.3: defensive cross-day reset
   }
   reset() {
     this.state = 'IDLE';
@@ -2181,6 +2529,16 @@ class StreamingPushDetector {
     this.idleStreakBars = [];
   }
   processBar(bar) {
+    // v8.0.3 (defensive fix for bug #22): if bar is from a different calendar
+    // date than the previous bar, reset detector state so pushes never stitch
+    // across an overnight gap. Production server already filters to single-day
+    // bars before this is called, so this only fires if a future caller passes
+    // multi-day data. Cheap insurance.
+    const barDate = (bar && bar.t) ? bar.t.slice(0, 10) : null;
+    if (barDate && this._lastBarDate && barDate !== this._lastBarDate) {
+      this.reset();
+    }
+    if (barDate) this._lastBarDate = barDate;
     const idx = this.candles.length;
     const prevClose = this.candles.length ? this.candles[this.candles.length-1].c : 0;
     const cls = classifyBar(bar, prevClose, this.atr);
@@ -2316,6 +2674,891 @@ function eventToQualifyingPush(event, atr, minAtrMult, minSlopePct, minBars) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PATHSR DETECTOR (port of luxsr_v2.py)
+// ═══════════════════════════════════════════════════════════════════════════
+// LonesomeTheBlue "Support Resistance Channels" pivot-channel detector with
+// proximity boost. Output is BANDS (high/low/mid), not single price lines,
+// so consolidation zones are naturally captured. Distinct from computeSR
+// above which is used for the engine's push scoring; PathSR is used by the
+// PB1 sub-strategy classifier to identify path blockers in the trade path.
+
+function pathsrFindPivots(bars, prd) {
+  const pivots = [];
+  const n = bars.length;
+  for (let i = prd; i < n - prd; i++) {
+    const hi = bars[i].h, lo = bars[i].l;
+    let isPh = true, isPl = true;
+    // Strict > on left side, >= on right side (matches Python detector)
+    for (let j = i - prd; j < i; j++) {
+      if (!(hi > bars[j].h)) isPh = false;
+      if (!(lo < bars[j].l)) isPl = false;
+    }
+    if (isPh || isPl) {
+      for (let j = i + 1; j <= i + prd; j++) {
+        if (isPh && !(hi >= bars[j].h)) isPh = false;
+        if (isPl && !(lo <= bars[j].l)) isPl = false;
+      }
+    }
+    if (isPh) pivots.push([i, hi, 'H']);
+    if (isPl) pivots.push([i, lo, 'L']);
+  }
+  return pivots;
+}
+
+function pathsrAtr(bars, n) {
+  if (bars.length < 2) return null;
+  const trs = [];
+  for (let i = 1; i < bars.length; i++) {
+    const h = bars[i].h, l = bars[i].l, pc = bars[i - 1].c;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  const slice = trs.slice(-n);
+  return slice.reduce((s, x) => s + x, 0) / Math.min(n, trs.length);
+}
+
+function detectPathSRChannels(bars, signalIdx, opts) {
+  opts = opts || {};
+  const prd = opts.prd != null ? opts.prd : NEW_CFG.PATHSR_PIVOT_PERIOD;
+  const channelWPct = opts.channelWPct != null ? opts.channelWPct : NEW_CFG.PATHSR_CHANNEL_WIDTH_PCT;
+  const minStrength = opts.minStrength != null ? opts.minStrength : NEW_CFG.PATHSR_MIN_STRENGTH;
+  const loopback = opts.loopback != null ? opts.loopback : NEW_CFG.PATHSR_LOOPBACK;
+  const maxChannels = opts.maxChannels != null ? opts.maxChannels : NEW_CFG.PATHSR_MAX_CHANNELS;
+  const rangeWindow = opts.rangeWindow != null ? opts.rangeWindow : NEW_CFG.PATHSR_RANGE_WINDOW;
+  const proximityAtrMult = opts.proximityAtrMult != null ? opts.proximityAtrMult : NEW_CFG.PATHSR_PROXIMITY_ATR_MULT;
+  const proximityMult = opts.proximityMult != null ? opts.proximityMult : NEW_CFG.PATHSR_PROXIMITY_MULTIPLIER;
+
+  const available = bars.slice(0, signalIdx + 1);
+  if (available.length < prd * 2 + 5) return [];
+  const pivots = pathsrFindPivots(available, prd);
+  const keep = pivots.filter(p => signalIdx - p[0] <= loopback);
+  if (!keep.length) return [];
+
+  const winStart = Math.max(0, signalIdx - rangeWindow + 1);
+  const wb = available.slice(winStart, signalIdx + 1);
+  if (!wb.length) return [];
+  const pdh = Math.max(...wb.map(b => b.h));
+  const pdl = Math.min(...wb.map(b => b.l));
+  const cw = (pdh - pdl) * channelWPct / 100;
+  if (cw <= 0) return [];
+
+  const curPrice = available[available.length - 1].c;
+  const atr = pathsrAtr(available.slice(-30), 14) || 1.0;
+
+  const candidates = [];
+  for (const [pidx, pp, pt] of keep) {
+    let lo = pp, hi = pp;
+    const inc = [];
+    for (const [pidx2, pp2, pt2] of keep) {
+      const w = (pp2 <= hi) ? (hi - pp2) : (pp2 - lo);
+      if (w <= cw) {
+        if (pp2 <= hi) lo = Math.min(lo, pp2);
+        else hi = Math.max(hi, pp2);
+        inc.push([pidx2, pp2, pt2]);
+      }
+    }
+    candidates.push({ hi, lo, strength: inc.length * 20, n_pivots: inc.length });
+  }
+
+  const loopStart = Math.max(0, signalIdx - loopback);
+  const lb = available.slice(loopStart, signalIdx + 1);
+  for (const c of candidates) {
+    let t = 0;
+    for (const b of lb) {
+      if ((b.h <= c.hi && b.h >= c.lo) || (b.l <= c.hi && b.l >= c.lo)) t++;
+    }
+    c.n_touches = t;
+    c.strength += t;
+    const bandMid = (c.hi + c.lo) / 2;
+    if (Math.abs(bandMid - curPrice) <= proximityAtrMult * atr) {
+      c.strength = Math.floor(c.strength * proximityMult);
+      c.proximity_boosted = true;
+    } else {
+      c.proximity_boosted = false;
+    }
+  }
+  candidates.sort((a, b) => b.strength - a.strength);
+
+  const final = [];
+  for (const c of candidates) {
+    if (c.strength < minStrength) continue;
+    // Skip if overlaps a stronger band already kept
+    const overlap = final.some(f => !(c.hi < f.low || c.lo > f.high));
+    if (overlap) continue;
+    final.push({
+      high: c.hi, low: c.lo, mid: (c.hi + c.lo) / 2,
+      strength: c.strength, n_pivots: c.n_pivots,
+      n_touches: c.n_touches, proximity_boosted: c.proximity_boosted,
+    });
+    if (final.length >= maxChannels) break;
+  }
+  return final;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PB1 SUB-STRATEGY CLASSIFIER (port of backtest_pb1_sub_strategies.py)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Routes a raw deep_retrace_pb1 fire into one of 5 sub-strategies based on
+// what sits ahead of entry (PathSR band, push start, push extreme) and how
+// price behaves there. V5 gate skips weak QR-reverse confirms.
+//
+// Inputs:
+//   dayBars      — full day's 5-min bars up to and including signal bar
+//   multiDayBars — multi-day bars (today + prior days) for PathSR detection
+//   sigIdx       — index in dayBars of the deep-retrace bar (where engine
+//                  would have fired raw PB1)
+//   push         — push dict from engine (start_price, extreme, is_up, ...)
+//   atr          — ATR at signal time
+//
+// Output: { sub_strategy, entry, stop, target, ... } OR { _skip_reason, ... }
+//
+// Live integration note: in live mode we get one bar at a time, so the
+// classifier exposes both a walk function (when full bars are available, e.g.
+// in test mode) AND a step function for the wait-state path. Both share the
+// same V5 logic.
+
+function pb1ZoneConsolidation(bars, startIdx, atr) {
+  const minBars = NEW_CFG.PB1_ZONE_MIN_BARS;
+  const maxWin = NEW_CFG.PB1_ZONE_MAX_WIN;
+  const heightAtr = NEW_CFG.PB1_ZONE_HEIGHT_ATR;
+  const slopePct = NEW_CFG.PB1_ZONE_SLOPE_PCT;
+  let best = null;
+  for (let s = startIdx; s < Math.min(startIdx + 8, bars.length - minBars); s++) {
+    for (let n = minBars; n <= maxWin && s + n <= bars.length; n++) {
+      const slice = bars.slice(s, s + n);
+      const hi = Math.max(...slice.map(b => b.h));
+      const lo = Math.min(...slice.map(b => b.l));
+      const height = hi - lo;
+      if (height > atr * heightAtr) break;
+      const firstMid = (slice[0].h + slice[0].l) / 2;
+      const lastMid = (slice[slice.length - 1].h + slice[slice.length - 1].l) / 2;
+      const slope = Math.abs(lastMid - firstMid) / Math.max(firstMid, 1e-9) * 100;
+      if (slope > slopePct) continue;
+      if (!best || n > best[2]) best = [s, s + n - 1, n, lo, hi, slope];
+    }
+  }
+  return best;  // [start, end, n_bars, low, high, slope_pct] or null
+}
+
+function pb1BarAfterCutoff(bar, cutoffHm) {
+  // bar.t is ISO; pull HH:MM, compare to HHMM int
+  const t = bar.t || '';
+  if (t.length < 16) return false;
+  const hm = parseInt(t.slice(11, 13)) * 100 + parseInt(t.slice(14, 16));
+  return hm > cutoffHm;
+}
+
+// Evaluates whether a candidate confirm bar passes the V5 gate.
+// candidateIsQrReverse: true iff this bar's classification would be QR-reverse
+//                       (against original direction AND has 4+ bar consolidation)
+// Returns 'ok' | 'fail_v5_reverse' | 'fail_baseline'
+function pb1V5Gate(bar, atr, status, candidateIsQrReverse) {
+  const barRange = Math.max(bar.h - bar.l, 1e-9);
+  const bodyP = Math.abs(bar.c - bar.o) / barRange;
+  // close_pos: 1.0 means closed at the favourable extreme of the bar.
+  // status 'above' → want close near HIGH; status 'below' → near LOW.
+  const closePos = (status === 'above')
+    ? (bar.c - bar.l) / barRange
+    : (bar.h - bar.c) / barRange;
+  const rangeAtr = barRange / Math.max(atr, 1e-9);
+
+  // Baseline body>=30% always required
+  const baselineOk = bodyP >= NEW_CFG.PB1_MIN_BODY_PCT;
+  if (!baselineOk) return 'fail_baseline';
+
+  if (!candidateIsQrReverse) return 'ok';
+
+  // V5: QR-reverse path needs all three.
+  const v5ok = (bodyP >= NEW_CFG.PB1_V5_BODY_MIN
+                && closePos >= NEW_CFG.PB1_V5_CLOSE_POS_MIN
+                && rangeAtr >= NEW_CFG.PB1_V5_RANGE_ATR_MIN);
+  return v5ok ? 'ok' : 'fail_v5_reverse';
+}
+
+// Builds barrier list (PathSR bands + push-start + push-extreme) ahead of entry.
+// Returns sorted nearest-first plus a list of crossed barriers behind entry.
+function pb1BuildBarriers(entryPrice, tradeDir, bands, pushStart, pushExtreme) {
+  const aheadList = [];
+  const behindList = [];
+  const isLong = tradeDir === 'long';
+  for (const b of bands) {
+    if (isLong) {
+      if (b.low > entryPrice) aheadList.push({ type: 'band', low: b.low, high: b.high, mid: b.mid, dist: b.low - entryPrice });
+      else if (b.high < entryPrice) behindList.push({ type: 'band', low: b.low, high: b.high, mid: b.mid, dist: entryPrice - b.high });
+    } else {
+      if (b.high < entryPrice) aheadList.push({ type: 'band', low: b.low, high: b.high, mid: b.mid, dist: entryPrice - b.high });
+      else if (b.low > entryPrice) behindList.push({ type: 'band', low: b.low, high: b.high, mid: b.mid, dist: b.low - entryPrice });
+    }
+  }
+  const addPoint = (name, px) => {
+    if (px == null) return;
+    if (isLong) {
+      if (px > entryPrice) aheadList.push({ type: name, low: px, high: px, mid: px, dist: px - entryPrice });
+      else if (px < entryPrice) behindList.push({ type: name, low: px, high: px, mid: px, dist: entryPrice - px });
+    } else {
+      if (px < entryPrice) aheadList.push({ type: name, low: px, high: px, mid: px, dist: entryPrice - px });
+      else if (px > entryPrice) behindList.push({ type: name, low: px, high: px, mid: px, dist: px - entryPrice });
+    }
+  };
+  addPoint('push_start', pushStart);
+  addPoint('push_extreme', pushExtreme);
+  aheadList.sort((a, b) => a.dist - b.dist);
+  behindList.sort((a, b) => a.dist - b.dist);
+  return { ahead: aheadList, behind: behindList };
+}
+
+// Cascade target picker. Excludes the barrier we just broke (exclude_lo/hi).
+function pb1ComputeTarget(entry, tradeDir, stopDist, bands, pushStart, pushExtreme, excludeLo, excludeHi) {
+  const isLong = tradeDir === 'long';
+  const sign = isLong ? 1 : -1;
+  const minRR = NEW_CFG.PB1_MIN_RR;
+  const candidates = [];
+  for (const b of bands) {
+    if (isLong) {
+      if (b.low > entry) {
+        if (excludeLo != null && excludeHi != null && b.low === excludeLo && b.high === excludeHi) continue;
+        candidates.push({ px: b.low, dist: b.low - entry });
+      }
+    } else {
+      if (b.high < entry) {
+        if (excludeLo != null && excludeHi != null && b.low === excludeLo && b.high === excludeHi) continue;
+        candidates.push({ px: b.high, dist: entry - b.high });
+      }
+    }
+  }
+  if (pushStart != null) {
+    const dist = isLong ? (pushStart - entry) : (entry - pushStart);
+    if (dist > 0) candidates.push({ px: pushStart, dist });
+  }
+  if (pushExtreme != null) {
+    const dist = isLong ? (pushExtreme - entry) : (entry - pushExtreme);
+    if (dist > 0) candidates.push({ px: pushExtreme, dist });
+  }
+  candidates.sort((a, b) => a.dist - b.dist);
+  for (const c of candidates) {
+    if (c.dist >= minRR * stopDist) return c.px;
+  }
+  // Fallback: 1R in trade direction (matches backtest spec, locked decision)
+  return entry + sign * NEW_CFG.PB1_FALLBACK_RR * stopDist;
+}
+
+// Full walk-and-classify (used in shadow LOG_ONLY mode where we have the
+// full bar series). Returns trade dict OR { _skip_reason, sub_strategy }.
+function pb1ClassifyAtSignal(dayBars, sigIdx, push, atr, multiDayBars) {
+  const isUpPush = push.is_up;
+  const tradeDir = isUpPush ? 'short' : 'long';   // PB1 is counter-trade
+  const sigBar = dayBars[sigIdx];
+  if (!sigBar) return { _skip_reason: 'no_signal_bar', sub_strategy: 'QR-skip' };
+
+  // PathSR bands evaluated on multi-day series at the signal-bar index.
+  // Find the index of sigBar in multiDayBars.
+  let mdSigIdx = -1;
+  for (let i = multiDayBars.length - 1; i >= 0; i--) {
+    if (multiDayBars[i].t === sigBar.t) { mdSigIdx = i; break; }
+  }
+  if (mdSigIdx < 0) mdSigIdx = multiDayBars.length - 1;
+  const bands = detectPathSRChannels(multiDayBars, mdSigIdx);
+
+  const sigEntry = sigBar.c;
+  const { ahead, behind } = pb1BuildBarriers(sigEntry, tradeDir, bands,
+                                             push.start_price, push.extreme);
+
+  // Step 2: nothing ahead?
+  if (!ahead.length) {
+    if (!behind.length) {
+      return { _skip_reason: 'no_barriers', sub_strategy: 'QR-no-structure' };
+    }
+    // Crossed barrier path: confirmation flow runs from sigIdx itself
+    return pb1WalkBarrierAndBuild(dayBars, sigIdx, push, atr,
+                                  behind[0], bands, tradeDir, sigIdx);
+  }
+  const nearest = ahead[0];
+
+  // Step 3 Case A: QR-clean-runway
+  const runwayThreshold = NEW_CFG.PB1_RUNWAY_THRESHOLD_ATR * atr;
+  if ((nearest.type === 'push_start' || nearest.type === 'push_extreme')
+      && nearest.dist >= runwayThreshold) {
+    // Verify no band sits between entry and nearest barrier
+    const bandBetween = ahead.some(b => b.type === 'band' && b.dist < nearest.dist);
+    if (!bandBetween) {
+      const sign = tradeDir === 'long' ? 1 : -1;
+      const entry = sigEntry;
+      const stop = entry - sign * NEW_CFG.PB1_STOP_ATR_CLEAN * atr;
+      const target = (tradeDir === 'long') ? nearest.high : nearest.low;
+      const stopDist = Math.abs(entry - stop);
+      const tgtDist = Math.abs(target - entry);
+      if (stopDist > 0 && tgtDist >= NEW_CFG.PB1_MIN_RR * stopDist) {
+        return {
+          sub_strategy: 'QR-clean-runway',
+          entry_price: +entry.toFixed(2),
+          stop_price: +stop.toFixed(2),
+          target_price: +target.toFixed(2),
+          stop_dist: +stopDist.toFixed(2),
+          rr: +(tgtDist / stopDist).toFixed(2),
+          trade_direction: tradeDir,
+          barrier_type: nearest.type,
+          entry_bar_idx: sigIdx,
+          entry_bar_t: sigBar.t,
+        };
+      }
+    }
+  }
+
+  // Step 3 Case B: walk at nearest barrier (sub-strategy decided by what happens)
+  return pb1WalkBarrierAndBuild(dayBars, sigIdx, push, atr,
+                                nearest, bands, tradeDir, sigIdx + 1);
+}
+
+// Walks forward from startSearchIdx looking for: barrier-touch → optional
+// consolidation → confirmation bar → classify into QR-break/continue/reverse/
+// break-against. Returns trade dict or skip dict.
+function pb1WalkBarrierAndBuild(dayBars, sigIdx, push, atr, barrier, bands, tradeDir, startSearchIdx) {
+  const sigBar = dayBars[sigIdx];
+  const signalDate = sigBar.t.slice(0, 10);
+  const maxLookahead = NEW_CFG.PB1_MAX_LOOKAHEAD;
+  const buffer = NEW_CFG.PB1_BUFFER_ATR * atr;
+  const cutoffHm = NEW_CFG.PB1_ENTRY_CUTOFF_HM;
+  const barrierLo = barrier.low;
+  const barrierHi = barrier.high;
+  const confirmBarsRequired = NEW_CFG.PB1_CONFIRM_BARS_REQUIRED;
+
+  // Step 1: find first bar where range touches barrier
+  let reachedIdx = -1;
+  for (let j = startSearchIdx; j < Math.min(startSearchIdx + maxLookahead, dayBars.length); j++) {
+    if (dayBars[j].t.slice(0, 10) !== signalDate) break;
+    if (dayBars[j].l <= barrierHi && dayBars[j].h >= barrierLo) { reachedIdx = j; break; }
+  }
+  if (reachedIdx < 0) return { _skip_reason: 'barrier_never_reached', sub_strategy: 'QR-no-resolution' };
+
+  // Look for consolidation starting at/around reached
+  const consol = pb1ZoneConsolidation(dayBars, reachedIdx, atr);
+
+  // Walk forward up to 12 bars for confirmation bar
+  const jEnd = Math.min(reachedIdx + 12, dayBars.length);
+  let confirmIdx = -1;
+  let confirmDirection = null;
+  let confirmStatus = null;
+
+  function closeStatus(b) {
+    if (b.c > barrierHi + buffer) return 'above';
+    if (b.c < barrierLo - buffer) return 'below';
+    return 'inside';
+  }
+
+  let j = reachedIdx;
+  while (j < jEnd) {
+    if (dayBars[j].t.slice(0, 10) !== signalDate) break;
+    const b = dayBars[j];
+    const status = closeStatus(b);
+    if (status === 'inside') { j++; continue; }
+    // Closed beyond. Check next (confirm_bars_required - 1) bars confirm.
+    const needed = confirmBarsRequired - 1;
+    let valid = true;
+    let lastCheckIdx = j;
+    for (let k = 1; k <= needed; k++) {
+      if (j + k >= dayBars.length || dayBars[j + k].t.slice(0, 10) !== signalDate) { valid = false; break; }
+      const nextStatus = closeStatus(dayBars[j + k]);
+      lastCheckIdx = j + k;
+      if (nextStatus === 'inside' || nextStatus !== status) { valid = false; break; }
+    }
+    if (!valid) { j = lastCheckIdx + 1; continue; }
+
+    // Candidate confirm at j. Check cutoff.
+    const cb = dayBars[j];
+    if (pb1BarAfterCutoff(cb, cutoffHm)) {
+      return { _skip_reason: 'after_cutoff', sub_strategy: 'QR-skip' };
+    }
+    // Decide candidate sub-strategy direction
+    let candidateConfirmDir;
+    if (tradeDir === 'long') candidateConfirmDir = (status === 'above') ? 'with' : 'against';
+    else candidateConfirmDir = (status === 'below') ? 'with' : 'against';
+    const candidateHasConsol = (consol && consol[0] < j && consol[2] >= 4);
+    const candidateIsQrReverse = (candidateConfirmDir === 'against') && candidateHasConsol;
+
+    const gate = pb1V5Gate(cb, atr, status, candidateIsQrReverse);
+    if (gate === 'ok') {
+      confirmIdx = j;
+      confirmDirection = candidateConfirmDir;
+      confirmStatus = status;
+      break;
+    } else if (gate === 'fail_v5_reverse') {
+      // Skip ENTIRE trade — V5 doesn't keep walking on QR-reverse rejection
+      return { _skip_reason: 'weak_reverse_confirm', sub_strategy: 'QR-skip' };
+    } else {
+      // baseline body<30%, keep walking
+      j = lastCheckIdx + 1;
+      continue;
+    }
+  }
+
+  if (confirmIdx < 0) return { _skip_reason: 'no_confirm', sub_strategy: 'QR-skip' };
+
+  // Classify
+  const hasConsol = (consol && consol[0] < confirmIdx && consol[2] >= 4);
+  let sub;
+  if (confirmDirection === 'with') sub = hasConsol ? 'QR-continue' : 'QR-break';
+  else sub = hasConsol ? 'QR-reverse' : 'QR-break-against';
+
+  // Build trade
+  const cb = dayBars[confirmIdx];
+  const entry = cb.c;
+  const effectiveDir = (confirmDirection === 'with') ? tradeDir
+                       : (tradeDir === 'long' ? 'short' : 'long');
+  const sign = effectiveDir === 'long' ? 1 : -1;
+
+  // Stop
+  let stop;
+  if (sub === 'QR-continue' || sub === 'QR-reverse') {
+    const zLo = consol[3], zHi = consol[4];
+    stop = (effectiveDir === 'long')
+      ? zLo - 0.25 * atr
+      : zHi + 0.25 * atr;
+  } else {
+    // QR-break / QR-break-against: barrier opposite edge - 0.5×ATR (long)
+    stop = (effectiveDir === 'long')
+      ? barrierLo - 0.5 * atr
+      : barrierHi + 0.5 * atr;
+  }
+  const stopDist = Math.abs(entry - stop);
+  if (stopDist <= 0) return { _skip_reason: 'zero_stop', sub_strategy: sub };
+
+  // Target (exclude the barrier we just broke from cascade)
+  const target = pb1ComputeTarget(entry, effectiveDir, stopDist, bands,
+                                   push.start_price, push.extreme,
+                                   barrierLo, barrierHi);
+
+  // Final sanity
+  const tgtDist = Math.abs(target - entry);
+  if (tgtDist <= 0) return { _skip_reason: 'no_target_distance', sub_strategy: sub };
+
+  return {
+    sub_strategy: sub,
+    entry_price: +entry.toFixed(2),
+    stop_price: +stop.toFixed(2),
+    target_price: +target.toFixed(2),
+    stop_dist: +stopDist.toFixed(2),
+    rr: +(tgtDist / stopDist).toFixed(2),
+    trade_direction: effectiveDir,
+    barrier_type: barrier.type,
+    entry_bar_idx: confirmIdx,
+    entry_bar_t: cb.t,
+    consol_idx_range: consol ? [consol[0], consol[1]] : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PB1 LIVE WALKER (v8.0.4) — stateful one-bar-at-a-time classifier
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Lets Tier2Monitor evaluate the classifier in real time. Created when raw
+// PB1 condition fires AND ENABLE_PB1_SUBSTRATEGIES=true AND LOG_ONLY=false.
+// Each subsequent bar is fed via tick() which returns one of:
+//   { action: 'WAIT' }                      — keep waiting
+//   { action: 'FIRE', trade: {...} }        — classifier produced a trade
+//   { action: 'SKIP', reason, sub_strategy } — classifier rejected
+//
+// Walker tracks: barrier touch, consolidation accumulator, confirm bar.
+// V5 gate is applied at confirmation; weak QR-reverse confirmation triggers
+// immediate SKIP (no rerouting).
+
+class Pb1LiveWalker {
+  constructor(opts) {
+    // opts: { sigBar, sigBarIdx, push, atr, bands, tradeDir, dayBarsAtStart,
+    //         signalDate, useCrossedBarrier (bool) }
+    this.sigBar = opts.sigBar;
+    this.sigBarIdx = opts.sigBarIdx;
+    this.push = opts.push;
+    this.atr = opts.atr;
+    this.bands = opts.bands || [];
+    this.tradeDir = opts.tradeDir;
+    this.signalDate = opts.signalDate;
+
+    // Day bar buffer — accumulates as ticks come in
+    this.dayBars = (opts.dayBarsAtStart || []).slice();
+
+    // Determine barrier + walk start
+    const sigEntry = this.sigBar.c;
+    const { ahead, behind } = pb1BuildBarriers(sigEntry, this.tradeDir,
+                                                this.bands, this.push.start_price,
+                                                this.push.extreme);
+
+    this.clean_runway_eligible = false;
+    this.clean_runway_trade = null;
+    this.barrier = null;
+    this.walk_start_idx_in_day = null;  // index in this.dayBars
+    this.skip_reason = null;
+
+    if (!ahead.length) {
+      if (!behind.length) {
+        this.skip_reason = 'no_barriers';
+        this.sub_strategy_on_skip = 'QR-no-structure';
+      } else {
+        // Crossed-barrier path — walk starts from sig bar itself
+        this.barrier = behind[0];
+        this.walk_start_idx_in_day = this.sigBarIdx;
+      }
+    } else {
+      const nearest = ahead[0];
+
+      // QR-clean-runway check
+      const runwayThreshold = NEW_CFG.PB1_RUNWAY_THRESHOLD_ATR * this.atr;
+      if ((nearest.type === 'push_start' || nearest.type === 'push_extreme')
+          && nearest.dist >= runwayThreshold) {
+        const bandBetween = ahead.some(b => b.type === 'band' && b.dist < nearest.dist);
+        if (!bandBetween) {
+          const sign = this.tradeDir === 'long' ? 1 : -1;
+          const entry = sigEntry;
+          const stop = entry - sign * NEW_CFG.PB1_STOP_ATR_CLEAN * this.atr;
+          const target = (this.tradeDir === 'long') ? nearest.high : nearest.low;
+          const stopDist = Math.abs(entry - stop);
+          const tgtDist = Math.abs(target - entry);
+          if (stopDist > 0 && tgtDist >= NEW_CFG.PB1_MIN_RR * stopDist) {
+            this.clean_runway_eligible = true;
+            this.clean_runway_trade = {
+              sub_strategy: 'QR-clean-runway',
+              entry_price: +entry.toFixed(2),
+              stop_price: +stop.toFixed(2),
+              target_price: +target.toFixed(2),
+              stop_dist: +stopDist.toFixed(2),
+              rr: +(tgtDist / stopDist).toFixed(2),
+              trade_direction: this.tradeDir,
+              barrier_type: nearest.type,
+              entry_bar_t: this.sigBar.t,
+            };
+          }
+        }
+      }
+      this.barrier = nearest;
+      // For non-crossed path, walker starts walking from bar AFTER the signal bar
+      this.walk_start_idx_in_day = this.sigBarIdx + 1;
+    }
+
+    this.reached_idx = null;       // index in this.dayBars where barrier first touched
+    this.consol_idx_range = null;  // [start, end_inclusive, n_bars, lo, hi, slope_pct]
+    this.bars_seen = 0;            // bars passed to tick() after signal bar
+    this.finished = false;
+    this.fire_result = null;       // populated on FIRE
+  }
+
+  // Returns array of per-bar audit entries (one entry per tick that's added).
+  // Cleared after orchestrator drains.
+  drainTicks() {
+    const t = this.audit_ticks || [];
+    this.audit_ticks = [];
+    return t;
+  }
+
+  // Push initial tick for signal bar + QR-clean-runway decision.
+  // Called immediately after construct so audit has a "start" entry.
+  startTicks() {
+    this.audit_ticks = [{
+      event: 'PB1_WAIT_START',
+      bar_t: this.sigBar.t,
+      sig_bar_t: this.sigBar.t,
+      tradeDir: this.tradeDir,
+      barrier_type: this.barrier ? this.barrier.type : null,
+      barrier_lo: this.barrier ? this.barrier.low : null,
+      barrier_hi: this.barrier ? this.barrier.high : null,
+      barrier_dist: this.barrier ? this.barrier.dist : null,
+      band_count: this.bands.length,
+      clean_runway_eligible: this.clean_runway_eligible,
+      skip_reason: this.skip_reason || null,
+    }];
+
+    // Resolve immediately if QR-clean-runway eligible (fires at signal bar)
+    if (this.clean_runway_eligible && this.clean_runway_trade) {
+      this.finished = true;
+      this.fire_result = this.clean_runway_trade;
+      this.fire_result.entry_bar_t = this.sigBar.t;
+      this.audit_ticks.push({
+        event: 'PB1_FIRED',
+        bar_t: this.sigBar.t,
+        sub_strategy: 'QR-clean-runway',
+        entry_price: this.fire_result.entry_price,
+        stop_price: this.fire_result.stop_price,
+        target_price: this.fire_result.target_price,
+        rr: this.fire_result.rr,
+        barrier_type: this.barrier ? this.barrier.type : null,
+        bars_walked: 0,
+      });
+      return { action: 'FIRE', trade: this.fire_result };
+    }
+
+    // Resolve immediately if no_barriers (skip)
+    if (this.skip_reason === 'no_barriers') {
+      this.finished = true;
+      this.audit_ticks.push({
+        event: 'PB1_SKIP',
+        bar_t: this.sigBar.t,
+        skip_reason: 'no_barriers',
+        sub_strategy: 'QR-no-structure',
+        bars_walked: 0,
+      });
+      return { action: 'SKIP', reason: 'no_barriers', sub_strategy: 'QR-no-structure' };
+    }
+
+    return { action: 'WAIT' };
+  }
+
+  // Feed one bar (after signal). Returns action.
+  tick(bar) {
+    if (this.finished) return { action: 'SKIP', reason: 'already_finished' };
+    this.audit_ticks = this.audit_ticks || [];
+    this.dayBars.push(bar);
+    this.bars_seen++;
+    const dayIdx = this.dayBars.length - 1;
+    const barrierLo = this.barrier.low;
+    const barrierHi = this.barrier.high;
+    const buffer = NEW_CFG.PB1_BUFFER_ATR * this.atr;
+    const cutoffHm = NEW_CFG.PB1_ENTRY_CUTOFF_HM;
+    const maxLookahead = NEW_CFG.PB1_MAX_LOOKAHEAD;
+
+    // Date guard
+    if (bar.t.slice(0, 10) !== this.signalDate) {
+      this.finished = true;
+      this.audit_ticks.push({
+        event: 'PB1_SKIP',
+        bar_t: bar.t,
+        skip_reason: 'day_boundary',
+        bars_walked: this.bars_seen,
+      });
+      return { action: 'SKIP', reason: 'day_boundary' };
+    }
+
+    // 14:30 cutoff
+    if (pb1BarAfterCutoff(bar, cutoffHm)) {
+      this.finished = true;
+      this.audit_ticks.push({
+        event: 'PB1_SKIP',
+        bar_t: bar.t,
+        skip_reason: 'after_cutoff',
+        bars_walked: this.bars_seen,
+      });
+      return { action: 'SKIP', reason: 'after_cutoff', sub_strategy: 'QR-skip' };
+    }
+
+    // Find barrier touch if not yet found
+    if (this.reached_idx === null) {
+      // Have we exceeded the max lookahead from walk_start_idx?
+      const barsFromWalkStart = dayIdx - this.walk_start_idx_in_day;
+      if (barsFromWalkStart >= maxLookahead) {
+        this.finished = true;
+        this.audit_ticks.push({
+          event: 'PB1_SKIP',
+          bar_t: bar.t,
+          skip_reason: 'barrier_never_reached',
+          sub_strategy: 'QR-no-resolution',
+          bars_walked: this.bars_seen,
+        });
+        return { action: 'SKIP', reason: 'barrier_never_reached', sub_strategy: 'QR-no-resolution' };
+      }
+      if (dayIdx >= this.walk_start_idx_in_day
+          && bar.l <= barrierHi && bar.h >= barrierLo) {
+        this.reached_idx = dayIdx;
+        // Recompute consolidation from reached_idx (need future bars for max
+        // window — we'll re-evaluate once enough have passed, but for short
+        // windows the first pass works correctly).
+        this.consol_idx_range = pb1ZoneConsolidation(this.dayBars, this.reached_idx, this.atr);
+      }
+      // Audit even when waiting for touch
+      this.audit_ticks.push({
+        event: 'PB1_BAR_TICK',
+        bar_t: bar.t,
+        bar_o: bar.o, bar_h: bar.h, bar_l: bar.l, bar_c: bar.c,
+        close_status: 'pre_reach',
+        barrier_reached: this.reached_idx !== null,
+        bars_from_walk_start: barsFromWalkStart,
+      });
+      return { action: 'WAIT' };
+    }
+
+    // Reached: try to find confirm bar starting at the touch bar.
+    // Re-evaluate consolidation as the buffer grows (max consol window 12 bars).
+    this.consol_idx_range = pb1ZoneConsolidation(this.dayBars, this.reached_idx, this.atr);
+
+    // Check confirm starting from reached_idx through dayIdx
+    const jEnd = Math.min(this.reached_idx + 12, this.dayBars.length);
+    // Walk only as far as we have bars
+    let j = this.reached_idx;
+    while (j < jEnd && j <= dayIdx) {
+      const b = this.dayBars[j];
+      if (b.t.slice(0, 10) !== this.signalDate) break;
+      const status = pb1ClosestatusForBuilder(b, barrierLo, barrierHi, buffer);
+      if (status === 'inside') { j++; continue; }
+      // Closed beyond. Confirm requires (confirm_bars_required - 1) more bars.
+      const needed = NEW_CFG.PB1_CONFIRM_BARS_REQUIRED - 1;
+      if (j + needed >= this.dayBars.length) {
+        // Not enough subsequent bars yet — wait.
+        break;
+      }
+      let valid = true;
+      let lastCheckIdx = j;
+      for (let k = 1; k <= needed; k++) {
+        if (j + k >= this.dayBars.length) { valid = false; break; }
+        const nextBar = this.dayBars[j + k];
+        if (nextBar.t.slice(0, 10) !== this.signalDate) { valid = false; break; }
+        const nextStatus = pb1ClosestatusForBuilder(nextBar, barrierLo, barrierHi, buffer);
+        lastCheckIdx = j + k;
+        if (nextStatus === 'inside' || nextStatus !== status) { valid = false; break; }
+      }
+      if (!valid) { j = lastCheckIdx + 1; continue; }
+
+      // Candidate confirm at j. Check cutoff and V5.
+      const cb = this.dayBars[j];
+      if (pb1BarAfterCutoff(cb, cutoffHm)) {
+        this.finished = true;
+        this.audit_ticks.push({
+          event: 'PB1_SKIP',
+          bar_t: cb.t,
+          skip_reason: 'after_cutoff',
+          bars_walked: this.bars_seen,
+        });
+        return { action: 'SKIP', reason: 'after_cutoff', sub_strategy: 'QR-skip' };
+      }
+      let candidateConfirmDir;
+      if (this.tradeDir === 'long') candidateConfirmDir = (status === 'above') ? 'with' : 'against';
+      else candidateConfirmDir = (status === 'below') ? 'with' : 'against';
+      const candidateHasConsol = (this.consol_idx_range
+                                  && this.consol_idx_range[0] < j
+                                  && this.consol_idx_range[2] >= 4);
+      const candidateIsQrReverse = (candidateConfirmDir === 'against') && candidateHasConsol;
+
+      const gate = pb1V5Gate(cb, this.atr, status, candidateIsQrReverse);
+
+      // Per-bar audit at candidate
+      const barRange = Math.max(cb.h - cb.l, 1e-9);
+      const bodyP = Math.abs(cb.c - cb.o) / barRange;
+      const closePos = (status === 'above') ? (cb.c - cb.l) / barRange : (cb.h - cb.c) / barRange;
+      const rangeAtr = barRange / Math.max(this.atr, 1e-9);
+      this.audit_ticks.push({
+        event: 'PB1_BAR_TICK',
+        bar_t: cb.t,
+        bar_o: cb.o, bar_h: cb.h, bar_l: cb.l, bar_c: cb.c,
+        close_status: status,
+        candidate_confirm_dir: candidateConfirmDir,
+        candidate_has_consol: candidateHasConsol,
+        candidate_is_qr_reverse: candidateIsQrReverse,
+        body_pct: +bodyP.toFixed(3),
+        close_pos: +closePos.toFixed(3),
+        range_atr: +rangeAtr.toFixed(3),
+        v5_gate_result: gate,
+      });
+
+      if (gate === 'fail_v5_reverse') {
+        this.finished = true;
+        this.audit_ticks.push({
+          event: 'PB1_SKIP',
+          bar_t: cb.t,
+          skip_reason: 'weak_reverse_confirm',
+          sub_strategy: 'QR-skip',
+          bars_walked: this.bars_seen,
+        });
+        return { action: 'SKIP', reason: 'weak_reverse_confirm', sub_strategy: 'QR-skip' };
+      }
+      if (gate === 'ok') {
+        // Fire classified trade
+        const hasConsol = candidateHasConsol;
+        let sub;
+        if (candidateConfirmDir === 'with') sub = hasConsol ? 'QR-continue' : 'QR-break';
+        else sub = hasConsol ? 'QR-reverse' : 'QR-break-against';
+        const entry = cb.c;
+        const effectiveDir = (candidateConfirmDir === 'with') ? this.tradeDir
+                             : (this.tradeDir === 'long' ? 'short' : 'long');
+        const sign = effectiveDir === 'long' ? 1 : -1;
+        let stop;
+        if (sub === 'QR-continue' || sub === 'QR-reverse') {
+          const zLo = this.consol_idx_range[3], zHi = this.consol_idx_range[4];
+          stop = (effectiveDir === 'long') ? zLo - 0.25 * this.atr : zHi + 0.25 * this.atr;
+        } else {
+          stop = (effectiveDir === 'long') ? barrierLo - 0.5 * this.atr : barrierHi + 0.5 * this.atr;
+        }
+        const stopDist = Math.abs(entry - stop);
+        if (stopDist <= 0) {
+          this.finished = true;
+          this.audit_ticks.push({ event: 'PB1_SKIP', bar_t: cb.t, skip_reason: 'zero_stop', sub_strategy: sub, bars_walked: this.bars_seen });
+          return { action: 'SKIP', reason: 'zero_stop', sub_strategy: sub };
+        }
+        const target = pb1ComputeTarget(entry, effectiveDir, stopDist, this.bands,
+                                         this.push.start_price, this.push.extreme,
+                                         barrierLo, barrierHi);
+        const tgtDist = Math.abs(target - entry);
+        if (tgtDist <= 0) {
+          this.finished = true;
+          this.audit_ticks.push({ event: 'PB1_SKIP', bar_t: cb.t, skip_reason: 'no_target_distance', sub_strategy: sub, bars_walked: this.bars_seen });
+          return { action: 'SKIP', reason: 'no_target_distance', sub_strategy: sub };
+        }
+        this.finished = true;
+        this.fire_result = {
+          sub_strategy: sub,
+          entry_price: +entry.toFixed(2),
+          stop_price: +stop.toFixed(2),
+          target_price: +target.toFixed(2),
+          stop_dist: +stopDist.toFixed(2),
+          rr: +(tgtDist / stopDist).toFixed(2),
+          trade_direction: effectiveDir,
+          barrier_type: this.barrier.type,
+          entry_bar_t: cb.t,
+          consol_idx_range: this.consol_idx_range
+            ? [this.consol_idx_range[0], this.consol_idx_range[1]]
+            : null,
+        };
+        this.audit_ticks.push({
+          event: 'PB1_FIRED',
+          bar_t: cb.t,
+          sub_strategy: sub,
+          trade_direction: effectiveDir,
+          entry_price: this.fire_result.entry_price,
+          stop_price: this.fire_result.stop_price,
+          target_price: this.fire_result.target_price,
+          rr: this.fire_result.rr,
+          barrier_type: this.barrier.type,
+          bars_walked: this.bars_seen,
+        });
+        return { action: 'FIRE', trade: this.fire_result };
+      }
+      // fail_baseline — keep walking
+      j = lastCheckIdx + 1;
+    }
+
+    // If we exhausted the window without firing
+    if (this.reached_idx !== null
+        && (dayIdx - this.reached_idx + 1) >= 12) {
+      this.finished = true;
+      this.audit_ticks.push({
+        event: 'PB1_SKIP',
+        bar_t: bar.t,
+        skip_reason: 'no_confirm',
+        sub_strategy: 'QR-skip',
+        bars_walked: this.bars_seen,
+      });
+      return { action: 'SKIP', reason: 'no_confirm', sub_strategy: 'QR-skip' };
+    }
+
+    // Standard waiting bar (we touched barrier but no confirm yet)
+    if (this.audit_ticks[this.audit_ticks.length - 1]
+        && this.audit_ticks[this.audit_ticks.length - 1].event !== 'PB1_BAR_TICK') {
+      // ensure a bar tick is emitted
+      this.audit_ticks.push({
+        event: 'PB1_BAR_TICK',
+        bar_t: bar.t,
+        bar_o: bar.o, bar_h: bar.h, bar_l: bar.l, bar_c: bar.c,
+        close_status: 'post_reach_waiting',
+        barrier_reached: true,
+        bars_since_reach: dayIdx - this.reached_idx,
+      });
+    }
+    return { action: 'WAIT' };
+  }
+}
+
+// Helper used by both walker and classifier — kept local.
+function pb1ClosestatusForBuilder(b, barrierLo, barrierHi, buffer) {
+  if (b.c > barrierHi + buffer) return 'above';
+  if (b.c < barrierLo - buffer) return 'below';
+  return 'inside';
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     ENG, RULE, computeZonesPD, findQualifyingPush,
@@ -2324,6 +3567,10 @@ if (typeof module !== 'undefined' && module.exports) {
     Tier2Monitor, computeBrokenSR, buildRationale, Tier3Tracker,
     barMove, bodyPct, isDoji, computeRetrace,
     computeContext, applyContext,
+    // v8.0.3 — PathSR + PB1 classifier
+    detectPathSRChannels, pb1ClassifyAtSignal,
+    // v8.0.4 — Live wait-state walker
+    Pb1LiveWalker,
   };
 }
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2357,6 +3604,15 @@ const STATE = {
   tier2_running: false,
   tier2_at: null,
   tier3_at: null,
+  // v8.0.3 — PB1 sub-strategy classifier shadow logging.
+  // pb1_shadow_pending: list of raw-PB1 fires queued for classifier evaluation
+  //   once enough subsequent bars are available. Each entry: { alert_id, symbol,
+  //   sig_bar_t, push, atr, queued_at }.
+  // pb1_shadow_log: completed classifier outcomes. Each entry includes both the
+  //   live (raw PB1) trade result AND the classifier's predicted trade for
+  //   side-by-side comparison.
+  pb1_shadow_pending: [],
+  pb1_shadow_log: [],
 };
 
 // ── STATE PERSISTENCE ──────────────────────────────────────────────────
@@ -2495,6 +3751,10 @@ function snapshotState() {
     tier1_at: STATE.tier1_at,
     tier2_at: STATE.tier2_at,
     tier3_at: STATE.tier3_at,
+    // v8.0.3 — persist PB1 classifier shadow state so a Railway restart
+    // mid-day doesn't blackhole a batch of pending evaluations.
+    pb1_shadow_pending: STATE.pb1_shadow_pending || [],
+    pb1_shadow_log: STATE.pb1_shadow_log || [],
   };
 }
 
@@ -2552,6 +3812,9 @@ function loadState() {
     STATE.tier1_at = snap.tier1_at;
     STATE.tier2_at = snap.tier2_at;
     STATE.tier3_at = snap.tier3_at;
+    // v8.0.3 — restore PB1 classifier shadow state (arrays; safe defaults)
+    STATE.pb1_shadow_pending = Array.isArray(snap.pb1_shadow_pending) ? snap.pb1_shadow_pending : [];
+    STATE.pb1_shadow_log = Array.isArray(snap.pb1_shadow_log) ? snap.pb1_shadow_log : [];
 
     // Live trades — reconstruct trackers from saved state
     STATE.live_trades = {};
@@ -2706,6 +3969,9 @@ async function runTier1v7() {
 
       // Add to watchlist
       const lastBarT = todayBars[todayBars.length-1].t;
+      // v8.0.4: multi-day bars for PathSR in the classifier wait-state.
+      // Slice to ~5 days max (Kite returns ~5 by default); keep it bounded.
+      const multiDayBars = candles.slice(-Math.min(candles.length, 500));
       STATE.watchlist[symbol] = {
         push: qp,
         push_id: pushId,
@@ -2713,6 +3979,7 @@ async function runTier1v7() {
         broken_sr: brokenSR,
         context_score: contextScore,
         day_bars: todayBars,
+        multi_day_bars: multiDayBars,
         atr,
         counter_indices: lastEvent ? lastEvent.counter_indices : [],   // for Tier 2 prefill
         push_end_idx: qp.end_idx,
@@ -2824,7 +4091,8 @@ async function runTier2v7() {
         entry.monitor = new Tier2Monitor(
           entry.push, entry.sr_levels, entry.broken_sr,
           entry.context_score, todayBars[0].o, [],
-          entry.day_bars   // v8.0: day_bars_ref for new engine's counter signals
+          entry.day_bars,   // v8.0: day_bars_ref for new engine's counter signals
+          candles           // v8.0.4: multi-day bars for classifier PathSR
         );
         entry.monitor.symbol = symbol; // for v8.0.1 diagnostic logging
         entry.monitor_was_created = true;   // mark for restart-detection
@@ -2844,6 +4112,11 @@ async function runTier2v7() {
       }
 
       // Feed each new bar through monitor
+      // v8.0.4: refresh monitor's multi-day + same-day reference each cycle
+      // so PathSR (if invoked by classifier wait-state) sees fresh history.
+      entry.monitor.multi_day_bars = candles;
+      entry.monitor.day_bars_ref = todayBars;
+
       for (const bar of newBars) {
         // Compute fresh atr/ema/rsi at this point
         const idxInCandles = candles.findIndex(c => c.t === bar.t);
@@ -2853,6 +4126,20 @@ async function runTier2v7() {
         const liveRsi = computeRSIEngine(histBars);
 
         const result = entry.monitor.processBar(bar, liveAtr, liveEma, liveRsi);
+
+        // v8.0.4: drain PB1 wait-state audit ticks into STATE.audit_log
+        if (entry.monitor.pb1_audit_ticks && entry.monitor.pb1_audit_ticks.length) {
+          for (const tk of entry.monitor.pb1_audit_ticks) {
+            STATE.audit_log.push({
+              ...tk,
+              symbol,
+              push_id: entry.push_id,
+              push_time: `${entry.push.start_time}→${entry.push.end_time}`,
+              fired_at: new Date().toISOString(),
+            });
+          }
+          entry.monitor.pb1_audit_ticks = [];
+        }
 
         // v8.0.2 (BACKLOG #9): drain any leg-2 retrace gate rejections from
         // this bar into the audit log so the rule's impact is visible.
@@ -2933,6 +4220,40 @@ async function runTier2v7() {
           });
           STATE.blocked_pushes.add(entry.push_id);
           console.log(`[T2v7 ALERT] ${symbol} ${sig.type} ${sig.dir} score=${sig.score}→${finalRes.final_score} entry=${sig.entry_price} stop=${sig.stop_price} target=${sig.target_price}`);
+
+          // v8.0.3 — Queue raw PB1 fires for sub-strategy classifier shadow
+          // evaluation. Only when flag is ON and we're in LOG_ONLY mode
+          // (default for v8.0.3). The pending entry will be processed by the
+          // shadow runner in Tier 3 once enough subsequent bars are available.
+          if (NEW_CFG.ENABLE_PB1_SUBSTRATEGIES && NEW_CFG.PB1_SUBSTRATEGIES_LOG_ONLY
+              && sig.trigger === 'deep_retrace_pb1') {
+            STATE.pb1_shadow_pending.push({
+              alert_id: alert.alert_id,
+              symbol,
+              sig_bar_t: bar.t,
+              push_id: entry.push_id,
+              push_snapshot: {
+                is_up: entry.push.is_up,
+                dir: entry.push.dir,
+                start_price: entry.push.start_price,
+                extreme: entry.push.extreme,
+                start_time: entry.push.start_time,
+                end_time: entry.push.end_time,
+                bars: entry.push.bars,
+                net_move: entry.push.net_move,
+              },
+              atr_at_signal: liveAtr,
+              raw_alert: {
+                entry_price: sig.entry_price,
+                stop_price: sig.stop_price,
+                target_price: sig.target_price,
+                rr: sig.rr,
+                dir: sig.dir,
+              },
+              queued_at: new Date().toISOString(),
+              status: 'pending',
+            });
+          }
           delete STATE.watchlist[symbol];
           break;
         } else if (result.action === 'CANCEL') {
@@ -3133,6 +4454,10 @@ async function runTier3v7() {
   // v8.0.2: Run shadow tracker for dismissed alerts (parallel to live trades)
   await runTier3Shadow();
 
+  // v8.0.3: Run PB1 classifier shadow runner — evaluates queued raw PB1 fires
+  // once enough subsequent bars are available, logs comparison to STATE.
+  await runTier3Pb1Shadow();
+
   STATE.tier3_at = new Date().toISOString();
   saveStateDebounced();
 }
@@ -3223,6 +4548,111 @@ async function runTier3Shadow() {
       console.warn(`[T3v7-SHADOW] ${id} error:`, e.message);
     }
   }
+}
+
+// ── PB1 CLASSIFIER SHADOW RUNNER (v8.0.3) ───────────────────────────────
+// For each pending raw PB1 fire, fetch bars since the signal and run the
+// sub-strategy classifier. Logs what the classifier WOULD have produced
+// (entry, stop, target, sub-strategy) alongside the raw fire for offline
+// comparison. Marks entry as resolved when enough bars have accumulated
+// (15 bars after signal, or end of trading day, whichever first).
+async function runTier3Pb1Shadow() {
+  if (!Array.isArray(STATE.pb1_shadow_pending) || !STATE.pb1_shadow_pending.length) return;
+  // Only process during/near market hours — outside hours bars won't accumulate
+  const now = new Date();
+  const istMs = now.getTime() + (5.5 * 60 * 60 * 1000);
+  const ist = new Date(istMs);
+  const hm = ist.getHours() * 100 + ist.getMinutes();
+  const istDate = ist.toISOString().slice(0, 10);
+
+  // Process pending in-place; drop resolved ones
+  const stillPending = [];
+  for (const p of STATE.pb1_shadow_pending) {
+    if (p.status !== 'pending') continue;
+    try {
+      const candles = await fetchKite5Min(p.symbol);
+      if (!candles || candles.length < 30) { stillPending.push(p); continue; }
+      const sigDate = p.sig_bar_t.slice(0, 10);
+      const today = candles[candles.length - 1].t.slice(0, 10);
+      // Filter to single signal-day bars >=09:45 (matches classifier expectation)
+      const dayBars = candles.filter(b => b.t.slice(0, 10) === sigDate
+                                       && b.t.slice(11, 16) >= '09:45');
+      const sigIdx = dayBars.findIndex(b => b.t === p.sig_bar_t);
+      if (sigIdx < 0) { stillPending.push(p); continue; }
+      const barsSinceSig = dayBars.length - 1 - sigIdx;
+      const dayEnded = (today !== sigDate) || (hm >= 1530);
+      // Wait for at least 12 bars after signal OR end-of-day
+      if (barsSinceSig < 12 && !dayEnded) { stillPending.push(p); continue; }
+
+      // Multi-day bars for PathSR: prior 4 days + today up to signal date.
+      // We slice the full candles down to the signal bar's index to avoid
+      // look-ahead at PathSR time.
+      const mdSigIdx = candles.findIndex(b => b.t === p.sig_bar_t);
+      const multiDayBars = mdSigIdx >= 0 ? candles.slice(0, mdSigIdx + 1) : candles;
+
+      const result = pb1ClassifyAtSignal(dayBars, sigIdx, p.push_snapshot,
+                                         p.atr_at_signal, multiDayBars);
+
+      // Measure outcome (if classifier produced a trade with entry bar)
+      let measured = null;
+      if (!result._skip_reason && result.entry_bar_idx != null) {
+        measured = pb1MeasureOutcome(dayBars, result);
+      }
+
+      STATE.pb1_shadow_log.push({
+        alert_id: p.alert_id,
+        symbol: p.symbol,
+        sig_bar_t: p.sig_bar_t,
+        push_id: p.push_id,
+        raw_alert: p.raw_alert,
+        classifier: result,
+        classifier_outcome: measured,
+        evaluated_at: new Date().toISOString(),
+      });
+      // Cap log size at 1000 entries to keep memory bounded
+      if (STATE.pb1_shadow_log.length > 1000) {
+        STATE.pb1_shadow_log = STATE.pb1_shadow_log.slice(-1000);
+      }
+      console.log(`[PB1-SHADOW] ${p.symbol} ${p.sig_bar_t.slice(11, 16)} -> ${result.sub_strategy || result._skip_reason} ${measured ? '(R=' + measured.R + ')' : ''}`);
+    } catch (e) {
+      console.warn(`[PB1-SHADOW] ${p.symbol} error:`, e.message);
+      stillPending.push(p);
+    }
+  }
+  STATE.pb1_shadow_pending = stillPending;
+}
+
+// Measure outcome for a classifier trade on dayBars (target/stop/EOD).
+function pb1MeasureOutcome(dayBars, trade) {
+  const startIdx = (trade.entry_bar_idx != null) ? trade.entry_bar_idx + 1 : 0;
+  const isLong = trade.trade_direction === 'long';
+  const entry = trade.entry_price;
+  const stop = trade.stop_price;
+  const target = trade.target_price;
+  const stopDist = Math.abs(entry - stop);
+  if (stopDist <= 0) return { outcome: 'INVALID', R: 0, bars: 0 };
+  for (let i = startIdx; i < dayBars.length; i++) {
+    const b = dayBars[i];
+    if (isLong) {
+      if (b.l <= stop) return { outcome: 'LOSS', exit_price: stop, R: -1.0, bars: i - startIdx + 1, exit_bar_t: b.t };
+      if (b.h >= target) {
+        const R = Math.abs(target - entry) / stopDist;
+        return { outcome: 'WIN', exit_price: target, R: +R.toFixed(3), bars: i - startIdx + 1, exit_bar_t: b.t };
+      }
+    } else {
+      if (b.h >= stop) return { outcome: 'LOSS', exit_price: stop, R: -1.0, bars: i - startIdx + 1, exit_bar_t: b.t };
+      if (b.l <= target) {
+        const R = Math.abs(target - entry) / stopDist;
+        return { outcome: 'WIN', exit_price: target, R: +R.toFixed(3), bars: i - startIdx + 1, exit_bar_t: b.t };
+      }
+    }
+  }
+  // EOD without exit: mark to close of last bar
+  const lastBar = dayBars[dayBars.length - 1];
+  const eodPx = lastBar ? lastBar.c : entry;
+  const captured = isLong ? (eodPx - entry) / stopDist : (entry - eodPx) / stopDist;
+  return { outcome: 'EOD', exit_price: eodPx, R: +captured.toFixed(3),
+            bars: dayBars.length - startIdx, exit_bar_t: lastBar ? lastBar.t : null };
 }
 
 // ── SCHEDULERS ────────────────────────────────────────────────────────
@@ -3543,6 +4973,51 @@ app.get('/v8/status', (req, res) => {
     live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
     shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
     blocked_pushes: STATE.blocked_pushes.size,
+    // v8.0.3 — PB1 classifier shadow stats
+    pb1_substrategies: {
+      enabled: NEW_CFG.ENABLE_PB1_SUBSTRATEGIES,
+      log_only: NEW_CFG.PB1_SUBSTRATEGIES_LOG_ONLY,
+      pending_count: (STATE.pb1_shadow_pending || []).length,
+      log_count: (STATE.pb1_shadow_log || []).length,
+    },
+  });
+});
+
+// v8.0.3 — PB1 sub-strategy classifier shadow log.
+// Side-by-side comparison: for each raw PB1 fire, shows what the classifier
+// would have done. Use ?symbol= and ?sub_strategy= to filter.
+app.get('/v8/pb1-shadow-log', (req, res) => {
+  const symbol = req.query.symbol;
+  const sub = req.query.sub_strategy;
+  let log = [...(STATE.pb1_shadow_log || [])];
+  if (symbol) log = log.filter(e => e.symbol === symbol.toUpperCase());
+  if (sub) log = log.filter(e => e.classifier && e.classifier.sub_strategy === sub);
+  // Summary aggregates
+  const completed = (STATE.pb1_shadow_log || []).filter(e => e.classifier_outcome);
+  const bySub = {};
+  for (const e of completed) {
+    const s = (e.classifier && e.classifier.sub_strategy) || 'skip';
+    if (!bySub[s]) bySub[s] = { n: 0, wins: 0, R: 0 };
+    bySub[s].n++;
+    if (e.classifier_outcome.outcome === 'WIN') bySub[s].wins++;
+    bySub[s].R += e.classifier_outcome.R || 0;
+  }
+  const summary = {};
+  for (const s of Object.keys(bySub)) {
+    const b = bySub[s];
+    summary[s] = { n: b.n, wr_pct: b.n ? +(100 * b.wins / b.n).toFixed(1) : 0,
+                    total_R: +b.R.toFixed(3),
+                    ev: b.n ? +(b.R / b.n).toFixed(3) : 0 };
+  }
+  res.json({
+    config: {
+      enabled: NEW_CFG.ENABLE_PB1_SUBSTRATEGIES,
+      log_only: NEW_CFG.PB1_SUBSTRATEGIES_LOG_ONLY,
+    },
+    summary,
+    pending_count: (STATE.pb1_shadow_pending || []).length,
+    log_count: log.length,
+    log,
   });
 });
 
@@ -3645,6 +5120,9 @@ app.post('/v8/reset-day', (req, res) => {
   STATE.watchlist = {};
   STATE.audit_log = [];      // fresh audit each trading day
   STATE.shadow_trades = {};  // v8.0.2: clear open shadow trackers
+  // v8.0.3: clear PB1 classifier shadow state (per-day evaluation)
+  STATE.pb1_shadow_pending = [];
+  STATE.pb1_shadow_log = [];
   // Keep live_trades and history
   saveStateNow();
   res.json({ ok: true });
@@ -3657,7 +5135,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.2 — Tier2Monitor (new pullback engine, Nifty 100 universe, lifecycle release + shadow tracking + BE-window stop + leg-2 retrace gate)',
+  engine: 'v8.0.4 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, full per-bar audit)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -3666,7 +5144,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.2 — New Pullback Engine + Lifecycle Release Path',
+  name: 'Signal Server v8.0.4 — PB1 Sub-Strategy Classifier LIVE',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

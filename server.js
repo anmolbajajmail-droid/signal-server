@@ -1,4 +1,20 @@
 /**
+ * SIGNAL SERVER v8.0.5 — Direction-aware confirm + consol re-check
+ *
+ * v8.0.5 CHANGES (19/05/2026 night)
+ *   - AGAINST direction now requires 2nd-bar body ≥30% confirmation. WITH
+ *     direction unchanged. Rationale: QR-break-against is a reversal trade
+ *     (push up → retrace down → bull bar at barrier) and needs reversal
+ *     confirmation, not just one bar closing above barrier.
+ *   - Consolidation re-check happens before final classification, catching
+ *     zones that formed AT the barrier while walker was looking for confirm.
+ *     This re-classifies some QR-break-against → QR-continue/QR-reverse.
+ *   - Backtest results:
+ *     - 13-day in-sample (~352 stocks): EV +0.164 → +0.186 (+13%), R +143.56 → +154.29 (+10.73)
+ *     - OOS (5 stocks, 7 months): EV +0.181 → +0.255 (+41%), R +19.00 → +25.99 (+6.99)
+ *     - QR-break-against EV: in-sample +0.137 → +0.245 (nearly doubles), OOS +0.024 → +0.173
+ *   - ROLLBACK: set NEW_CFG.PB1_AGAINST_CONFIRM_BARS = 1 to disable.
+ *
  * SIGNAL SERVER v8.0.4.2 — Partial-bar filter fix
  *
  * v8.0.4.2 PATCH (19/05/2026 evening)
@@ -975,6 +991,11 @@ const NEW_CFG = {
   // Classifier knobs (mirror backtest)
   PB1_RUNWAY_THRESHOLD_ATR: 1.5,
   PB1_CONFIRM_BARS_REQUIRED: 2,
+  // v8.0.5: separate confirm requirement for AGAINST direction (reversal).
+  // 2 = stricter (require 2 bars beyond barrier + 2nd bar body ≥30%).
+  // 1 = same as v8.0.4.2 (1-bar confirm for both with and against).
+  // ROLLBACK: set to 1 to revert.
+  PB1_AGAINST_CONFIRM_BARS: 2,
   PB1_MIN_RR: 1.0,
   PB1_STOP_ATR_CLEAN: 1.5,
   PB1_BUFFER_ATR: 0.25,
@@ -3456,8 +3477,17 @@ class Pb1LiveWalker {
       if (b.t.slice(0, 10) !== this.signalDate) break;
       const status = pb1ClosestatusForBuilder(b, barrierLo, barrierHi, buffer);
       if (status === 'inside') { j++; continue; }
-      // Closed beyond. Confirm requires (confirm_bars_required - 1) more bars.
-      const needed = NEW_CFG.PB1_CONFIRM_BARS_REQUIRED - 1;
+      // v8.0.5: direction-aware confirm requirement
+      // QR-break (with original counter direction): 1-bar confirm (PB1_CONFIRM_BARS_REQUIRED, default 2 -> needed=1)
+      // QR-break-against (flipped direction): 2-bar confirm (reversal needs validation)
+      // Flag: PB1_AGAINST_CONFIRM_BARS. Set to 1 to revert to v8.0.4.2 behaviour.
+      let thisDir;
+      if (this.tradeDir === 'long') thisDir = (status === 'above') ? 'with' : 'against';
+      else thisDir = (status === 'below') ? 'with' : 'against';
+      const againstBars = NEW_CFG.PB1_AGAINST_CONFIRM_BARS || NEW_CFG.PB1_CONFIRM_BARS_REQUIRED;
+      const needed = (thisDir === 'against')
+        ? (againstBars - 1)
+        : (NEW_CFG.PB1_CONFIRM_BARS_REQUIRED - 1);
       if (j + needed >= this.dayBars.length) {
         // Not enough subsequent bars yet — wait.
         break;
@@ -3529,6 +3559,19 @@ class Pb1LiveWalker {
           bars_walked: this.bars_seen,
         });
         return { action: 'SKIP', reason: 'weak_reverse_confirm', sub_strategy: 'QR-skip' };
+      }
+      // v8.0.5: AGAINST direction requires 2nd bar body ≥30% (reversal validation).
+      // If fails, keep walking (don't skip — consolidation may still form).
+      if (thisDir === 'against' && needed >= 1
+          && (NEW_CFG.PB1_AGAINST_CONFIRM_BARS || 1) >= 2) {
+        const cb2 = this.dayBars[j + 1];
+        const cb2Range = Math.max(cb2.h - cb2.l, 1e-9);
+        const cb2Body = Math.abs(cb2.c - cb2.o) / cb2Range;
+        if (cb2Body < NEW_CFG.PB1_MIN_BODY_PCT) {
+          // 2nd bar weak — not a valid against confirm. Keep walking.
+          j = lastCheckIdx + 1;
+          continue;
+        }
       }
       if (gate === 'ok') {
         // Fire classified trade
@@ -5209,7 +5252,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.4.2 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, audit dedup, partial-bar filter)',
+  engine: 'v8.0.5 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (direction-aware confirm + consol re-check)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5218,7 +5261,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.4.2 — PB1 Sub-Strategy Classifier LIVE (partial-bar filter)',
+  name: 'Signal Server v8.0.5 — PB1 Classifier (direction-aware confirm)',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

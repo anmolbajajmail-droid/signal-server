@@ -1,4 +1,23 @@
 /**
+ * SIGNAL SERVER v8.0.4.2 — Partial-bar filter fix
+ *
+ * v8.0.4.2 PATCH (19/05/2026 evening)
+ *   - fetchKite5Min and Yahoo fallback now drop the trailing bar if its
+ *     5-min interval hasn't closed yet (+30s grace for clock skew). Without
+ *     this, the classifier walker can fire on PARTIAL OHLC data, producing
+ *     wrong entry/stop/target prices.
+ *
+ *   - Bug observed live 19/05/2026, LT 14:00 IST: walker recorded entry
+ *     3946.7 (partial bar close) but real bar finalised at 3951.3 — alert
+ *     stop/target were computed off the wrong entry, real trader would have
+ *     entered at ~3951 with risk:reward different from what the alert said.
+ *
+ *   - Affects all of Tier 1 / Tier 2 / Tier 3 / diagnose / shadow runner —
+ *     they all call fetchKite5Min as the single fetch path.
+ *
+ *   - Tradeoff: alerts delayed by up to 5 min worst case (wait for current
+ *     bar to close before evaluating it). Acceptable for audit-quality data.
+ *
  * SIGNAL SERVER v8.0.4.1 — PB1 Classifier audit dedup fix
  *
  * v8.0.4.1 PATCH (19/05/2026 afternoon)
@@ -614,6 +633,28 @@ app.get('/kite/historical', async (req, res) => {
 // ─── 5-MIN CANDLE FETCH — Kite primary, Yahoo fallback ──────────────────────
 // Uses fresh instrument tokens fetched from Kite /instruments/NSE after login
 // Falls back to Yahoo Finance if token not available yet (e.g. before first login)
+// v8.0.4.2 — Drop the trailing bar if it might still be forming.
+// A 5-min bar with timestamp T covers the interval [T, T+5min). If "now"
+// is within that interval (i.e. now < T + 5min + grace), the bar is in
+// progress and its OHLC reflects only the first N seconds. Walker decisions
+// on partial bars produce wrong entry/stop/target prices.
+// Grace allows a small clock-skew tolerance (Kite reports tick lag of ~10-30s).
+function dropInProgressTrailingBar(candles) {
+  if (!candles || !candles.length) return candles;
+  const last = candles[candles.length - 1];
+  if (!last || !last.t) return candles;
+  const barStartMs = new Date(last.t).getTime();
+  if (isNaN(barStartMs)) return candles;
+  const barEndMs = barStartMs + 5 * 60 * 1000;
+  const graceMs = 30 * 1000;        // 30s grace for clock skew / Kite tick lag
+  const nowMs = Date.now();
+  // If we haven't passed the bar's end-of-interval (plus grace), drop it.
+  if (nowMs < barEndMs + graceMs) {
+    return candles.slice(0, -1);
+  }
+  return candles;
+}
+
 async function fetchKite5Min(symbol) {
   // Try Kite first (authoritative NSE data)
   const token = KITE.instrumentTokens[symbol];
@@ -631,9 +672,11 @@ async function fetchKite5Min(symbol) {
         },
         timeout: 8000,
       });
-      const candles = (resp.data?.data?.candles || []).map(c => ({
+      let candles = (resp.data?.data?.candles || []).map(c => ({
         t: c[0], o: +c[1], h: +c[2], l: +c[3], c: +c[4], v: +c[5]
       })).filter(c => c.c > 0);
+      // v8.0.4.2: drop trailing partial bar
+      candles = dropInProgressTrailingBar(candles);
       if (candles.length >= 10) return candles;
       // If Kite returned empty (holiday/error), fall through to Yahoo
     } catch(e) {
@@ -656,7 +699,7 @@ async function fetchKite5Min(symbol) {
     if (!result) return null;
     const q  = result.indicators?.quote?.[0] || {};
     const ts = result.timestamp || [];
-    const candles = ts.map((t, i) => ({
+    let candles = ts.map((t, i) => ({
       t: new Date(t * 1000).toISOString(),
       o: q.open?.[i]  != null ? +q.open[i].toFixed(2)  : null,
       h: q.high?.[i]  != null ? +q.high[i].toFixed(2)  : null,
@@ -664,6 +707,8 @@ async function fetchKite5Min(symbol) {
       c: q.close?.[i] != null ? +q.close[i].toFixed(2) : null,
       v: q.volume?.[i] || 0,
     })).filter(c => c.c != null && c.h != null && c.l != null && c.c > 0);
+    // v8.0.4.2: drop trailing partial bar
+    candles = dropInProgressTrailingBar(candles);
     return candles.length >= 10 ? candles : null;
   } catch(e) {
     return null;
@@ -5164,7 +5209,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.4.1 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, audit dedup fix)',
+  engine: 'v8.0.4.2 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (wait-state walker, V5 gate, audit dedup, partial-bar filter)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5173,7 +5218,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.4.1 — PB1 Sub-Strategy Classifier LIVE (audit dedup fix)',
+  name: 'Signal Server v8.0.4.2 — PB1 Sub-Strategy Classifier LIVE (partial-bar filter)',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

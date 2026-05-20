@@ -1,4 +1,21 @@
 /**
+ * SIGNAL SERVER v8.0.7 — Refresh alert commentary for PB1 sub-strategies
+ *
+ * v8.0.7 CHANGES (20/05/2026 night, deploy before 21/05 market open)
+ *   - Dashboard alert commentary (buildDetailedRationale) now describes the
+ *     PB1 sub-strategy classifier path properly. Prior text was generic
+ *     "counter trade" language inherited from v8.0.2 (pre-classifier).
+ *   - For each fired sub-strategy (QR-clean-runway, QR-break, QR-break-against,
+ *     QR-continue, QR-reverse), the alert now shows:
+ *       (a) Which sub-strategy fired and what it means
+ *       (b) Which barrier (PathSR band / push_start / push_extreme)
+ *       (c) Trade direction and whether it FLIPPED from PB1 intent
+ *       (d) Sub-strategy-specific stop rationale (not generic swing-extreme)
+ *       (e) Cascade-target description (not "50% of push extension")
+ *   - Legacy counter path (deep_retrace_pb2, combo, swing-low-break, ema-fail)
+ *     keeps its existing description.
+ *   - No engine logic changes — commentary only.
+ *
  * SIGNAL SERVER v8.0.6 — Skip alarm gate for PB1 classifier fires
  *
  * v8.0.6 CHANGES (20/05/2026 mid-session)
@@ -1378,23 +1395,51 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
   // SECTION 3: What happened after push
   lines.push('');
   if (isCounter) {
-    // v8.0.2 (#11 fix): describe what the new engine actually does, not the
-    // old hardcoded "80% retrace" / "1.5× target" assumption.
     const retPctCt = sig.retrace_pct ? (sig.retrace_pct * 100).toFixed(0) : '?';
     const trigger = sig.trigger || 'unknown';
-    lines.push(`🔄 COUNTER TRADE LOGIC`);
-    if (trigger === 'deep_retrace_pb1') {
+    // v8.0.7 (commentary refresh): PB1 sub-strategy classifier path uses
+    // barrier-based logic. Show which sub-strategy fired and the barrier
+    // structure that produced it.
+    const isPb1Classifier = (trigger === 'deep_retrace_pb1' && sig.sub_strategy);
+    if (isPb1Classifier) {
+      const sub = sig.sub_strategy;
+      const bt = sig.barrier_type;
+      const trDir = sig.trade_direction;
+      const subDesc = {
+        'QR-clean-runway': 'Quick Reversal — Clean Runway: deep retrace, no structure in trade path. Direct entry, no walker confirmation.',
+        'QR-break': 'Quick Reversal — Break: deep retrace, then walker confirmed close BEYOND barrier in PB1 direction. Continuation entry.',
+        'QR-break-against': 'Quick Reversal — Break Against: walker confirmed close BACK across barrier opposite PB1 direction. Trade FLIPS to push direction (reversal of reversal).',
+        'QR-continue': 'Quick Reversal — Continue: walker confirmed beyond barrier WITH 4+ bar consolidation at barrier (PB1 direction). Strong continuation.',
+        'QR-reverse': 'Quick Reversal — Reverse: walker confirmed AGAINST PB1 direction WITH 4+ bar consolidation at barrier. Trade flips with V5 quality gate.',
+      };
+      lines.push(`🔄 PB1 CLASSIFIER FIRE — ${sub}`);
+      lines.push(`• ${subDesc[sub] || 'Sub-strategy: ' + sub}`);
       lines.push(`• Pullback 1 retraced ${retPctCt}% of push (≥70% threshold met)`);
-    } else if (trigger === 'deep_retrace_pb2') {
-      lines.push(`• Pullback 2 retraced ${retPctCt}% of push after leg-2 attempt failed`);
-    } else if (trigger === 'combo' || trigger === 'combo_or_structural_break') {
-      lines.push(`• Structural break — push high/low broken by counter wave`);
+      if (bt === 'band') {
+        lines.push(`• Barrier: PathSR multi-day band (price-action zone from prior pivots)`);
+      } else if (bt === 'push_start') {
+        lines.push(`• Barrier: Push start price (price where the original push began)`);
+      } else if (bt === 'push_extreme') {
+        lines.push(`• Barrier: Push extreme (high/low of the push)`);
+      }
+      lines.push(`• Trade direction: ${trDir ? trDir.toUpperCase() : (isUp ? 'LONG' : 'SHORT')} | Original push: ${pushDir}`);
+      if (sub === 'QR-break-against' || sub === 'QR-reverse') {
+        lines.push(`• Note: direction FLIPPED from PB1 intent. Walker confirmed opposite move at barrier.`);
+      }
     } else {
-      lines.push(`• Counter trigger: ${trigger} (retrace ${retPctCt}%)`);
+      // Legacy counter path (PB2 / combo / EMA-fail / swing-low-break)
+      lines.push(`🔄 COUNTER TRADE LOGIC`);
+      if (trigger === 'deep_retrace_pb2') {
+        lines.push(`• Pullback 2 retraced ${retPctCt}% of push after leg-2 attempt failed`);
+      } else if (trigger === 'combo' || trigger === 'combo_or_structural_break') {
+        lines.push(`• Structural break — push high/low broken by counter wave`);
+      } else {
+        lines.push(`• Counter trigger: ${trigger} (retrace ${retPctCt}%)`);
+      }
+      lines.push(`• Trading AGAINST original ${pushDir} direction — now ${isUp ? 'LONG' : 'SHORT'}`);
+      lines.push(`• Counter swing veto passed (no recent swing extreme within 0.5× ATR blocking entry)`);
+      lines.push(`• Note: counter trades are higher-risk — push direction reversed entirely`);
     }
-    lines.push(`• Trading AGAINST original ${pushDir} direction — now ${isUp ? 'LONG' : 'SHORT'}`);
-    lines.push(`• Counter swing veto passed (no recent swing extreme within 0.5× ATR blocking entry)`);
-    lines.push(`• Note: counter trades are higher-risk — push direction reversed entirely`);
   } else {
     lines.push(`🔄 PULLBACK PATTERN`);
     const retPct = sig.retrace_pct ? (sig.retrace_pct * 100).toFixed(0) : '?';
@@ -1417,14 +1462,37 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
   lines.push('');
   lines.push(`💡 TRADE THESIS`);
   if (isCounter) {
-    lines.push(`• Original ${pushDir} momentum exhausted/reversed; ride the new direction`);
-    lines.push(`• Stop ₹${sig.stop_price} = beyond recent swing extreme + 0.5× ATR`);
-    // v8.0.2 (#11 fix): show real R:R from the signal, not hardcoded 1.5
-    const rrCt = sig.rr || (Math.abs(sig.target_price - sig.entry_price) / Math.abs(sig.entry_price - sig.stop_price)).toFixed(2);
-    const trgPctCt = (sig.trigger === 'deep_retrace_pb2' || sig.trigger === 'combo')
-      ? '50% of leg-2 range'
-      : '50% of push extension';
-    lines.push(`• Target ₹${sig.target_price} = ${trgPctCt} (R:R ${rrCt})`);
+    // v8.0.7: PB1 classifier sub-strategies have barrier-based stops, not
+    // swing-extreme-based. Show the right description.
+    const isPb1Classifier = (sig.trigger === 'deep_retrace_pb1' && sig.sub_strategy);
+    if (isPb1Classifier) {
+      const sub = sig.sub_strategy;
+      const bt = sig.barrier_type;
+      lines.push(`• PB1 deep retrace held at barrier; walker confirmed direction`);
+      if (sub === 'QR-clean-runway') {
+        lines.push(`• Stop ₹${sig.stop_price} = 1.5× ATR from entry (no nearby structure)`);
+      } else if (sub === 'QR-continue' || sub === 'QR-reverse') {
+        lines.push(`• Stop ₹${sig.stop_price} = beyond consolidation zone + 0.25× ATR`);
+      } else {
+        // QR-break / QR-break-against
+        if (bt === 'band') {
+          lines.push(`• Stop ₹${sig.stop_price} = beyond barrier band edge + 0.5× ATR`);
+        } else {
+          lines.push(`• Stop ₹${sig.stop_price} = beyond ${bt === 'push_start' ? 'push start' : 'push extreme'} + 0.5× ATR`);
+        }
+      }
+      const rrCt = sig.rr || (Math.abs(sig.target_price - sig.entry_price) / Math.abs(sig.entry_price - sig.stop_price)).toFixed(2);
+      lines.push(`• Target ₹${sig.target_price} = nearest barrier in trade direction (cascade) (R:R ${rrCt})`);
+    } else {
+      // Legacy counter path
+      lines.push(`• Original ${pushDir} momentum exhausted/reversed; ride the new direction`);
+      lines.push(`• Stop ₹${sig.stop_price} = beyond recent swing extreme + 0.5× ATR`);
+      const rrCt = sig.rr || (Math.abs(sig.target_price - sig.entry_price) / Math.abs(sig.entry_price - sig.stop_price)).toFixed(2);
+      const trgPctCt = (sig.trigger === 'deep_retrace_pb2' || sig.trigger === 'combo')
+        ? '50% of leg-2 range'
+        : '50% of push extension';
+      lines.push(`• Target ₹${sig.target_price} = ${trgPctCt} (R:R ${rrCt})`);
+    }
   } else {
     lines.push(`• ${pushDir} momentum holding through pullback — expecting continuation`);
     lines.push(`• Stop ₹${sig.stop_price} = beyond pullback extreme + 1× ATR buffer`);
@@ -5284,7 +5352,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.6 — PB1 classifier fires bypass alarm gate (matches backtest)',
+  engine: 'v8.0.7 — PB1 sub-strategy commentary refresh (alarm gate bypassed for PB1)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5293,7 +5361,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.6 — PB1 classifier bypasses alarm gate',
+  name: 'Signal Server v8.0.7 — PB1 sub-strategy commentary refresh',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

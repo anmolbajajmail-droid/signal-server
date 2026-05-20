@@ -1,4 +1,24 @@
 /**
+ * SIGNAL SERVER v8.0.6 — Skip alarm gate for PB1 classifier fires
+ *
+ * v8.0.6 CHANGES (20/05/2026 mid-session)
+ *   - PB1 sub-strategy classifier fires now BYPASS the alarm gate
+ *     (final_score >= 50). All 5 sub-strategies: QR-clean-runway, QR-break,
+ *     QR-break-against, QR-continue, QR-reverse.
+ *   - Rationale: backtest harness (backtest_pb1_sub_strategies.py) does NOT
+ *     apply applyContext()/alarm filter. So v8.0.5 backtest numbers
+ *     (+10.73 R in-sample, +6.99 R OOS) were computed without the gate.
+ *     Applying it live created mismatch: classifier fires with score<50
+ *     were silently dropped, so live delivered fewer alerts than backtest.
+ *   - Live evidence (20/05/2026 morning, before this change):
+ *     ADANIPOWER QR-clean-runway score=47 → dropped by gate
+ *     RECLTD QR-break-against score=18 → dropped by gate
+ *     DLF (other PB1) score≥50 → delivered as alert (working path)
+ *   - Other signal paths (PULLBACK_AT_LEVEL, COUNTER, etc.) still subject
+ *     to alarm gate. Unchanged.
+ *   - ROLLBACK: remove the `&& !isPb1Classifier` condition to restore
+ *     v8.0.5 behaviour.
+ *
  * SIGNAL SERVER v8.0.5 — Direction-aware confirm + consol re-check
  *
  * v8.0.5 CHANGES (19/05/2026 night)
@@ -4298,8 +4318,17 @@ async function runTier2v7() {
           sig.alarm = finalRes.alarm;
           sig.conviction = finalRes.conviction;
           sig.context = ctxAtSig;
-          // Only push if alarm passes (matches Python alarm filter)
-          if (!sig.alarm) {
+          // v8.0.6: skip alarm gate for PB1 sub-strategy classifier fires.
+          // The classifier IS the gate now — backtest harness does not apply
+          // alarm filter, so backtest results were computed without it.
+          // Applying alarm gate live created a mismatch where low-score
+          // classifier fires (e.g. ADANIPOWER QR-clean-runway score=47,
+          // RECLTD QR-break-against score=18 on 20/05/2026) were silently
+          // dropped. With this change, all 5 PB1 sub-strategies bypass the
+          // alarm gate. Other paths (PULLBACK_AT_LEVEL, COUNTER, etc.)
+          // keep the gate unchanged.
+          const isPb1Classifier = (sig.trigger === 'deep_retrace_pb1');
+          if (!sig.alarm && !isPb1Classifier) {
             console.log(`[T2v7] ${symbol} ${sig.type} score=${sig.score} final=${finalRes.final_score} below alarm threshold — skipped`);
             STATE.audit_log.push({
               event: 'SKIPPED', reason: 'below_alarm_threshold',
@@ -4311,6 +4340,9 @@ async function runTier2v7() {
             STATE.blocked_pushes.add(entry.push_id);
             delete STATE.watchlist[symbol];
             break;
+          }
+          if (!sig.alarm && isPb1Classifier) {
+            console.log(`[T2v7] ${symbol} ${sig.type} sub=${sig.sub_strategy} score=${sig.score} final=${finalRes.final_score} — alarm-gate BYPASSED for PB1 classifier (v8.0.6)`);
           }
           const alert = {
             alert_id: `${symbol}_${entry.push_id}_${Date.now()}`,
@@ -5252,7 +5284,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.5 — Tier2Monitor + PB1 Sub-Strategy Classifier LIVE (direction-aware confirm + consol re-check)',
+  engine: 'v8.0.6 — PB1 classifier fires bypass alarm gate (matches backtest)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5261,7 +5293,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.5 — PB1 Classifier (direction-aware confirm)',
+  name: 'Signal Server v8.0.6 — PB1 classifier bypasses alarm gate',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

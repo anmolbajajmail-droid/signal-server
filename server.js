@@ -1,4 +1,70 @@
 /**
+ * SIGNAL SERVER v8.0.9 — Bar-aligned Tier 1/2 scheduling
+ *
+ * v8.0.9 CHANGES (21/05/2026 night — deploy after 22/05 market close)
+ *   PROBLEM: Today (21/05) every PB1 alert fired ~4:47 after its validation
+ *   bar closed. Audit across 15 fires showed lag locked between 4:46 and 4:53.
+ *   Root cause: setInterval(runTier2v7, 5*60*1000) had no bar-boundary
+ *   alignment — Railway boot time set the phase. Cycle ticked at HH:XX:45
+ *   (~45s BEFORE the next bar's close), catching the previously-closed bar
+ *   with ~4:45 latency.
+ *
+ *   FIX: Replace unphased setInterval with self-scheduling setTimeout chain
+ *   that:
+ *     (a) computes ms until next bar boundary in IST + offset (90s for T2,
+ *         120s for T1),
+ *     (b) AWAITS each cycle's completion before scheduling the next (prevents
+ *         overlap if processing takes longer than the interval on a busy day),
+ *     (c) chains forever — every cycle re-schedules its successor based on
+ *         wallclock, so no drift accumulates.
+ *
+ *   PHASING:
+ *     Tier 2 — every 5 min at +90s past 5-min boundary (HH:01:30, HH:06:30, ...)
+ *     Tier 1 — every 10 min at +120s past 10-min boundary (HH:02:00, HH:12:00, ...)
+ *     Tier 3 — UNCHANGED (60s, no bar-boundary dependency)
+ *
+ *   WHY +90s for Tier 2? v8.0.4.2 dropInProgressTrailingBar grace is 30s.
+ *   Kite's historical API publishes the just-closed bar at ~10-30s post-close
+ *   based on observation. 90s gives a 3x buffer — even if Kite is occasionally
+ *   slow, the engine won't drop the bar as partial.
+ *
+ *   WHY +120s for Tier 1 (not +90s)? Tier 1 is heavier (scans full universe of
+ *   310 stocks). 30s offset from Tier 2 prevents concurrent Kite fetches that
+ *   could race for the rate limit.
+ *
+ *   EXPECTED LAG (bar close → alert on dashboard):
+ *     Today (v8.0.8): ~5:00 avg (4:47 cycle + 15s dashboard poll)
+ *     After v8.0.9: ~1:40 avg (90s phase + 7s processing + ~5s polling)
+ *
+ *   COMPANION CHANGE: trading_app.html POLL_INTERVAL reduced 30000 → 5000
+ *   to remove dashboard polling jitter from end-to-end lag.
+ *
+ *   ROLLBACK: 4-line revert in /home/claude/server_v8_0_9.js scheduler block —
+ *   restore the original 4-line setTimeout/setInterval combo from v8.0.8.
+ *
+ * SIGNAL SERVER v8.0.8 — Fix isCounter gate + surface barrier details in commentary
+ *
+ * v8.0.8 CHANGES (21/05/2026 — deploy after market close, before 22/05 open)
+ *   (1) FIX isCounter gate. v8.0.7 added PB1 sub-strategy commentary inside
+ *       the `if (isCounter)` branch of buildDetailedRationale. But buildRationale
+ *       was passing `sig.type === 'COUNTER'` as isCounter — which is FALSE for
+ *       PB1 fires (their sig.type is QR_BREAK / QR_BREAK_AGAINST / etc).
+ *       So v8.0.7 PB1 commentary never ran in production on 21/05.
+ *       Fix: pass `sig.is_counter === true || sig.type === 'COUNTER'` so any
+ *       counter-direction trade (PB1 sub-strategy fires OR legacy COUNTER)
+ *       reaches the isCounter branch.
+ *
+ *   (2) ADD barrier details to alert. Live trades on 21/05 fired against
+ *       barriers like HINDALCO's "band 1100.40-1100.40" — a degenerate 1-pivot
+ *       band only visible in the 5-day Kite window (not full multi-day).
+ *       User needs to see barrier price/range and strength in the alert text
+ *       to judge whether the structure being traded against is robust.
+ *       Fix: expose barrier_lo, barrier_hi, barrier_strength, barrier_n_pivots
+ *       on fire_result and sig; render in commentary with clear "WEAK structure
+ *       (single pivot)" warning when band collapses to a line.
+ *
+ *   No engine logic changes. Commentary + sig fields only.
+ *
  * SIGNAL SERVER v8.0.7 — Refresh alert commentary for PB1 sub-strategies
  *
  * v8.0.7 CHANGES (20/05/2026 night, deploy before 21/05 market open)
@@ -1415,7 +1481,26 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
       lines.push(`🔄 PB1 CLASSIFIER FIRE — ${sub}`);
       lines.push(`• ${subDesc[sub] || 'Sub-strategy: ' + sub}`);
       lines.push(`• Pullback 1 retraced ${retPctCt}% of push (≥70% threshold met)`);
-      if (bt === 'band') {
+      // v8.0.8: surface barrier prices + strength so user can validate
+      // the structure being traded against.
+      const bLo = sig.barrier_lo;
+      const bHi = sig.barrier_hi;
+      const bStr = sig.barrier_strength;
+      const bPiv = sig.barrier_n_pivots;
+      if (bt === 'band' && bLo != null && bHi != null) {
+        if (Math.abs(bHi - bLo) < 0.01) {
+          // Degenerate band (single pivot collapsed to line)
+          const strInfo = (bStr != null && bPiv != null) ? `, strength ${bStr}, ${bPiv} pivot${bPiv === 1 ? '' : 's'}` : '';
+          lines.push(`• Barrier: PathSR band collapsed to single price ₹${bLo}${strInfo}${bPiv === 1 ? ' — WEAK structure (single pivot)' : ''}`);
+        } else {
+          const strInfo = (bStr != null && bPiv != null) ? `, strength ${bStr}, ${bPiv} pivots` : '';
+          lines.push(`• Barrier: PathSR multi-day band ₹${bLo} – ₹${bHi}${strInfo}`);
+        }
+      } else if (bt === 'push_start' && bLo != null) {
+        lines.push(`• Barrier: Push start price ₹${bLo} (price where original push began)`);
+      } else if (bt === 'push_extreme' && bLo != null) {
+        lines.push(`• Barrier: Push extreme ₹${bLo} (high/low of original push)`);
+      } else if (bt === 'band') {
         lines.push(`• Barrier: PathSR multi-day band (price-action zone from prior pivots)`);
       } else if (bt === 'push_start') {
         lines.push(`• Barrier: Push start price (price where the original push began)`);
@@ -1425,6 +1510,20 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
       lines.push(`• Trade direction: ${trDir ? trDir.toUpperCase() : (isUp ? 'LONG' : 'SHORT')} | Original push: ${pushDir}`);
       if (sub === 'QR-break-against' || sub === 'QR-reverse') {
         lines.push(`• Note: direction FLIPPED from PB1 intent. Walker confirmed opposite move at barrier.`);
+      }
+      // v8.0.8: next 2 bands in trade path (potential support for SHORT, resistance for LONG)
+      const pathBands = sig.path_bands || [];
+      if (pathBands.length > 0) {
+        const isShort = (trDir === 'short') || (!trDir && !isUp);
+        const sideLabel = isShort ? 'support' : 'resistance';
+        lines.push(`• Next bands in trade path (potential ${sideLabel}):`);
+        pathBands.forEach(pb => {
+          const isDegenerate = Math.abs(pb.high - pb.low) < 0.01;
+          const priceStr = isDegenerate ? `₹${pb.low}` : `₹${pb.low} – ₹${pb.high}`;
+          const strInfo = pb.strength ? `strength ${pb.strength}, ${pb.n_pivots} pivot${pb.n_pivots === 1 ? '' : 's'}` : '';
+          const weakFlag = (pb.n_pivots === 1) ? ' (WEAK — single pivot)' : '';
+          lines.push(`  - ${priceStr} (${strInfo})${weakFlag} — ${pb.dist.toFixed(2)} from entry`);
+        });
       }
     } else {
       // Legacy counter path (PB2 / combo / EMA-fail / swing-low-break)
@@ -1521,7 +1620,11 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
 }
 
 function buildRationale(sig, push, brokenSR) {
-  return buildDetailedRationale(sig, push, brokenSR, sig.type === 'COUNTER');
+  // v8.0.8: PB1 sub-strategy fires have sig.is_counter=true but sig.type is
+  // QR_BREAK / QR_BREAK_AGAINST / etc (NOT 'COUNTER'). So the old gate
+  // `sig.type === 'COUNTER'` evaluated false for ALL PB1 fires and the v8.0.7
+  // PB1 commentary branch was never reached. Use sig.is_counter directly.
+  return buildDetailedRationale(sig, push, brokenSR, sig.is_counter === true || sig.type === 'COUNTER');
 }
 
 class Tier2Monitor {
@@ -2118,6 +2221,12 @@ class Tier2Monitor {
       is_counter: true,
       atr: +atr.toFixed(4),
       barrier_type: tr.barrier_type,
+      // v8.0.8: surface barrier details to alert commentary
+      barrier_lo: tr.barrier_lo,
+      barrier_hi: tr.barrier_hi,
+      barrier_strength: tr.barrier_strength,
+      barrier_n_pivots: tr.barrier_n_pivots,
+      path_bands: tr.path_bands || [],
       classified: true,  // marker for dashboard / audit
       explanation: buildExplanation(push, this, bar, publicType, score, ema, counterDir),
     };
@@ -3162,6 +3271,19 @@ function pb1ClassifyAtSignal(dayBars, sigIdx, push, atr, multiDayBars) {
       const stopDist = Math.abs(entry - stop);
       const tgtDist = Math.abs(target - entry);
       if (stopDist > 0 && tgtDist >= NEW_CFG.PB1_MIN_RR * stopDist) {
+        // v8.0.8: compute next 2 bands in trade direction
+        const isLongDir = (tradeDir === 'long');
+        const pathBands = bands
+          .filter(b => isLongDir ? (b.low > entry) : (b.high < entry))
+          .map(b => ({
+            low: +(b.low || 0).toFixed(2),
+            high: +(b.high || 0).toFixed(2),
+            strength: b.strength || 0,
+            n_pivots: b.n_pivots || 0,
+            dist: isLongDir ? (b.low - entry) : (entry - b.high),
+          }))
+          .sort((a, b) => a.dist - b.dist)
+          .slice(0, 2);
         return {
           sub_strategy: 'QR-clean-runway',
           entry_price: +entry.toFixed(2),
@@ -3171,6 +3293,12 @@ function pb1ClassifyAtSignal(dayBars, sigIdx, push, atr, multiDayBars) {
           rr: +(tgtDist / stopDist).toFixed(2),
           trade_direction: tradeDir,
           barrier_type: nearest.type,
+          // v8.0.8: surface barrier details (nearest is the runway target)
+          barrier_lo: +(nearest.low || nearest.price || 0).toFixed(2),
+          barrier_hi: +(nearest.high || nearest.price || 0).toFixed(2),
+          barrier_strength: nearest.strength || null,
+          barrier_n_pivots: nearest.n_pivots || null,
+          path_bands: pathBands,
           entry_bar_idx: sigIdx,
           entry_bar_t: sigBar.t,
         };
@@ -3694,6 +3822,21 @@ class Pb1LiveWalker {
           return { action: 'SKIP', reason: 'no_target_distance', sub_strategy: sub };
         }
         this.finished = true;
+        // v8.0.8: compute next 2 bands in trade direction (toward target).
+        // For LONG, bands ABOVE entry; for SHORT, bands BELOW entry.
+        // These are the structures the trade has to push through.
+        const isLongDir = (effectiveDir === 'long');
+        const pathBands = (this.bands || [])
+          .filter(b => isLongDir ? (b.low > entry) : (b.high < entry))
+          .map(b => ({
+            low: +(b.low || 0).toFixed(2),
+            high: +(b.high || 0).toFixed(2),
+            strength: b.strength || 0,
+            n_pivots: b.n_pivots || 0,
+            dist: isLongDir ? (b.low - entry) : (entry - b.high),
+          }))
+          .sort((a, b) => a.dist - b.dist)
+          .slice(0, 2);
         this.fire_result = {
           sub_strategy: sub,
           entry_price: +entry.toFixed(2),
@@ -3703,6 +3846,15 @@ class Pb1LiveWalker {
           rr: +(tgtDist / stopDist).toFixed(2),
           trade_direction: effectiveDir,
           barrier_type: this.barrier.type,
+          // v8.0.8: expose full barrier details so the dashboard alert
+          // commentary can show exactly which barrier price/zone was used
+          // and how robust the structure was (band strength + n_pivots).
+          barrier_lo: +(this.barrier.low || this.barrier.price || 0).toFixed(2),
+          barrier_hi: +(this.barrier.high || this.barrier.price || 0).toFixed(2),
+          barrier_strength: this.barrier.strength || null,
+          barrier_n_pivots: this.barrier.n_pivots || null,
+          // v8.0.8: next 2 bands in trade path (support for SHORT, resistance for LONG)
+          path_bands: pathBands,
           entry_bar_t: cb.t,
           consol_idx_range: this.consol_idx_range
             ? [this.consol_idx_range[0], this.consol_idx_range[1]]
@@ -4873,10 +5025,89 @@ function pb1MeasureOutcome(dayBars, trade) {
 }
 
 // ── SCHEDULERS ────────────────────────────────────────────────────────
+// v8.0.9: Bar-aligned scheduling for Tier 1 / Tier 2 to minimise lag between
+// bar close and alert fire. Replaces unphased setInterval with self-scheduling
+// setTimeout chains that AWAIT each cycle's completion before scheduling the
+// next (prevents overlap on busy days).
+//
+// Phasing:
+//   Tier 2 — every 5 min at +90s past each 5-min boundary
+//            (HH:00:90, HH:05:90, HH:10:90, etc. — i.e. HH:01:30, HH:06:30, ...)
+//   Tier 1 — every 10 min at +120s past each 10-min boundary
+//            (HH:02:00, HH:12:00, HH:22:00, etc.) — 30s offset from any Tier 2 tick
+//   Tier 3 — every 60s, unchanged (live trade tracking, no bar-boundary dependency)
+//
+// 90s/120s offsets give Kite's historical API time to publish the closed bar
+// (v8.0.4.2 dropInProgressTrailingBar uses 30s grace; 90s = 3x buffer).
+//
+// Expected end-to-end lag (bar close → alert in Telegram):
+//   Today: ~5:00 avg (4:47 Tier 2 cycle phase + 15s dashboard poll)
+//   v8.0.9: ~1:40 avg (90s phase + 7s processing + 5s dashboard poll)
+
+function msUntilNextBoundary(intervalMin, offsetSec) {
+  // Compute ms from now until the next clock boundary of `intervalMin` minutes
+  // past the hour, plus `offsetSec` seconds. Uses IST (UTC+5:30).
+  //
+  // Logic: find most recent boundary (e.g. for intervalMin=5, that's the most
+  // recent 5-min mark like 10:45:00). Target = boundary + offset (e.g. 10:46:30).
+  // If we're before the target → wait until it. If we're past → wait until the
+  // NEXT boundary's target (10:50:00 + offset = 10:51:30).
+  const now = new Date();
+  const utcMs = now.getTime();
+  const istMs = utcMs + (5 * 60 + 30) * 60 * 1000;  // shift to IST wallclock
+  const ist = new Date(istMs);
+  const minute = ist.getUTCMinutes();
+  const second = ist.getUTCSeconds();
+  const milli = ist.getUTCMilliseconds();
+  // Most recent boundary minute (rounded DOWN to multiple of intervalMin)
+  const currentBoundaryMin = Math.floor(minute / intervalMin) * intervalMin;
+  // ms into the current boundary
+  const msIntoBoundary = (minute - currentBoundaryMin) * 60_000 + second * 1000 + milli;
+  const offsetMs = offsetSec * 1000;
+  if (msIntoBoundary < offsetMs) {
+    // Still before this boundary's target — wait until it
+    return offsetMs - msIntoBoundary;
+  } else {
+    // Past this boundary's target — schedule for next boundary's target
+    return (intervalMin * 60_000) - msIntoBoundary + offsetMs;
+  }
+}
+
+async function scheduleNextTier2() {
+  const delayMs = msUntilNextBoundary(5, 90);  // 5-min boundary + 90s
+  const targetTime = new Date(Date.now() + delayMs).toISOString();
+  console.log(`[T2v7 schedule] next tick in ${Math.round(delayMs/1000)}s at ${targetTime}`);
+  setTimeout(async () => {
+    try {
+      await runTier2v7();
+    } catch (e) {
+      console.error('[T2v7 cycle error]', e);
+    }
+    scheduleNextTier2();
+  }, delayMs);
+}
+
+async function scheduleNextTier1() {
+  const delayMs = msUntilNextBoundary(10, 120);  // 10-min boundary + 120s
+  const targetTime = new Date(Date.now() + delayMs).toISOString();
+  console.log(`[T1v7 schedule] next tick in ${Math.round(delayMs/1000)}s at ${targetTime}`);
+  setTimeout(async () => {
+    try {
+      await runTier1v7();
+    } catch (e) {
+      console.error('[T1v7 cycle error]', e);
+    }
+    scheduleNextTier1();
+  }, delayMs);
+}
+
+// Boot sequence:
+//   - Tier 1 runs once at +8s after boot (warm-up scan)
+//   - Then both schedulers start chaining themselves to bar boundaries
 setTimeout(runTier1v7, 8000);                              // 8s after startup
-setInterval(runTier1v7, 10 * 60 * 1000);                   // every 10 min
-setInterval(runTier2v7, 5 * 60 * 1000);                    // every 5 min
-setInterval(runTier3v7, 60 * 1000);                        // every 1 min
+scheduleNextTier1();                                       // then every 10 min at +120s
+scheduleNextTier2();                                       // every 5 min at +90s
+setInterval(runTier3v7, 60 * 1000);                        // every 1 min (live trades — unchanged)
 
 // ── ENDPOINTS ────────────────────────────────────────────────────────
 app.get('/v8/alerts', (req, res) => {
@@ -5352,7 +5583,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.7 — PB1 sub-strategy commentary refresh (alarm gate bypassed for PB1)',
+  engine: 'v8.0.9 — Bar-aligned Tier 1/2 scheduling (T2 +90s, T1 +120s) on top of v8.0.8',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5361,7 +5592,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.7 — PB1 sub-strategy commentary refresh',
+  name: 'Signal Server v8.0.9 — Bar-aligned scheduling',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

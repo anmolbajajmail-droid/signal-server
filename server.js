@@ -1,4 +1,40 @@
 /**
+ * SIGNAL SERVER v8.0.11 — User fill+stop override + dropdown persistence + exit-button restore
+ *
+ * v8.0.11 CHANGES (25/05/2026 night — deploy after market close)
+ *   CHANGE 1: Editable user fill price + stop in /v8/track endpoint.
+ *     - Accepts new optional field `user_stop_price` in request body.
+ *     - When provided, Tier 3 R/P&L uses USER fill_price and USER stop.
+ *     - Engine entry_price and stop_price preserved unchanged on alert.* for analytics.
+ *     - live_trades record now stores user_fill_price / user_stop_price / user_shares.
+ *     - Tier3Tracker constructor accepts a 6th param (userStopPrice). If null,
+ *       uses alert.stop_price (engine). If provided, uses it for BE, hit
+ *       detection, and R denominator.
+ *     - Validates user_stop_price is on correct side of fill_price.
+ *     - Tracker exposes engine_R for later analytics (delta vs user R).
+ *
+ *   /v8/live-trades response expanded with user_fill_price / user_stop_price.
+ *   Dashboard displays USER values prominently; engine values shown only in
+ *   the original-thesis dropdown (introduced in v8.0.10).
+ *
+ *   COMPANION DASHBOARD CHANGES (in trading_app_v8_10.html):
+ *     1. New Take-Trade modal with three editable fields:
+ *        - Fill price (default = engine entry_price; user can change)
+ *        - Stop price (default = engine stop_price; user typically widens)
+ *        - Shares
+ *     2. Live trade cards show user values (Position, Stop, P&L all use user values).
+ *     3. Original-thesis dropdown shows ENGINE values (entry/stop/target/RR) so
+ *        user can see the recommendation as engine made it.
+ *     4. Engine-vs-User delta row added to live card: "Stop +0.5 pts (+18%)
+ *        wider than engine" if user widened.
+ *     5. Dropdown auto-close fix: track open panel IDs in JS Set, re-apply on
+ *        every re-render (both live-trade thesis panels and dismissed section).
+ *     6. Exit Trade button visibility restored (verify renderLive includes
+ *        exitBtn HTML).
+ *
+ *   ROLLBACK: revert /v8/track to v8.0.10 signature (drop user_stop_price),
+ *   revert Tier3Tracker constructor to 5 args. Dashboard back to v8_9.html.
+ *
  * SIGNAL SERVER v8.0.10 — Live-trade thesis preservation
  *
  * v8.0.10 CHANGES (22/05/2026 night — deploy after market close)
@@ -2499,33 +2535,32 @@ class Tier2Monitor {
   }
 }
 class Tier3Tracker {
-  constructor(alert, fillPrice, fillTime, shares, isShadow) {
+  constructor(alert, fillPrice, fillTime, shares, isShadow, userStopPrice) {
     this.alert = alert; this.fill_price = fillPrice; this.fill_time = fillTime;
     this.shares = shares || 1;
     this.bars_since_fill = 0; this.mfe = 0; this.mae = 0; this.exit_override = false;
     this.outcome = null; this.exit_reason = null; this.exit_price = null; this.exit_time = null;
     this.last_price = fillPrice;
+    // v8.0.11: User can override the engine stop with a different (typically wider)
+    // stop at take-trade time. Tier 3 lifecycle (BE, hit detection, R) uses the
+    // user stop if provided, else falls back to engine stop. Engine stop stays
+    // preserved on `alert.stop_price` for analytics.
+    this.user_stop_price = userStopPrice != null ? +userStopPrice : null;
+    this.effective_stop = (this.user_stop_price != null) ? this.user_stop_price : alert.stop_price;
     // v8.0.2 (BACKLOG #7): Breakeven-window stop. The "active stop" used for
-    // hit detection lives in `current_stop`, starts equal to alert.stop_price,
+    // hit detection lives in `current_stop`, starts equal to effective_stop,
     // moves to entry + buffer when BE activates, returns to original on release.
-    this.original_stop = alert.stop_price;
-    this.current_stop = alert.stop_price;
+    this.original_stop = this.effective_stop;
+    this.current_stop = this.effective_stop;
     this.breakeven_active = false;
     this.breakeven_released = false;
     this.stop_history = [];  // [{ time, from, to, reason }]
     // v8.0.2: capture ATR from alert for BE buffer (matches backtest spec).
-    // Falls back to null for legacy alerts that don't carry it.
     this.atr = (alert.atr != null) ? alert.atr : null;
-    // v8.0.2 (BACKLOG #14): Distinguish shadow vs live taken trade.
-    // Shadow: early-exit rules auto-close (no real money).
-    // Live taken: early-exit rules become NOTIFY only — never auto-close.
-    // Trade closes only on target, stop (original or BE), manual exit, or EOD.
     this.is_shadow = !!isShadow;
-    // v8.0.2 (BACKLOG #14, #16): notifications queued for orchestrator to drain
-    // and push to Telegram + dashboard. Shape:
-    //   { type: 'BE_ACTIVATE' | 'BE_RELEASE' | 'EARLY_EXIT_ADVISORY',
-    //     reason, time, current_stop, current_price, mfe, mae, unrealized_R, advisory_text }
     this.notifications = [];
+    // v8.0.11: pre-compute engine R for analytics (compare engine vs user later)
+    this.engine_R = Math.abs(alert.entry_price - alert.stop_price);
   }
   _pnl(price) {
     const isUp = this.alert.dir === 'up';
@@ -2604,7 +2639,9 @@ class Tier3Tracker {
     if (this.outcome) return { status: 'closed', ...this.summary() };
     this.bars_since_fill++;
     const isUp = this.alert.dir === 'up';
-    const R = Math.abs(this.alert.entry_price - this.original_stop);
+    // v8.0.11: R uses USER fill_price and USER stop if provided. This is the R
+    // displayed to the user. Engine R is preserved in this.engine_R for analytics.
+    const R = Math.abs(this.fill_price - this.original_stop);
     const m = isUp ? (bar.c - this.fill_price) : (this.fill_price - bar.c);
     const mR = m / R;
     if (mR > this.mfe) this.mfe = mR;
@@ -5168,21 +5205,40 @@ app.get('/v8/watchlist', (req, res) => {
 });
 
 app.post('/v8/track', (req, res) => {
-  const { alert_id, fill_price, fill_time, shares } = req.body || {};
+  // v8.0.11: accept user_stop_price — user's actual real-world stop (typically
+  // wider than engine stop). If provided, Tier 3 R/P&L uses USER values
+  // throughout. Engine values stay preserved on alert object for analytics.
+  // fill_price now represents USER fill (default = engine entry_price).
+  const { alert_id, fill_price, fill_time, shares, user_stop_price } = req.body || {};
   if (!alert_id || !fill_price) return res.status(400).json({ error: 'alert_id and fill_price required' });
   const alert = STATE.alerts.find(a => a.alert_id === alert_id);
   if (!alert) return res.status(404).json({ error: 'alert not found' });
   alert.status = 'taken';
   const nShares = shares ? +shares : 1;
-  const tracker = new Tier3Tracker(alert, fill_price, fill_time || new Date().toISOString(), nShares, false);
+  // Validate user_stop_price direction (must be on correct side of fill_price)
+  let userStop = null;
+  if (user_stop_price != null && user_stop_price !== '') {
+    const us = +user_stop_price;
+    if (alert.dir === 'up' && us >= +fill_price) {
+      return res.status(400).json({ error: 'user_stop_price must be below fill_price for LONG trades' });
+    }
+    if (alert.dir === 'down' && us <= +fill_price) {
+      return res.status(400).json({ error: 'user_stop_price must be above fill_price for SHORT trades' });
+    }
+    userStop = us;
+  }
+  const tracker = new Tier3Tracker(alert, +fill_price, fill_time || new Date().toISOString(), nShares, false, userStop);
   STATE.live_trades[alert_id] = {
     alert, fill_price: +fill_price, fill_time: fill_time || new Date().toISOString(),
     shares: nShares,
+    user_fill_price: +fill_price,
+    user_stop_price: userStop, // null if not overridden
+    user_shares: nShares,
     tracker, last_bar_t: null, closed: false, last_status: { status: 'open' },
   };
-  console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price} shares=${nShares}`);
+  console.log(`[T3v7] TRACKING ${alert.symbol} ${alert.type} fill=${fill_price} stop=${userStop != null ? userStop+' (user)' : alert.stop_price+' (engine)'} shares=${nShares}`);
   saveStateNow();
-  res.json({ ok: true, alert_id, fill_price, fill_time, shares: nShares });
+  res.json({ ok: true, alert_id, fill_price, fill_time, shares: nShares, user_stop_price: userStop });
 });
 
 // ── v8.0.2: Dismiss alert (BACKLOG #1) ─────────────────────────────────────
@@ -5269,8 +5325,11 @@ app.post('/v8/manual-exit-trade', (req, res) => {
 });
 
 app.get('/v8/live-trades', (req, res) => {
-  // v8.0.10: include full alert thesis so dashboard can show original recommendation
-  // (rationale, score breakdown, push info, barriers, path bands) on Live Trade cards.
+  // v8.0.10: include full alert thesis so dashboard can show original recommendation.
+  // v8.0.11: include user_fill_price / user_stop_price (user's real-world values).
+  // Display defaults: USER values shown prominently. Engine values are inside
+  // alert.entry_price / alert.stop_price (preserved unchanged) and shown only
+  // in the original-thesis dropdown for backtesting reference.
   const lt = Object.entries(STATE.live_trades).map(([id, t]) => ({
     alert_id: id,
     symbol: t.alert.symbol,
@@ -5280,6 +5339,11 @@ app.get('/v8/live-trades', (req, res) => {
     fill_price: t.fill_price,
     fill_time: t.fill_time,
     shares: t.shares || 1,
+    // v8.0.11: user vs engine values for the live card
+    user_fill_price: t.user_fill_price != null ? t.user_fill_price : t.fill_price,
+    user_stop_price: t.user_stop_price, // null = using engine stop
+    user_shares: t.user_shares != null ? t.user_shares : (t.shares || 1),
+    // Engine values (preserved from alert at fire time)
     entry_price: t.alert.entry_price,
     stop_price: t.alert.stop_price,
     target_price: t.alert.target_price,
@@ -5651,7 +5715,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.10 — Live-trade thesis preservation + dismissed alerts collapsible section',
+  engine: 'v8.0.11 — User fill+stop override (editable take-trade) + dropdown-state persistence + exit button restore',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5660,7 +5724,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.10 — Live-trade thesis preservation',
+  name: 'Signal Server v8.0.11 — User fill+stop override',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

@@ -1,4 +1,39 @@
 /**
+ * SIGNAL SERVER v8.0.10 — Live-trade thesis preservation
+ *
+ * v8.0.10 CHANGES (22/05/2026 night — deploy after market close)
+ *   PROBLEM: When a user clicks "Take" on an alert, the alert moves from
+ *   STATE.alerts → STATE.live_trades. The /v8/live-trades endpoint then only
+ *   exposed trade levels (entry/stop/target) — NOT the original rationale,
+ *   score breakdown, push info, barrier details, or path bands. Once a trade
+ *   went live, the user lost visibility into WHY the engine recommended it.
+ *
+ *   FIX: Expand /v8/live-trades response to include the full alert thesis:
+ *     - rationale (commentary text)
+ *     - score, final_score, conviction, breakdown, context
+ *     - push (full push object), push_id, push_start, push_end, push_extreme
+ *     - barrier_type, barrier_lo, barrier_hi, barrier_strength, barrier_n_pivots
+ *     - path_bands
+ *     - retrace_pct, atr, is_counter, classified, alarm
+ *     - rt_level, rt_tier (for PB@L)
+ *
+ *   Server-side change is small (~30 line additions in /v8/live-trades handler).
+ *   Dashboard side (trading_app_v8_9.html) consumes these new fields to show
+ *   expandable thesis dropdowns on Live Trade cards.
+ *
+ *   COMPANION DASHBOARD CHANGES (in trading_app_v8_9.html):
+ *     1. Live Trade cards get a "▶ Show original thesis" toggle button.
+ *        Clicking expands an inline panel with the full alert thesis as it
+ *        was at fire-time (entry/stop/target, RR, score, conviction badge,
+ *        push details, barrier, path bands, full rationale text).
+ *     2. New collapsible "Dismissed Alerts (N)" section below the pending
+ *        alerts list. Click header to expand/collapse. Each dismissed alert
+ *        renders with the same card format as pending alerts but greyed out
+ *        + a DISMISSED badge. Data source: /v8/history?type=DISMISSED.
+ *
+ *   ROLLBACK: revert /v8/live-trades to the slim version (16 lines), revert
+ *   the dashboard HTML file. Both changes are isolated and rollback is clean.
+ *
  * SIGNAL SERVER v8.0.9 — Bar-aligned Tier 1/2 scheduling
  *
  * v8.0.9 CHANGES (21/05/2026 night — deploy after 22/05 market close)
@@ -5234,10 +5269,13 @@ app.post('/v8/manual-exit-trade', (req, res) => {
 });
 
 app.get('/v8/live-trades', (req, res) => {
+  // v8.0.10: include full alert thesis so dashboard can show original recommendation
+  // (rationale, score breakdown, push info, barriers, path bands) on Live Trade cards.
   const lt = Object.entries(STATE.live_trades).map(([id, t]) => ({
     alert_id: id,
     symbol: t.alert.symbol,
     type: t.alert.type,
+    sub_strategy: t.alert.sub_strategy || null,
     dir: t.alert.dir,
     fill_price: t.fill_price,
     fill_time: t.fill_time,
@@ -5245,8 +5283,38 @@ app.get('/v8/live-trades', (req, res) => {
     entry_price: t.alert.entry_price,
     stop_price: t.alert.stop_price,
     target_price: t.alert.target_price,
+    rr: t.alert.rr || null,
+    bar_time: t.alert.bar_time || null,
+    fired_at: t.alert.fired_at || null,
     closed: t.closed,
     status: t.last_status,
+    // v8.0.10: full thesis fields (preserved as-is from original alert)
+    rationale: t.alert.rationale || null,
+    explanation: t.alert.explanation || null,
+    score: t.alert.score != null ? t.alert.score : null,
+    final_score: t.alert.final_score != null ? t.alert.final_score : null,
+    conviction: t.alert.conviction || null,
+    breakdown: t.alert.breakdown || null,
+    context: t.alert.context || null,
+    push: t.alert.push || null,
+    push_id: t.alert.push_id || null,
+    push_start: t.alert.push_start || null,
+    push_end: t.alert.push_end || null,
+    push_extreme: t.alert.push_extreme != null ? t.alert.push_extreme : null,
+    push_move: t.alert.push_move != null ? t.alert.push_move : null,
+    barrier_type: t.alert.barrier_type || null,
+    barrier_lo: t.alert.barrier_lo != null ? t.alert.barrier_lo : null,
+    barrier_hi: t.alert.barrier_hi != null ? t.alert.barrier_hi : null,
+    barrier_strength: t.alert.barrier_strength != null ? t.alert.barrier_strength : null,
+    barrier_n_pivots: t.alert.barrier_n_pivots != null ? t.alert.barrier_n_pivots : null,
+    path_bands: t.alert.path_bands || null,
+    retrace_pct: t.alert.retrace_pct != null ? t.alert.retrace_pct : null,
+    atr: t.alert.atr != null ? t.alert.atr : null,
+    is_counter: t.alert.is_counter != null ? t.alert.is_counter : null,
+    classified: t.alert.classified != null ? t.alert.classified : null,
+    alarm: t.alert.alarm != null ? t.alert.alarm : null,
+    rt_level: t.alert.rt_level != null ? t.alert.rt_level : null,
+    rt_tier: t.alert.rt_tier || null,
   }));
   res.json({ live: lt.filter(l => !l.closed), closed: lt.filter(l => l.closed), history_count: STATE.history.length });
 });
@@ -5583,7 +5651,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.9 — Bar-aligned Tier 1/2 scheduling (T2 +90s, T1 +120s) on top of v8.0.8',
+  engine: 'v8.0.10 — Live-trade thesis preservation + dismissed alerts collapsible section',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -5592,7 +5660,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.9 — Bar-aligned scheduling',
+  name: 'Signal Server v8.0.10 — Live-trade thesis preservation',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [

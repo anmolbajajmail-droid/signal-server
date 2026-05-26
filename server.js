@@ -1,4 +1,40 @@
 /**
+ * SIGNAL SERVER v8.0.12 — Structural cautions in thesis (informational)
+ *
+ * v8.0.12 CHANGES (25/05/2026 night — deploy after market close)
+ *   PROBLEM: Engine target placement uses PathSR bands + push_start + push_extreme
+ *   only. T1/T2 S/R levels from computeSR are visible to scoring (+5 reconfirmation
+ *   bonus, -10 path blocker penalty) and to the legacy thesis ("Levels broken"
+ *   section), but they are NOT consulted by pb1BuildBarriers or pb1ComputeTarget.
+ *   On 25/05/2026, HAL #1 (target placed past a 5-pivot same-day shelf at 4435)
+ *   and GODREJCP #2 (target placed past a 10-pivot 1012-1014 support shelf from
+ *   prior 2 days) both stopped out because price respected those levels. The
+ *   levels were detected by computeSR but never surfaced in the thesis prominently.
+ *
+ *   FIX: New function getMajorCautions() builds a strict-filtered list of major
+ *   structural barriers IN THE TRADE DIRECTION:
+ *     - PathSR bands with n_pivots ≥ 3, within 2.5× ATR of entry, ahead-of-entry
+ *     - T1 S/R levels with priorDayTouches ≥ 3, within 2.5× ATR of entry, ahead
+ *     - T2 S/R levels with priorDayTouches ≥ 2, within 1.5× ATR of entry, ahead
+ *   Deduplicates levels within 0.5× ATR of each other (e.g. a T1 sitting inside
+ *   a PathSR band shows up once). Caps at 3 items total to avoid thesis bloat.
+ *   Each item is tagged STRONG (between entry and target — likely to halt trade)
+ *   or INFO (past target — secondary resistance).
+ *
+ *   Thesis change: ⚠️ CAUTIONS block rendered at TOP of thesis (above PUSH
+ *   DETECTED section) ONLY when ≥1 caution exists. Most clean setups will show
+ *   no cautions block at all. Strict criteria + 3-item cap keeps thesis short.
+ *
+ *   No engine-level skip. No score change. No target/stop change. Trades fire
+ *   exactly as before. Cautions are PURELY INFORMATIONAL.
+ *
+ *   Alert payload gains optional `cautions: [...]` array — surfaced on
+ *   /v8/audit, /v8/live-trades, and rendered in dashboard as amber-yellow box
+ *   at top of alert card (companion dashboard change in trading_app_v8_11.html).
+ *
+ *   ROLLBACK: drop getMajorCautions, remove cautions field, revert
+ *   buildDetailedRationale to v8.0.11. Dashboard back to v8_10.html.
+ *
  * SIGNAL SERVER v8.0.11 — User fill+stop override + dropdown persistence + exit-button restore
  *
  * v8.0.11 CHANGES (25/05/2026 night — deploy after market close)
@@ -1513,6 +1549,35 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
   const pushDir = push.is_up ? 'UP' : 'DOWN';
   const pushBars = push.bars || ((push.end_idx || 0) - (push.start_idx || 0) + 1);
   const atrMult = push.net_move && push.atr ? (push.net_move / push.atr).toFixed(1) : '?';
+  const tradeDir = (sig.dir === 'up') ? 'long' : 'short';
+  const sideLabel = (tradeDir === 'long') ? 'resistance' : 'support';
+
+  // SECTION 0 (v8.0.12): structural cautions at TOP — only if any major
+  // levels in trade path. Strict-filtered upstream; max 3 items.
+  if (Array.isArray(sig.cautions) && sig.cautions.length > 0) {
+    lines.push(`⚠️ CAUTIONS — major ${sideLabel} in trade path`);
+    sig.cautions.forEach(c => {
+      const tag = c.severity === 'STRONG' ? '🚨' : '•';
+      const distStr = `${c.dist_atr.toFixed(2)}× ATR away`;
+      if (c.type === 'pathsr_band') {
+        const priceStr = Math.abs(c.hi - c.lo) < 0.01
+          ? `₹${c.lo.toFixed(2)}`
+          : `₹${c.lo.toFixed(2)} – ₹${c.hi.toFixed(2)}`;
+        const tagStr = c.severity === 'STRONG'
+          ? ' — BETWEEN entry and target (likely halt point)'
+          : ' — beyond target (secondary)';
+        lines.push(`${tag} PathSR band ${priceStr} (${c.n_pivots} pivots, ${distStr})${tagStr}`);
+      } else if (c.type === 'sr_level') {
+        const tierStr = c.tier;
+        const sideStr = c.side === 'res' ? 'resistance' : 'support';
+        const tagStr = c.severity === 'STRONG'
+          ? ' — BETWEEN entry and target (likely halt point)'
+          : ' — beyond target (secondary)';
+        lines.push(`${tag} ${tierStr} ${sideStr} @ ₹${c.level.toFixed(2)} (${c.n_pivots} prior-day touches, ${distStr})${tagStr}`);
+      }
+    });
+    lines.push('');
+  }
 
   // SECTION 1: What the engine saw
   lines.push(`📊 PUSH DETECTED`);
@@ -2271,6 +2336,20 @@ class Tier2Monitor {
 
     const stopDist = Math.abs(tr.entry_price - tr.stop_price);
 
+    // v8.0.12: structural cautions — major levels in trade direction.
+    // Informational only — does not affect engine behaviour. Strict criteria
+    // and 3-item cap keep thesis short.
+    let cautions = [];
+    try {
+      cautions = getMajorCautions(
+        tr.entry_price, tr.trade_direction, tr.target_price, atr,
+        walker.bands || [], this.sr_levels || []
+      );
+    } catch (e) {
+      console.warn(`[T2 ${this.symbol}] getMajorCautions error:`, e.message);
+      cautions = [];
+    }
+
     return {
       type: publicType,
       trigger: 'deep_retrace_pb1',
@@ -2298,6 +2377,7 @@ class Tier2Monitor {
       barrier_strength: tr.barrier_strength,
       barrier_n_pivots: tr.barrier_n_pivots,
       path_bands: tr.path_bands || [],
+      cautions, // v8.0.12: structural cautions (informational, may be empty)
       classified: true,  // marker for dashboard / audit
       explanation: buildExplanation(push, this, bar, publicType, score, ema, counterDir),
     };
@@ -3295,6 +3375,114 @@ function pb1ComputeTarget(entry, tradeDir, stopDist, bands, pushStart, pushExtre
   }
   // Fallback: 1R in trade direction (matches backtest spec, locked decision)
   return entry + sign * NEW_CFG.PB1_FALLBACK_RR * stopDist;
+}
+
+// v8.0.12 — Major structural cautions for thesis (informational only).
+//
+// Returns up to 3 major levels in the trade direction (ahead of entry) that
+// the user should be aware of. Does NOT change engine behaviour — purely an
+// alert-text enhancement so user can spot trades where a known structural
+// barrier may halt the move.
+//
+// Strict gatekeeping to avoid thesis bloat:
+//   - PathSR bands: n_pivots >= 3, dist <= 2.5× ATR, ahead of entry
+//   - T1 S/R     : priorDayTouches >= 3, dist <= 2.5× ATR, ahead of entry
+//   - T2 S/R     : priorDayTouches >= 2, dist <= 1.5× ATR, ahead of entry
+//   - dedup levels within 0.5× ATR of each other (keep the strongest)
+//   - cap at 3 items
+//   - tag STRONG if between entry and target (very likely to halt trade),
+//     INFO if beyond target (secondary resistance/support)
+//
+// `srLevels` is the computeSR() output. `bands` is the detectPathSRChannels()
+// output (already filtered to current cycle).
+function getMajorCautions(entry, tradeDir, target, atr, bands, srLevels) {
+  const isLong = (tradeDir === 'long');
+  const isAhead = (lvl) => isLong ? (lvl > entry) : (lvl < entry);
+  const distOf = (lvl) => Math.abs(lvl - entry);
+  const isBeforeTarget = (lvl) =>
+    isLong ? (lvl > entry && lvl < target) : (lvl < entry && lvl > target);
+  const items = [];
+
+  // 1. PathSR bands ahead
+  if (Array.isArray(bands)) {
+    for (const b of bands) {
+      const piv = b.n_pivots || 0;
+      if (piv < 3) continue;
+      // Use the near edge for distance check
+      const nearEdge = isLong ? b.low : b.high;
+      if (!isAhead(nearEdge)) continue;
+      const d = distOf(nearEdge);
+      if (d > 2.5 * atr) continue;
+      items.push({
+        type: 'pathsr_band',
+        lo: +Number(b.low).toFixed(2),
+        hi: +Number(b.high).toFixed(2),
+        level: +Number(nearEdge).toFixed(2),
+        strength: b.strength || null,
+        n_pivots: piv,
+        dist: +d.toFixed(2),
+        dist_atr: +(d / atr).toFixed(2),
+        tier: 'PathSR',
+        severity: isBeforeTarget(nearEdge) ? 'STRONG' : 'INFO',
+      });
+    }
+  }
+
+  // 2. T1 / T2 S/R levels ahead
+  if (Array.isArray(srLevels)) {
+    for (const lv of srLevels) {
+      if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
+      if (!isAhead(lv.level)) continue;
+      const touches = lv.priorDayTouches || 0;
+      const d = distOf(lv.level);
+      let qualifies = false;
+      if (lv.tier === 'T1' && touches >= 3 && d <= 2.5 * atr) qualifies = true;
+      else if (lv.tier === 'T2' && touches >= 2 && d <= 1.5 * atr) qualifies = true;
+      if (!qualifies) continue;
+      items.push({
+        type: 'sr_level',
+        level: +Number(lv.level).toFixed(2),
+        tier: lv.tier,
+        side: lv.type, // 'res' or 'sup'
+        n_pivots: touches,
+        dist: +d.toFixed(2),
+        dist_atr: +(d / atr).toFixed(2),
+        severity: isBeforeTarget(lv.level) ? 'STRONG' : 'INFO',
+      });
+    }
+  }
+
+  if (items.length === 0) return [];
+
+  // 3. Dedup within 0.5× ATR — keep stronger one
+  const tolerance = 0.5 * atr;
+  // Strength rank: PathSR n_pivots, then T1 touches × 1.2 (slight T1 boost)
+  const strengthRank = (it) => {
+    if (it.type === 'pathsr_band') return it.n_pivots * 1.0;
+    return (it.tier === 'T1' ? it.n_pivots * 1.2 : it.n_pivots * 1.0);
+  };
+  items.sort((a, b) => a.dist - b.dist);
+  const deduped = [];
+  for (const it of items) {
+    const existing = deduped.find(d => Math.abs(d.level - it.level) <= tolerance);
+    if (existing) {
+      if (strengthRank(it) > strengthRank(existing)) {
+        // Replace existing
+        const idx = deduped.indexOf(existing);
+        deduped[idx] = it;
+      }
+      continue;
+    }
+    deduped.push(it);
+  }
+
+  // 4. Sort: STRONG before INFO, then by distance asc
+  deduped.sort((a, b) => {
+    if (a.severity !== b.severity) return a.severity === 'STRONG' ? -1 : 1;
+    return a.dist - b.dist;
+  });
+
+  return deduped.slice(0, 3);
 }
 
 // Full walk-and-classify (used in shadow LOG_ONLY mode where we have the
@@ -5372,6 +5560,7 @@ app.get('/v8/live-trades', (req, res) => {
     barrier_strength: t.alert.barrier_strength != null ? t.alert.barrier_strength : null,
     barrier_n_pivots: t.alert.barrier_n_pivots != null ? t.alert.barrier_n_pivots : null,
     path_bands: t.alert.path_bands || null,
+    cautions: t.alert.cautions || null, // v8.0.12: structural cautions (may be empty array)
     retrace_pct: t.alert.retrace_pct != null ? t.alert.retrace_pct : null,
     atr: t.alert.atr != null ? t.alert.atr : null,
     is_counter: t.alert.is_counter != null ? t.alert.is_counter : null,
@@ -5715,7 +5904,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.11 — User fill+stop override (editable take-trade) + dropdown-state persistence + exit button restore',
+  engine: 'v8.0.12 — Structural cautions in thesis (informational only — no engine behaviour change)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,

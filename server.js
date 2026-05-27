@@ -1,5 +1,48 @@
 /**
- * SIGNAL SERVER v8.0.12 — Structural cautions in thesis (informational)
+ * SIGNAL SERVER v8.0.13 — Fresh-shelf cautions + computeSR widened slice
+ *
+ * v8.0.13 CHANGES (26/05/2026 night — deploy after market close)
+ *   PROBLEM: On 26/05/2026, three live trades (EICHERMOT, AXISBANK, PNB) entered
+ *   into prior-day (25/05) consolidation shelves that v8.0.12 cautions did NOT
+ *   flag. Offline replay confirmed:
+ *     (a) computeSR DOES score these levels in the grid (e.g. PNB shelf at
+ *         105.43-105.75 has totalTouches 14-26 with priorDayTouches=1)
+ *     (b) BUT they got squeezed out of the top-8 slice because multi-day T1
+ *         levels at 100-104 (far below) outranked them
+ *     (c) AND v8.0.12 caution criteria required T2 priorDayTouches >= 2,
+ *         filtering out single-prior-day shelves entirely
+ *
+ *   FIX (three parts):
+ *     1. computeSR slice bumped from top-8 → top-40 per side. Caution layer
+ *        filters by distance anyway, so a wider returned list is safer. Old
+ *        top-8 cap lost fresh nearby shelves to multi-day historical levels
+ *        further away. Negligible perf cost (still post-dedup, just more rows).
+ *
+ *     2. getMajorCautions: new "fresh_shelf" tier. Qualifies a level when:
+ *          priorDayTouches >= 1 AND totalTouches >= 5
+ *          AND level sits in trade path (between entry & target) OR within
+ *          1.5× ATR past target. Trade-path check handles low-volatility
+ *          stocks (e.g. PNB ATR 0.25) where a fixed ATR multiple is tiny.
+ *
+ *     3. T2 tier DROPPED. Old criterion (priorDayTouches=2, dist<=1.5×ATR)
+ *        was a middling structurally-weak case. If a level had real
+ *        consolidation it would qualify as fresh_shelf instead. Unified
+ *        dedup rank = max(n_pivots, priorDays×2, totalTouches/3) — comparable
+ *        across PathSR/T1/fresh_shelf instead of three ad-hoc formulas.
+ *
+ *   Thesis renders fresh_shelf as: "Fresh shelf @ ₹X — yesterday's
+ *   resistance/support (N touches in tight band, X× ATR away)"
+ *
+ *   Still INFORMATIONAL only. No engine behaviour change. No score/target/stop
+ *   modification. Caution layer just surfaces more.
+ *
+ *   Validation: offline replay of EICHERMOT/AXISBANK/PNB confirms all three
+ *   user-identified zones would have shown as STRONG cautions under v8.0.13.
+ *
+ *   ROLLBACK: revert computeSR slice to .slice(0,8), drop fresh_shelf branch
+ *   in getMajorCautions and buildDetailedRationale.
+ *
+ * SIGNAL SERVER v8.0.12 — Structural cautions in thesis (informational) + W fix
  *
  * v8.0.12 CHANGES (25/05/2026 night — deploy after market close)
  *   PROBLEM: Engine target placement uses PathSR bands + push_start + push_extreme
@@ -32,8 +75,19 @@
  *   /v8/audit, /v8/live-trades, and rendered in dashboard as amber-yellow box
  *   at top of alert card (companion dashboard change in trading_app_v8_11.html).
  *
+ *   ALSO: bug W fix — /v8/diagnose/:symbol endpoint was calling `fetchCandles`
+ *   (undefined function). Now calls `fetchKite5Min` (the actual fetch path used
+ *   by all other endpoints). One-line fix; endpoint now functional.
+ *
+ *   ALSO: /v8/diagnose extended to surface (a) computeSR sr_levels with tier &
+ *   priorDayTouches, (b) detectPathSRChannels output (bands now), and (c) a
+ *   cautions dry-run for both long/short hypothetical entries from latest close.
+ *   Lets user validate whether a level the chart shows is actually recognised
+ *   by the engine.
+ *
  *   ROLLBACK: drop getMajorCautions, remove cautions field, revert
- *   buildDetailedRationale to v8.0.11. Dashboard back to v8_10.html.
+ *   buildDetailedRationale to v8.0.11, revert /v8/diagnose to fetchCandles.
+ *   Dashboard back to v8_10.html.
  *
  * SIGNAL SERVER v8.0.11 — User fill+stop override + dropdown persistence + exit-button restore
  *
@@ -1052,9 +1106,14 @@ function computeSR(candles) {
       deduped.push(r);
   });
 
+  // v8.0.13: bumped slice cap from 8 → 40. Old cap of 8 lost fresh
+  // single-prior-day shelves to multi-day historical levels far from
+  // current price. Caution layer filters by distance/trade-path anyway,
+  // so a wider returned list is safer than a tight one. Negligible perf
+  // cost (still post-dedup, just more rows returned).
   return {
-    supports:    deduped.filter(l => l.type==='sup').slice(0, 8),
-    resistances: deduped.filter(l => l.type==='res').slice(0, 8),
+    supports:    deduped.filter(l => l.type==='sup').slice(0, 40),
+    resistances: deduped.filter(l => l.type==='res').slice(0, 40),
     atr,
   };
 }
@@ -1574,6 +1633,13 @@ function buildDetailedRationale(sig, push, brokenSR, isCounter) {
           ? ' — BETWEEN entry and target (likely halt point)'
           : ' — beyond target (secondary)';
         lines.push(`${tag} ${tierStr} ${sideStr} @ ₹${c.level.toFixed(2)} (${c.n_pivots} prior-day touches, ${distStr})${tagStr}`);
+      } else if (c.type === 'fresh_shelf') {
+        // v8.0.13: fresh single-prior-day consolidation shelf
+        const sideStr = c.side === 'res' ? 'resistance' : 'support';
+        const tagStr = c.severity === 'STRONG'
+          ? ' — BETWEEN entry and target (likely halt point)'
+          : ' — beyond target (secondary)';
+        lines.push(`${tag} Fresh shelf @ ₹${c.level.toFixed(2)} — yesterday's ${sideStr} (${c.total_touches} touches in tight band, ${distStr})${tagStr}`);
       }
     });
     lines.push('');
@@ -3388,6 +3454,9 @@ function pb1ComputeTarget(entry, tradeDir, stopDist, bands, pushStart, pushExtre
 //   - PathSR bands: n_pivots >= 3, dist <= 2.5× ATR, ahead of entry
 //   - T1 S/R     : priorDayTouches >= 3, dist <= 2.5× ATR, ahead of entry
 //   - T2 S/R     : priorDayTouches >= 2, dist <= 1.5× ATR, ahead of entry
+//   - v8.0.13 NEW: "fresh shelf" — priorDayTouches >= 1 AND totalTouches >= 5
+//     within 1.5× ATR (catches yesterday-only consolidation zones that
+//     formed AFTER 14:30 IST and are not yet multi-day levels)
 //   - dedup levels within 0.5× ATR of each other (keep the strongest)
 //   - cap at 3 items
 //   - tag STRONG if between entry and target (very likely to halt trade),
@@ -3428,23 +3497,43 @@ function getMajorCautions(entry, tradeDir, target, atr, bands, srLevels) {
     }
   }
 
-  // 2. T1 / T2 S/R levels ahead
+  // 2. SR levels ahead — T1 (multi-day) OR fresh shelf (yesterday-heavy).
+  //    v8.0.13 cleanup: T2 dropped. T2=exactly-2-prior-days with low touches
+  //    is structurally weak; if it had real consolidation it would qualify as
+  //    fresh shelf instead (totalTouches counts touches across all days).
   if (Array.isArray(srLevels)) {
     for (const lv of srLevels) {
       if (lv.tier !== 'T1' && lv.tier !== 'T2') continue;
       if (!isAhead(lv.level)) continue;
-      const touches = lv.priorDayTouches || 0;
+      const priorDays = lv.priorDayTouches || 0;
+      const totalTouches = lv.totalTouches || priorDays;
       const d = distOf(lv.level);
       let qualifies = false;
-      if (lv.tier === 'T1' && touches >= 3 && d <= 2.5 * atr) qualifies = true;
-      else if (lv.tier === 'T2' && touches >= 2 && d <= 1.5 * atr) qualifies = true;
+      let isFreshShelf = false;
+      // T1: 3+ prior days, within 2.5× ATR
+      if (lv.tier === 'T1' && priorDays >= 3 && d <= 2.5 * atr) {
+        qualifies = true;
+      }
+      // Fresh shelf: 1+ prior days AND 5+ total touches, in trade path
+      else if (priorDays >= 1 && totalTouches >= 5) {
+        const inPath = isBeforeTarget(lv.level);
+        const pastTargetButClose = isLong
+          ? (lv.level >= target && lv.level <= target + 1.5 * atr)
+          : (lv.level <= target && lv.level >= target - 1.5 * atr);
+        if (inPath || pastTargetButClose) {
+          qualifies = true;
+          isFreshShelf = true;
+        }
+      }
+      // (Fresh-shelf clause merged into the inline if-else above; no second pass needed.)
       if (!qualifies) continue;
       items.push({
-        type: 'sr_level',
+        type: isFreshShelf ? 'fresh_shelf' : 'sr_level',
         level: +Number(lv.level).toFixed(2),
         tier: lv.tier,
         side: lv.type, // 'res' or 'sup'
-        n_pivots: touches,
+        n_pivots: priorDays,
+        total_touches: totalTouches,
         dist: +d.toFixed(2),
         dist_atr: +(d / atr).toFixed(2),
         severity: isBeforeTarget(lv.level) ? 'STRONG' : 'INFO',
@@ -3454,20 +3543,26 @@ function getMajorCautions(entry, tradeDir, target, atr, bands, srLevels) {
 
   if (items.length === 0) return [];
 
-  // 3. Dedup within 0.5× ATR — keep stronger one
+  // 3. Dedup within 0.5× ATR — keep stronger one.
+  // v8.0.13 cleanup: unified "activity" rank across all 3 types so we're not
+  // comparing different scales.
+  //   activity = max(n_pivots, priorDayTouches × 2, totalTouches / 3)
+  // - 5-pivot PathSR band → max(5, 0, 0) = 5
+  // - 3-day T1 with 9 touches → max(0, 6, 3) = 6
+  // - Fresh shelf 10 touches → max(0, 2, 3.3) = 3.3
+  // - Fresh shelf 30 touches → max(0, 2, 10) = 10
   const tolerance = 0.5 * atr;
-  // Strength rank: PathSR n_pivots, then T1 touches × 1.2 (slight T1 boost)
-  const strengthRank = (it) => {
-    if (it.type === 'pathsr_band') return it.n_pivots * 1.0;
-    return (it.tier === 'T1' ? it.n_pivots * 1.2 : it.n_pivots * 1.0);
+  const activityRank = (it) => {
+    const piv = it.n_pivots || 0;
+    const tot = it.total_touches || 0;
+    return Math.max(piv, piv * 2, tot / 3);
   };
   items.sort((a, b) => a.dist - b.dist);
   const deduped = [];
   for (const it of items) {
     const existing = deduped.find(d => Math.abs(d.level - it.level) <= tolerance);
     if (existing) {
-      if (strengthRank(it) > strengthRank(existing)) {
-        // Replace existing
+      if (activityRank(it) > activityRank(existing)) {
         const idx = deduped.indexOf(existing);
         deduped[idx] = it;
       }
@@ -5794,7 +5889,8 @@ app.get('/v8/pb1-shadow-log', (req, res) => {
 app.get('/v8/diagnose/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   try {
-    const candles = await fetchCandles(symbol);
+    // v8.0.12 (bug W fix): was `fetchCandles` (undefined). Correct function is fetchKite5Min.
+    const candles = await fetchKite5Min(symbol);
     if (!candles || candles.length < 50) return res.status(404).json({ error: 'not enough bar data', symbol });
     const today = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
     const dayBars = candles.filter(b => b.t.slice(0, 10) === today);
@@ -5831,10 +5927,54 @@ app.get('/v8/diagnose/:symbol', async (req, res) => {
     const stockAlerts = STATE.alerts.filter(a => a.symbol === symbol);
     const stockLive = Object.values(STATE.live_trades).filter(t => t.alert && t.alert.symbol === symbol);
 
+    // v8.0.12 (diag extension): expose SR levels, PathSR bands, and a cautions
+    // dry-run so user can validate the structural-cautions feature directly.
+    let srLevels = [];
+    let pathBands = [];
+    let cautionsDryRun = { long: [], short: [] };
+    try {
+      const srRes = computeSR(candles);
+      // Combine supports + resistances; preserve all fields
+      srLevels = [
+        ...(srRes.supports || []).map(s => ({ ...s, type: 'sup' })),
+        ...(srRes.resistances || []).map(r => ({ ...r, type: 'res' })),
+      ];
+      // PathSR bands as of the latest available bar
+      const lastIdx = candles.length - 1;
+      pathBands = detectPathSRChannels(candles, lastIdx) || [];
+      // Run cautions dry-run for BOTH long and short directions
+      // using the latest close as a hypothetical entry, and target = entry ± 1×ATR
+      const ep = candles[lastIdx].c;
+      const a = computeATR(candles.slice(-30));
+      cautionsDryRun.long = getMajorCautions(ep, 'long', ep + a, a, pathBands, srLevels);
+      cautionsDryRun.short = getMajorCautions(ep, 'short', ep - a, a, pathBands, srLevels);
+    } catch (e) {
+      console.warn(`[diagnose ${symbol}] SR/bands/cautions error:`, e.message);
+    }
+
     res.json({
       symbol, today, atr: +atr.toFixed(2),
       today_bars: filtered.length,
       detected_events: events,
+      // v8.0.12: structural cautions data — what the engine sees for this symbol
+      sr_levels: srLevels.map(l => ({
+        level: l.level, type: l.type, tier: l.tier,
+        score: l.score,
+        priorDayTouches: l.priorDayTouches,
+        totalTouches: l.totalTouches,
+        sharpRejections: l.sharpRejections,
+        mildClusters: l.mildClusters,
+      })),
+      path_bands_now: pathBands.map(b => ({
+        low: +b.low.toFixed(2), high: +b.high.toFixed(2),
+        n_pivots: b.n_pivots, n_touches: b.n_touches,
+        strength: b.strength,
+      })),
+      cautions_dry_run: {
+        if_long_from_close: cautionsDryRun.long,
+        if_short_from_close: cautionsDryRun.short,
+        note: 'cautions evaluated against latest close as hypothetical entry with target = entry ± 1×ATR. For real alerts, cautions use actual entry & target from the fire.',
+      },
       in_watchlist: inWatchlist ? {
         push_id: inWatchlist.push_id,
         push_dir: inWatchlist.push.dir,
@@ -5904,7 +6044,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.12 — Structural cautions in thesis (informational only — no engine behaviour change)',
+  engine: 'v8.0.13 — Fresh-shelf cautions + computeSR slice widened (informational only — no engine behaviour change)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,

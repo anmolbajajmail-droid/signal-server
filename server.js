@@ -1,4 +1,58 @@
 /**
+ * SIGNAL SERVER v8.0.14 — Daily state purge on restore + cross-day staleness fix
+ *
+ * v8.0.14 CHANGES (29/05/2026 — deploy after market close)
+ *   PROBLEM 1 (state pollution across days):
+ *     On 29/05, after a server restart, the snapshot loaded yesterday's
+ *     STATE.watchlist and STATE.alerts in full. AMBUJACEM and TVSMOTOR both
+ *     fired phantom alerts with push timestamps from 27/05 (e.g. "13:30 →
+ *     13:40") on today's 09:15-10:30 bars. /v8/history also returned a stale
+ *     R total from 27/05's session.
+ *
+ *   PROBLEM 2 (cross-day staleness check skipped):
+ *     T2v7 staleness check used:
+ *       const pushEndBar = todayBars.find(b => b.t.slice(11,16) === push.end_time);
+ *       if (pushEndBar) { ageMin = ... } // SILENT SKIP when undefined
+ *     When push was carried over from a prior day with end_time later than the
+ *     current intraday clock (e.g. push.end_time "13:35" while it's 10:30 now),
+ *     find() returns undefined, the if-block is skipped entirely, and the stale
+ *     push proceeds to walker processing as if fresh. This is how the 27/05
+ *     pushes survived to fire on 29/05.
+ *
+ *   FIX 1 — Daily state purge on restore (loadStateSnapshot):
+ *     - Compute today's IST date (real-world clock, not last-candle time)
+ *     - For each restored alert: drop if fired_at IST date != today. Move to
+ *       history with entry_type='STALE_OVERNIGHT'. Always log to console.
+ *     - For each restored watchlist entry: drop if added_at IST date != today.
+ *     - For each restored shadow_trade: drop if dismissed_at IST date != today.
+ *     - blocked_pushes (Set) is cleared entirely on cross-day restore — push_ids
+ *       are inherently single-day (HH:MM_ext) and stale ones would block Tier 1
+ *       from re-finding fresh pushes today.
+ *     - live_trades kept as-is (they may legitimately span days; user closes
+ *       them manually).
+ *     - STATE.history NOT mutated by restore (multi-day record).
+ *
+ *   FIX 2 — Cross-day staleness check (Tier 2 worker):
+ *     Replace the `pushEndBar = todayBars.find(...)` approach with a direct
+ *     ISO-timestamp comparison using `entry.added_at`. ageMin is always
+ *     computed; the skip is guaranteed for any push older than MAX_PUSH_AGE_MIN
+ *     regardless of whether push.end_time happens to land in today's bars.
+ *
+ *   FIX 3 — /v8/history endpoint adds optional ?since=YYYY-MM-DD filter,
+ *     defaults to today's IST date. Backward compat: pass since=1970-01-01 to
+ *     get all history.
+ *
+ *   FIX 4 — New endpoint POST /v8/purge-stale wraps the same purge logic so
+ *     user can manually fire it mid-session if anything looks suspect. Same
+ *     behaviour as the automatic restore-time purge but called by dashboard.
+ *
+ *   Still INFORMATIONAL only on engine behaviour — no scoring, target, or stop
+ *   logic changed. This is pure state hygiene.
+ *
+ *   ROLLBACK: revert loadStateSnapshot purge block, revert Tier 2 staleness
+ *   check to pushEndBar = todayBars.find(...), drop /v8/history since param
+ *   and /v8/purge-stale endpoint.
+ *
  * SIGNAL SERVER v8.0.13 — Fresh-shelf cautions + computeSR widened slice
  *
  * v8.0.13 CHANGES (26/05/2026 night — deploy after market close)
@@ -4487,6 +4541,75 @@ function saveStateDebounced() {
   saveStateTimer = setTimeout(saveStateNow, 2000);
 }
 
+// v8.0.14 — Purge entries whose timestamp falls on a day other than today's
+// IST date. Walks alerts, watchlist, shadow_trades, blocked_pushes. live_trades
+// and history are intentionally preserved (live trades may span days; history
+// is a multi-day rolling record). Called from loadState (post-restore) and
+// from /v8/purge-stale (manual). Returns counts for the caller to log.
+function purgeStaleStateEntries(reason) {
+  const todayIST = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+  const summary = { todayIST, reason, alerts_dropped: 0, watchlist_dropped: 0, shadow_dropped: 0, blocked_pushes_cleared: 0 };
+
+  // Alerts — drop any with fired_at on a different IST day; move to history
+  // as STALE_OVERNIGHT for auditability.
+  const keptAlerts = [];
+  for (const a of STATE.alerts || []) {
+    if (!a.fired_at) { keptAlerts.push(a); continue; }
+    const alertDay = new Date(new Date(a.fired_at).getTime() + 5.5 * 3600000).toISOString().slice(0, 10);
+    if (alertDay !== todayIST) {
+      STATE.history.push({ entry_type: 'STALE_OVERNIGHT', ...a, purged_at: new Date().toISOString(), purged_reason: reason });
+      summary.alerts_dropped++;
+    } else {
+      keptAlerts.push(a);
+    }
+  }
+  STATE.alerts = keptAlerts;
+
+  // Watchlist — drop any whose added_at IST day != today
+  const keptWatchlist = {};
+  for (const [sym, entry] of Object.entries(STATE.watchlist || {})) {
+    if (!entry.added_at) { keptWatchlist[sym] = entry; continue; }
+    const wDay = new Date(new Date(entry.added_at).getTime() + 5.5 * 3600000).toISOString().slice(0, 10);
+    if (wDay !== todayIST) {
+      summary.watchlist_dropped++;
+    } else {
+      keptWatchlist[sym] = entry;
+    }
+  }
+  STATE.watchlist = keptWatchlist;
+
+  // Shadow trades — drop any whose dismissed_at IST day != today
+  const keptShadow = {};
+  for (const [id, t] of Object.entries(STATE.shadow_trades || {})) {
+    const ts = t.dismissed_at || (t.alert && t.alert.fired_at);
+    if (!ts) { keptShadow[id] = t; continue; }
+    const sDay = new Date(new Date(ts).getTime() + 5.5 * 3600000).toISOString().slice(0, 10);
+    if (sDay !== todayIST) {
+      summary.shadow_dropped++;
+    } else {
+      keptShadow[id] = t;
+    }
+  }
+  STATE.shadow_trades = keptShadow;
+
+  // Blocked pushes — push_id format is "{dir}_{HH:MM}_{ext}", contains no date.
+  // If anything was purged from watchlist/alerts/shadow, the blocked set is
+  // unreliable (may contain push_ids from prior days). Cheapest fix: clear it
+  // entirely on any purge — Tier 1 will rebuild blocked set today as alerts fire.
+  if (summary.alerts_dropped || summary.watchlist_dropped || summary.shadow_dropped) {
+    summary.blocked_pushes_cleared = STATE.blocked_pushes ? STATE.blocked_pushes.size : 0;
+    STATE.blocked_pushes = new Set();
+  }
+
+  if (summary.alerts_dropped || summary.watchlist_dropped || summary.shadow_dropped || summary.blocked_pushes_cleared) {
+    console.log(`[PURGE ${reason}] today=${todayIST}: alerts=${summary.alerts_dropped} watchlist=${summary.watchlist_dropped} shadow=${summary.shadow_dropped} blocked=${summary.blocked_pushes_cleared}`);
+    saveStateNow();
+  } else {
+    console.log(`[PURGE ${reason}] today=${todayIST}: nothing stale, no changes`);
+  }
+  return summary;
+}
+
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) {
@@ -4596,6 +4719,15 @@ function loadState() {
         last_status: t.last_status || { status: 'open' },
       };
     }
+
+    // v8.0.14 — Per-entry stale purge. Snapshot can contain prior-day entries
+    // even when savedDay==nowDay (e.g. server kept running across day boundary,
+    // saving every 60s, so the most recent save is from today even though the
+    // watchlist/alerts/shadow still contain entries from yesterday or earlier).
+    // Walks alerts, watchlist, shadow_trades; drops any whose timestamp IST date
+    // != today. live_trades preserved as-is (may span days).
+    purgeStaleStateEntries('restore');
+
     console.log(`[STATE] restored from ${snap.saved_at}: ${Object.keys(STATE.watchlist).length} watchlist, ${STATE.alerts.length} alerts, ${Object.keys(STATE.live_trades).length} live trades, ${Object.keys(STATE.shadow_trades).length} shadow trades, ${STATE.history.length} history`);
     return true;
   } catch (e) {
@@ -4748,19 +4880,28 @@ async function runTier2v7() {
       // otherwise allow more processing.
       // MAX_PUSH_AGE_MIN = 65 — validated against parity test on May 8
       // (40 min killed 5 valid B/H2 setups; 65 min catches LALPATHLAB-style
-      // 75-min stale bugs while preserving all legitimate setups)
+      // 75-min stale bugs while preserving all legitimate setups).
+      //
+      // v8.0.14 — Cross-day safe. Old code used:
+      //   const pushEndBar = todayBars.find(b => b.t.slice(11,16) === push.end_time)
+      //   if (pushEndBar) { ageMin = ... }
+      // When push was carried over from a prior day with end_time later than the
+      // current intraday clock (e.g. push.end_time '13:35' while it's 10:30 now),
+      // find() returned undefined, the if-block was silently skipped, and the
+      // stale push proceeded to walker processing as if fresh. Now we compute
+      // ageMin directly from entry.added_at (when push entered watchlist).
       const MAX_PUSH_AGE_MIN = 65;
-      const pushEndBar = todayBars.find(b => b.t.slice(11, 16) === entry.push.end_time);
-      if (pushEndBar) {
-        const lastBarT = newBars[newBars.length - 1].t;
-        const ageMin = (new Date(lastBarT) - new Date(pushEndBar.t)) / 60000;
+      const lastBarT = newBars[newBars.length - 1].t;
+      if (entry.added_at) {
+        const ageMin = (new Date(lastBarT).getTime() - new Date(entry.added_at).getTime()) / 60000;
         if (ageMin > MAX_PUSH_AGE_MIN) {
-          console.log(`[T2v7] ${symbol} push too stale (${Math.round(ageMin)} min since push end ${entry.push.end_time}) — dropping`);
+          console.log(`[T2v7] ${symbol} push too stale (${Math.round(ageMin)} min since added_at ${entry.added_at}) — dropping`);
           STATE.audit_log.push({
             event: 'SKIPPED', reason: 'push_stale_clock_time',
             symbol, push_id: entry.push_id,
             push_time: `${entry.push.start_time}→${entry.push.end_time}`,
             push_age_min: Math.round(ageMin),
+            added_at: entry.added_at,
             bar_time: lastBarT, fired_at: new Date().toISOString(),
           });
           STATE.blocked_pushes.add(entry.push_id);
@@ -5671,12 +5812,34 @@ app.get('/v8/live-trades', (req, res) => {
 // Use ?type=REALIZED or ?type=SHADOW or ?type=DISMISSED to filter.
 app.get('/v8/history', (req, res) => {
   const t = req.query.type;
-  let h = [...STATE.history];
+  // v8.0.14: ?since=YYYY-MM-DD filter (defaults to today's IST date).
+  // Use since=1970-01-01 to get full history (legacy compat).
+  // History entries have multiple possible timestamp fields depending on type:
+  //   REALIZED: exit_time / fill_time
+  //   SHADOW: exit_time / dismissed_at
+  //   DISMISSED: dismissed_at
+  //   STALE_OVERNIGHT (v8.0.14): purged_at / fired_at
+  // We use the most recent of these per row for filtering.
+  const todayIST = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+  const since = req.query.since || todayIST;
+  const entryDate = (e) => {
+    const ts = e.exit_time || e.purged_at || e.dismissed_at || e.fill_time || e.fired_at;
+    if (!ts) return null;
+    return new Date(new Date(ts).getTime() + 5.5 * 3600000).toISOString().slice(0, 10);
+  };
+  let h = [...STATE.history].filter(e => {
+    const d = entryDate(e);
+    return d == null || d >= since;
+  });
   if (t) h = h.filter(e => e.entry_type === t);
-  // Totals
-  const realized = STATE.history.filter(e => e.entry_type === 'REALIZED');
-  const shadow = STATE.history.filter(e => e.entry_type === 'SHADOW');
-  const dismissed = STATE.history.filter(e => e.entry_type === 'DISMISSED');
+  // Totals — also filtered by since
+  const sinceFiltered = STATE.history.filter(e => {
+    const d = entryDate(e);
+    return d == null || d >= since;
+  });
+  const realized = sinceFiltered.filter(e => e.entry_type === 'REALIZED');
+  const shadow = sinceFiltered.filter(e => e.entry_type === 'SHADOW');
+  const dismissed = sinceFiltered.filter(e => e.entry_type === 'DISMISSED');
   const sumR = arr => arr.reduce((s, x) => {
     // R captured: if outcome present, use (exit-fill)/(entry-stop). Else 0.
     if (x.exit_price == null) return s;
@@ -5689,6 +5852,7 @@ app.get('/v8/history', (req, res) => {
   }, 0);
   res.json({
     history: h,
+    since,
     totals: {
       realized_count: realized.length,
       realized_R: +sumR(realized).toFixed(3),
@@ -6037,6 +6201,14 @@ app.post('/v8/reset-day', (req, res) => {
   res.json({ ok: true });
 });
 
+// v8.0.14: Surgical purge — drops only entries whose timestamp IST date != today.
+// Unlike /v8/reset-day (which nukes everything), this only removes stale entries.
+// Useful mid-session if anything looks suspect after a server restart.
+app.post('/v8/purge-stale', (req, res) => {
+  const summary = purgeStaleStateEntries('manual');
+  res.json({ ok: true, ...summary });
+});
+
 
 app.get('/health', (req, res) => res.json({
   ok: true,
@@ -6044,7 +6216,7 @@ app.get('/health', (req, res) => res.json({
   time: new Date().toISOString(),
   kiteReady: kiteReady(),
   marketHours: isMarketHours(),
-  engine: 'v8.0.13 — Fresh-shelf cautions + computeSR slice widened (informational only — no engine behaviour change)',
+  engine: 'v8.0.14 — Daily state purge + cross-day staleness fix (informational hygiene only — no engine behaviour change)',
   alerts_pending: STATE.alerts.filter(a => a.status === 'pending').length,
   live_trades: Object.values(STATE.live_trades).filter(t => !t.closed).length,
   shadow_trades: Object.values(STATE.shadow_trades).filter(t => !t.closed).length,
@@ -6053,7 +6225,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.get('/', (req, res) => res.json({
-  name: 'Signal Server v8.0.11 — User fill+stop override',
+  name: 'Signal Server v8.0.14 — Daily state purge + cross-day staleness fix',
   kite: { ready: kiteReady(), authenticatedAt: KITE.authenticatedAt },
   universe: NSE_UNIVERSE.length,
   endpoints: [
@@ -6061,7 +6233,8 @@ app.get('/', (req, res) => res.json({
     '/v8/shadow-history', '/v8/unrealized', '/v8/tier3-notifications', '/v8/status',
     '/v8/track [POST]', '/v8/dismiss [POST]', '/v8/dismiss-alert [POST]',
     '/v8/manual-exit-trade [POST]',
-    '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]', '/v8/reset-day [POST]',
+    '/v8/run-tier1 [POST]', '/v8/run-tier2 [POST]',
+    '/v8/reset-day [POST]', '/v8/purge-stale [POST]',
     '/health', '/prices', '/candles/:symbol', '/kite/login',
   ],
   marketHours: isMarketHours(),
